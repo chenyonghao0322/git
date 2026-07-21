@@ -1,0 +1,46 @@
+---
+description: PointCloudViewer C++ 与点云相关代码规范
+globs: PointCloudViewer/**/*.{cpp,h,hpp}
+alwaysApply: false
+---
+
+# 目录职责
+
+- `src/app/`：主窗口、菜单、工具栏、面板、文件对话框
+- `src/core/`：点云数据结构
+- `src/io/`：点云/图像读写
+- `src/render/`：OpenGL 渲染、相机、着色器
+- `src/tools/`：测量、滤波、ROI、剖切、撤销历史
+
+# 编码规范
+
+- 使用 C++17，不引入不必要的新依赖。
+- 头文件用 `#pragma once` 或 include guard，与现有文件保持一致。
+- 新功能优先扩展现有类（如 `Application`、`MeasureTools`），避免重复造轮子。
+- 字符串/UI 文本使用 `u8"中文"`，与现有 ImGui 用法一致。
+- 注释只在非显而易见处添加，说明业务逻辑或算法意图，不写废话注释。
+
+# 点云与算法相关
+
+- 大点云操作注意性能：避免无谓的全量拷贝，优先复用 `PointCloud` 数据结构。
+- **新增点云处理算法默认使用 PCL**（`PclTools` / `PclAdapter`），经 `EffectiveAlgoBackend()` 分发；仅交互拾取、视口框选等可走 `MeasureTools`。
+- 滤波、拟合、剖切、投影、孔径测量等几何算法应实现于 `PclTools`，自研路径保留在 `MeasureTools` 作对照。
+- 滤波、拟合、剖切等工具改动后，应保证撤销/重做（Undo/Redo）行为不被破坏。
+- 新增测量或显示功能时，同步考虑状态栏提示与左侧/工具栏入口是否必要。
+
+# UI 改动
+
+- 不随意增加工具栏按钮；用户未要求时，优先放在现有面板或菜单。
+- 删除 UI 入口时，确认底层功能是否仍需保留（例如面板内仍可用）。
+- 保持深色工业风界面，与 `UiTheme` 现有风格一致。
+
+# 编译验证
+
+在 `PointCloudViewer` 目录下：
+
+```bat
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+若 `CMakeCache.txt` 路径冲突，删除 `build/CMakeCache.txt` 后重新配置。

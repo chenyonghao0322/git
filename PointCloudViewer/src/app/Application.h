@@ -6,6 +6,10 @@
 #include "tools/MeasureTools.h"
 #include "tools/UndoHistory.h"
 #include "app/AlgorithmEditor.h"
+#include "app/AlgoToolsPanel.h"
+#include "app/PclPanel.h"
+#include "app/PclToolsPanel.h"
+#include "tools/AlgorithmBackend.h"
 
 #include <cstdint>
 #include <optional>
@@ -40,6 +44,7 @@ private:
     void DrawToolPanel();
     void DrawViewAxisWidget(float contentTop, float contentBottom, float leftInset);
     void DrawAboutPopup();
+    void DrawNativeAlgoPasswordPopup();
     void DrawSectionPanel();
     void DrawStepGapPanel();
     void DrawFilterMenuItems();
@@ -51,6 +56,7 @@ private:
     bool ApplyCloud(PointCloud&& cloud, const char* statusMsg);
     void CreateSphereCloud();
     void CreateCylinderCloud();
+    void CreateDiskCloud();
     bool OpenDepthImage();
     bool OpenBrightnessImage();
     void DestroyImageView(ImageView& view);
@@ -67,6 +73,25 @@ private:
     void BeginRoiDrag(float mouseX, float mouseY);
     void UpdateRoiDrag(float mouseX, float mouseY);
     void EndRoiDrag();
+    void FinishRoiPolygon();
+    void RunRoiSelection();
+    void RefreshWorldRoiAt(float mouseX, float mouseY);
+    void ApplyProjectionToAxis(int axis);
+    bool RunRoiProjectFill(std::string& error);
+    void RefreshGpuFilled();
+    void CloseDualCloudView();
+    bool DualCloudViewActive() const;
+    int CloudPaneAtMouse(float mouseX) const;
+    void GetCloudPaneFbRect(int pane, int& x, int& y, int& w, int& h) const;
+    void GetCloudPaneGlViewport(int pane, int& x, int& y, int& w, int& h) const;
+    float CloudPaneAspect(int pane) const;
+    PointCloud& EditableCloud();
+    const PointCloud& EditableCloud() const;
+    void DrawDualCloudPaneLabels();
+    void DrawFitRoiShapeControls();
+    void ResetFitRoiSelection();
+    void BuildFilledPaneDisplayCloud(PointCloud& out);
+    bool MeasureHoleRadiusWithBackend(HoleMeasureResult& out, std::string& error);
     void GenerateSection();
     void OnSectionPlotClick(float plotX, float plotY, float plotW, float plotH);
     void UpdateSectionDistances();
@@ -102,17 +127,53 @@ private:
                               const std::vector<std::size_t>& indices, const char* label,
                               unsigned int col, unsigned int textCol);
     void DrawStepGapRegionOverlays(ImDrawList* dl, int winW, int winH);
-    void RunFilterPreview(int type);  // 0 voxel 1 radius 2 statistical
+    void RunFilterPreview(int type, AlgorithmBackend backend);
     void ApplyFilterResult();
     void ClearFilterCompare();
+    bool FitPlaneWithBackend(const std::vector<std::size_t>& indices, PlaneModel& plane,
+                             std::string& error, AlgorithmBackend backend);
+    bool FitSphereWithBackend(const std::vector<std::size_t>& indices, SphereModel& sphere,
+                              std::string& error, AlgorithmBackend backend);
+    bool FitCircleWithBackend(const std::vector<std::size_t>& indices, CircleModel& circle,
+                              std::string& error, AlgorithmBackend backend);
+    bool FitCylinderWithBackend(const std::vector<std::size_t>& indices, CylinderModel& cylinder,
+                                std::string& error, AlgorithmBackend backend);
+    bool ComputeFlatnessWithBackend(const std::vector<std::size_t>& indices, FlatnessResult& out,
+                                    std::string& error, AlgorithmBackend backend);
+    bool ComputeStepGapZHeightWithBackend(const std::vector<std::size_t>& regionA,
+                                          const std::vector<std::size_t>& regionB,
+                                          StepGapResult& out, std::string& error,
+                                          AlgorithmBackend backend);
+    bool ExtractSectionWithBackend(bool cutAlongX, float position, float thickness,
+                                   SectionData& out, std::string& error,
+                                   AlgorithmBackend backend);
+    void ApplyClipMaskWithBackend(const Vec3& normal, float d, bool enabled);
+    void SelectRoiWithBackend(int fbW, int fbH, float x0, float y0, float x1, float y1,
+                              std::vector<std::size_t>& outIndices, RoiShape shape,
+                              bool useWorldSize, float worldRadius, float worldHalfW,
+                              float worldHalfH, const Vec3& worldCenter,
+                              const std::vector<float>* polyX, const std::vector<float>* polyY);
+    std::optional<std::size_t> PickNearestWithBackend(int fbW, int fbH, float mouseX, float mouseY,
+                                                      float maxPixelDist,
+                                                      const std::vector<std::size_t>* onlyIndices);
+    void ApplyRoiDeleteWithBackend(const std::vector<std::size_t>& roiIndices, bool deleteInside);
+    void RestoreAllPointsWithBackend();
+    AlgoToolsHost BuildAlgoToolsHost(AlgorithmBackend backend);
+
+    AlgorithmBackend EffectiveAlgoBackend() const;
 
     GLFWwindow* window_ = nullptr;
     PointCloud cloud_;
+    PointCloud filledCloud_;
     Camera camera_;
     PointCloudRenderer renderer_;
+    PointCloudRenderer filledRenderer_;
     MeasureState measure_;
     UndoHistory history_;
     std::vector<std::size_t> displayIndices_;
+    std::vector<std::size_t> displayFilledIndices_;
+    bool dualCloudView_ = false;
+    int activeCloudPane_ = 0;  // 0=原始 1=投影填充
 
     float pointSize_ = 2.5f;
     float opacity_ = 1.f;
@@ -120,23 +181,34 @@ private:
     float zMax_ = 1.f;
     bool autoZRange_ = true;
     bool needUpload_ = false;
+    bool needUploadFilled_ = false;
     int maxDisplayPoints_ = 1200000;
     int gpuPointCount_ = 0;
+    int gpuFilledPointCount_ = 0;
+    float filledZMin_ = 0.f;
+    float filledZMax_ = 1.f;
     bool showAxes_ = true;
     float axesLength_ = 1.f;
     bool showAbout_ = false;
+    bool showNativeAlgoPassword_ = false;
+    bool nativeAlgoUnlocked_ = false;
+    char nativeAlgoPasswordBuf_[16] = {};
     bool showCreateSphere_ = false;
     bool showCreateCylinder_ = false;
+    bool showCreateDisk_ = false;
     static constexpr const char* kAppVersion = "0.1";
 
     // 创建点云参数
     float genSphereRadius_ = 10.f;
     int genSpherePoints_ = 20000;
-    float genSphereNoise_ = 0.05f;
+    float genSphereNoise_ = 0.f;
     float genCylRadius_ = 8.f;
     float genCylHeight_ = 30.f;
     int genCylPoints_ = 30000;
     float genCylNoise_ = 0.05f;
+    float genDiskRadius_ = 10.f;
+    int genDiskPoints_ = 20000;
+    float genDiskNoise_ = 0.f;
 
     // 2D 深度图 / 亮度图窗口（不转点云）
     ImageView depthImage_;
@@ -177,6 +249,10 @@ private:
     int filterLastKept_ = 0;
     int filterLastRemoved_ = 0;
 
+    AlgorithmBackend algoBackend_ = AlgorithmBackend::PCL;
+    PclPanel pclPanel_;
+    PclToolsPanel pclToolsPanel_;
+
     bool rotating_ = false;
     bool panning_ = false;
     bool sectionDragging_ = false;
@@ -193,6 +269,10 @@ private:
     float view3dY_ = 0.f;
     float view3dW_ = 800.f;
     float view3dH_ = 600.f;
+    float view3dPane0X_ = 320.f;
+    float view3dPane0W_ = 800.f;
+    float view3dPane1X_ = 0.f;
+    float view3dPane1W_ = 0.f;
 
     AlgorithmEditor algoEditor_;
 };

@@ -6,6 +6,7 @@
 #include "io/PointCloudGenerator.h"
 #include "io/PointCloudIO.h"
 #include "tools/FilterTools.h"
+#include "tools/PclTools.h"
 
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -79,6 +81,9 @@ bool Application::Init() {
     if (!renderer_.Init(err)) {
         return false;
     }
+    if (!filledRenderer_.Init(err)) {
+        return false;
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -97,6 +102,7 @@ bool Application::Init() {
 }
 
 bool Application::ApplyCloud(PointCloud&& cloud, const char* statusMsg) {
+    CloseDualCloudView();
     cloud_ = std::move(cloud);
     useIntensityColors_ = false;
     intensityColors_.clear();
@@ -468,6 +474,23 @@ void Application::CreateCylinderCloud() {
     ApplyCloud(std::move(cloud), buf);
 }
 
+void Application::CreateDiskCloud() {
+    PointCloudGenerator::DiskParams p;
+    p.radius = genDiskRadius_;
+    p.pointCount = genDiskPoints_;
+    p.noise = genDiskNoise_;
+    std::string error;
+    PointCloud cloud;
+    if (!PointCloudGenerator::GenerateDisk(p, cloud, error)) {
+        measure_.status = error;
+        return;
+    }
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), u8"已创建圆面点云 %zu 点（R=%.3f，Z噪声=%.3f）",
+                  cloud.points.size(), p.radius, p.noise);
+    ApplyCloud(std::move(cloud), buf);
+}
+
 void Application::FitCameraToCloud() {
     if (!cloud_.bounds.Valid()) return;
     const Vec3 e = cloud_.bounds.Extent();
@@ -562,17 +585,25 @@ void Application::RefreshGpu() {
     params.maxDisplayPoints = maxDisplayPoints_;
     params.zMin = zMin_;
     params.zMax = zMax_;
+    const bool sphereFitCompare =
+        IsSphereFitMode(measure_.mode) && measure_.sphere &&
+        !measure_.sphere->inlierIndices.empty();
+    const bool circleFitCompare = measure_.mode == ToolMode::CircleFit && measure_.circle &&
+                                  !measure_.circle->inlierIndices.empty();
     const bool showRoi =
         !measure_.roiIndices.empty() &&
         (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
-         measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::CircleFit ||
+         measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::SphereBodyFit ||
+         measure_.mode == ToolMode::CircleFit ||
          measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
          measure_.mode == ToolMode::StepGap) &&
-        !measure_.flatness.valid && !measure_.stepGap.hasDistances;
+        !measure_.flatness.valid && !measure_.stepGap.hasDistances && !sphereFitCompare &&
+        !circleFitCompare;
     params.highlightRoi = showRoi ? &measure_.roiIndices : nullptr;
     params.usePointColors = (cloud_.colors.size() == cloud_.points.size()) &&
                             (filterCompareActive_ || measure_.flatness.valid ||
-                             measure_.stepGap.hasDistances || useIntensityColors_);
+                             measure_.stepGap.hasDistances || useIntensityColors_ ||
+                             sphereFitCompare || circleFitCompare);
     params.ignoreMask = filterCompareActive_ && !filterHideRemoved_;
 
     std::vector<uint8_t> maskBackup;
@@ -638,6 +669,24 @@ void Application::RebuildAnalysisColors() {
         return;
     }
 
+    if (IsSphereFitMode(measure_.mode) && measure_.sphere &&
+        !measure_.sphere->inlierIndices.empty()) {
+        cloud_.colors.assign(cloud_.points.size(), Vec3{0.52f, 0.55f, 0.60f});
+        for (std::size_t idx : measure_.sphere->inlierIndices) {
+            if (idx < cloud_.colors.size()) cloud_.colors[idx] = {0.20f, 0.82f, 0.98f};
+        }
+        return;
+    }
+
+    if (measure_.mode == ToolMode::CircleFit && measure_.circle &&
+        !measure_.circle->inlierIndices.empty() && !DualCloudViewActive()) {
+        cloud_.colors.assign(cloud_.points.size(), Vec3{0.52f, 0.55f, 0.60f});
+        for (std::size_t idx : measure_.circle->inlierIndices) {
+            if (idx < cloud_.colors.size()) cloud_.colors[idx] = {1.0f, 0.55f, 0.15f};
+        }
+        return;
+    }
+
     if (useIntensityColors_ && intensityColors_.size() == cloud_.points.size()) {
         cloud_.colors = intensityColors_;
         return;
@@ -647,7 +696,9 @@ void Application::RebuildAnalysisColors() {
     cloud_.ApplyHeightColors(zMin_, zMax_);
 }
 
-void Application::RunFilterPreview(int type) {
+void Application::RunFilterPreview(int type, AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
     if (cloud_.points.empty()) {
         measure_.status = u8"请先加载点云再滤波";
         return;
@@ -658,14 +709,22 @@ void Application::RunFilterPreview(int type) {
     std::string error;
     int kept = 0;
     bool ok = false;
+    const bool usePcl = active == AlgorithmBackend::PCL;
     if (type == 0) {
-        ok = FilterTools::VoxelDownsample(cloud_, filterVoxelLeaf_, filterKeepMask_, error, &kept);
+        ok = usePcl ? PclTools::VoxelDownsample(cloud_, filterVoxelLeaf_, filterKeepMask_, error,
+                                                &kept)
+                    : FilterTools::VoxelDownsample(cloud_, filterVoxelLeaf_, filterKeepMask_, error,
+                                                   &kept);
     } else if (type == 1) {
-        ok = FilterTools::RadiusOutlier(cloud_, filterRadius_, filterRadiusMinNeighbors_,
-                                        filterKeepMask_, error, &kept);
+        ok = usePcl ? PclTools::RadiusOutlier(cloud_, filterRadius_, filterRadiusMinNeighbors_,
+                                              filterKeepMask_, error, &kept)
+                    : FilterTools::RadiusOutlier(cloud_, filterRadius_, filterRadiusMinNeighbors_,
+                                                 filterKeepMask_, error, &kept);
     } else {
-        ok = FilterTools::StatisticalOutlier(cloud_, filterStatMeanK_, filterStatStdMul_,
-                                             filterKeepMask_, error, &kept);
+        ok = usePcl ? PclTools::StatisticalOutlier(cloud_, filterStatMeanK_, filterStatStdMul_,
+                                                   filterKeepMask_, error, &kept)
+                    : FilterTools::StatisticalOutlier(cloud_, filterStatMeanK_, filterStatStdMul_,
+                                                      filterKeepMask_, error, &kept);
     }
     if (!ok) {
         measure_.status = error;
@@ -679,10 +738,421 @@ void Application::RunFilterPreview(int type) {
     filterHideRemoved_ = false;
     needUpload_ = true;
 
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), u8"滤波预览：保留 %d，滤除 %d（青绿=保留，红=滤除）",
-                  filterLastKept_, filterLastRemoved_);
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), u8"%s 滤波预览：保留 %d，滤除 %d（青绿=保留，红=滤除）",
+                  AlgorithmBackendLabel(active), filterLastKept_, filterLastRemoved_);
     measure_.status = buf;
+}
+
+bool Application::FitPlaneWithBackend(const std::vector<std::size_t>& indices, PlaneModel& plane,
+                                      std::string& error, AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::FitPlaneRANSAC(EditableCloud(), indices, pclToolsPanel_.PlaneDistThresh(),
+                                        pclToolsPanel_.PlaneMaxIter(), plane, error);
+    }
+    return MeasureTools::FitPlaneSVD(EditableCloud(), indices, plane, error);
+}
+
+AlgorithmBackend Application::EffectiveAlgoBackend() const {
+    if (algoBackend_ == AlgorithmBackend::Native && !nativeAlgoUnlocked_) {
+        return AlgorithmBackend::PCL;
+    }
+    return algoBackend_;
+}
+
+bool Application::FitSphereWithBackend(const std::vector<std::size_t>& indices,
+                                       SphereModel& sphere, std::string& error,
+                                       AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::FitSphereRANSAC(EditableCloud(), indices, pclToolsPanel_.PlaneDistThresh(),
+                                         pclToolsPanel_.PlaneMaxIter(), sphere, error);
+    }
+    return MeasureTools::FitSphere(EditableCloud(), indices, sphere, error);
+}
+
+bool Application::FitCircleWithBackend(const std::vector<std::size_t>& indices, CircleModel& circle,
+                                       std::string& error, AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::FitCircleRANSAC(EditableCloud(), indices, pclToolsPanel_.PlaneDistThresh(),
+                                         pclToolsPanel_.PlaneMaxIter(), circle, error);
+    }
+    return MeasureTools::FitCircle3D(EditableCloud(), indices, circle, error);
+}
+
+bool Application::FitCylinderWithBackend(const std::vector<std::size_t>& indices,
+                                         CylinderModel& cylinder, std::string& error,
+                                         AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::FitCylinderRANSAC(EditableCloud(), indices, pclToolsPanel_.PlaneDistThresh(),
+                                           pclToolsPanel_.PlaneMaxIter(), cylinder, error);
+    }
+    return MeasureTools::FitCylinder(EditableCloud(), indices, cylinder, error);
+}
+
+bool Application::ComputeFlatnessWithBackend(const std::vector<std::size_t>& indices,
+                                           FlatnessResult& out, std::string& error,
+                                           AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::ComputeFlatness(EditableCloud(), indices, pclToolsPanel_.PlaneDistThresh(),
+                                         pclToolsPanel_.PlaneMaxIter(), out, error);
+    }
+    return MeasureTools::ComputeFlatness(EditableCloud(), indices, out, error);
+}
+
+bool Application::ComputeStepGapZHeightWithBackend(const std::vector<std::size_t>& regionA,
+                                                   const std::vector<std::size_t>& regionB,
+                                                   StepGapResult& out, std::string& error,
+                                                   AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::ComputeStepGapZHeight(EditableCloud(), regionA, regionB, out, error);
+    }
+    return MeasureTools::ComputeStepGapZHeight(EditableCloud(), regionA, regionB, out, error);
+}
+
+bool Application::ExtractSectionWithBackend(bool cutAlongX, float position, float thickness,
+                                          SectionData& out, std::string& error,
+                                          AlgorithmBackend backend) {
+    (void)backend;
+    const AlgorithmBackend active = EffectiveAlgoBackend();
+    if (active == AlgorithmBackend::PCL) {
+        return PclTools::ExtractSection(EditableCloud(), cutAlongX, position, thickness, out, error);
+    }
+    return MeasureTools::ExtractSection(EditableCloud(), cutAlongX, position, thickness, out, error);
+}
+
+void Application::ApplyClipMaskWithBackend(const Vec3& normal, float d, bool enabled) {
+    if (EffectiveAlgoBackend() == AlgorithmBackend::PCL) {
+        PclTools::ApplyClipMask(EditableCloud(), normal, d, enabled);
+    } else {
+        MeasureTools::ApplyClipMask(EditableCloud(), normal, d, enabled);
+    }
+}
+
+void Application::SelectRoiWithBackend(int fbW, int fbH, float x0, float y0, float x1, float y1,
+                                       std::vector<std::size_t>& outIndices, RoiShape shape,
+                                       bool useWorldSize, float worldRadius, float worldHalfW,
+                                       float worldHalfH, const Vec3& worldCenter,
+                                       const std::vector<float>* polyX,
+                                       const std::vector<float>* polyY) {
+    (void)EffectiveAlgoBackend();
+    outIndices.clear();
+    PointCloud& cloud = EditableCloud();
+    if (shape == RoiShape::FreePolygon && polyX && polyY) {
+        MeasureTools::SelectRoiPolygon(cloud, camera_, fbW, fbH, *polyX, *polyY, outIndices);
+        return;
+    }
+    if (useWorldSize) {
+        if (shape == RoiShape::Circle) {
+            MeasureTools::SelectRoiWorldCircleXY(cloud, camera_, fbW, fbH, worldCenter,
+                                                 worldRadius, outIndices);
+        } else {
+            MeasureTools::SelectRoiWorldRectXY(cloud, camera_, fbW, fbH, worldCenter, worldHalfW,
+                                               worldHalfH, outIndices);
+        }
+        return;
+    }
+    if (shape == RoiShape::Circle) {
+        const float cx = x0;
+        const float cy = y0;
+        const float r = std::hypot(x1 - x0, y1 - y0);
+        MeasureTools::SelectRoiCircle(cloud, camera_, fbW, fbH, cx, cy, r, outIndices);
+        return;
+    }
+    MeasureTools::SelectRoi(cloud, camera_, fbW, fbH, x0, y0, x1, y1, outIndices);
+}
+
+bool Application::MeasureHoleRadiusWithBackend(HoleMeasureResult& out, std::string& error) {
+    if (measure_.roiIndices.empty()) {
+        error = u8"请先用 ROI 框选孔缘环带区域，再测量孔径";
+        return false;
+    }
+    if (EffectiveAlgoBackend() == AlgorithmBackend::PCL) {
+        return PclTools::MeasureHoleRadius(cloud_, measure_.roiIndices, pclToolsPanel_.PlaneDistThresh(),
+                                           pclToolsPanel_.PlaneMaxIter(), out, error);
+    }
+    return MeasureTools::MeasureHoleRadius(cloud_, measure_.roiIndices, out, error);
+}
+
+bool Application::DualCloudViewActive() const {
+    return dualCloudView_ && !filledCloud_.points.empty();
+}
+
+PointCloud& Application::EditableCloud() {
+    return (activeCloudPane_ == 1 && DualCloudViewActive()) ? filledCloud_ : cloud_;
+}
+
+const PointCloud& Application::EditableCloud() const {
+    return (activeCloudPane_ == 1 && DualCloudViewActive()) ? filledCloud_ : cloud_;
+}
+
+void Application::CloseDualCloudView() {
+    dualCloudView_ = false;
+    activeCloudPane_ = 0;
+    filledCloud_.Clear();
+    displayFilledIndices_.clear();
+    gpuFilledPointCount_ = 0;
+    needUploadFilled_ = false;
+    filledRenderer_.ClearFitWireOverlay();
+}
+
+int Application::CloudPaneAtMouse(float mouseX) const {
+    if (!DualCloudViewActive()) return 0;
+    if (mouseX >= view3dPane1X_ && mouseX < view3dPane1X_ + view3dPane1W_) return 1;
+    return activeCloudPane_;
+}
+
+void Application::GetCloudPaneFbRect(int pane, int& x, int& y, int& w, int& h) const {
+    int winW = 0, winH = 0;
+    if (window_) glfwGetWindowSize(window_, &winW, &winH);
+    const float sx = (winW > 0) ? static_cast<float>(fbW_) / static_cast<float>(winW) : 1.f;
+    const float sy = (winH > 0) ? static_cast<float>(fbH_) / static_cast<float>(winH) : 1.f;
+    const float px = (pane == 1 && DualCloudViewActive()) ? view3dPane1X_ : view3dPane0X_;
+    const float pw = (pane == 1 && DualCloudViewActive()) ? view3dPane1W_ : view3dPane0W_;
+    x = static_cast<int>(std::lround(px * sx));
+    y = static_cast<int>(std::lround(view3dY_ * sy));
+    w = std::max(1, static_cast<int>(std::lround(pw * sx)));
+    h = std::max(1, static_cast<int>(std::lround(view3dH_ * sy)));
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > fbW_) w = std::max(1, fbW_ - x);
+    if (y + h > fbH_) h = std::max(1, fbH_ - y);
+}
+
+void Application::GetCloudPaneGlViewport(int pane, int& x, int& y, int& w, int& h) const {
+    int fx = 0, fy = 0;
+    GetCloudPaneFbRect(pane, fx, fy, w, h);
+    x = fx;
+    y = fbH_ - fy - h;
+    if (y < 0) y = 0;
+}
+
+float Application::CloudPaneAspect(int pane) const {
+    int x = 0, y = 0, w = 0, h = 0;
+    GetCloudPaneFbRect(pane, x, y, w, h);
+    return static_cast<float>(w) / static_cast<float>(std::max(h, 1));
+}
+
+void Application::ResetFitRoiSelection() {
+    measure_.roiShape = RoiShape::Rect;
+    measure_.roiUseWorldSize = false;
+    measure_.roiHasWorldCenter = false;
+    measure_.roiIndices.clear();
+    measure_.roiPolyX.clear();
+    measure_.roiPolyY.clear();
+    measure_.roiPolyBuilding = false;
+    measure_.roiX0 = measure_.roiX1 = 0.f;
+    measure_.roiY0 = measure_.roiY1 = 0.f;
+}
+
+void Application::DrawFitRoiShapeControls() {
+    ImGui::TextDisabled(u8"框选形状（仅作用于当前编辑点云）");
+    int shape = static_cast<int>(measure_.roiShape);
+    if (ImGui::RadioButton(u8"矩形", shape == 0)) measure_.roiShape = RoiShape::Rect;
+    ImGui::SameLine();
+    if (ImGui::RadioButton(u8"圆形", shape == 1)) measure_.roiShape = RoiShape::Circle;
+    ImGui::SameLine();
+    if (ImGui::RadioButton(u8"自由多边形", shape == 2)) {
+        measure_.roiShape = RoiShape::FreePolygon;
+    }
+    if (measure_.roiShape == RoiShape::FreePolygon) {
+        ImGui::Text(u8"顶点数: %zu", measure_.roiPolyX.size());
+        if (ImGui::Button(u8"完成多边形", ImVec2(-1, 0))) FinishRoiPolygon();
+        if (ImGui::Button(u8"清除多边形顶点", ImVec2(-1, 0))) {
+            measure_.roiPolyX.clear();
+            measure_.roiPolyY.clear();
+            measure_.roiPolyBuilding = false;
+        }
+    }
+    ImGui::Text(u8"当前框选: %zu 点", measure_.roiIndices.size());
+}
+
+void Application::BuildFilledPaneDisplayCloud(PointCloud& out) {
+    out.Clear();
+    if (!DualCloudViewActive()) return;
+
+    std::unordered_set<std::size_t> filledInliers;
+    if (measure_.mode == ToolMode::CircleFit && measure_.circle &&
+        !measure_.circle->inlierIndices.empty()) {
+        filledInliers.reserve(measure_.circle->inlierIndices.size() * 2 + 1);
+        for (std::size_t idx : measure_.circle->inlierIndices) filledInliers.insert(idx);
+    }
+
+    out.points.reserve(cloud_.points.size() + filledCloud_.points.size());
+    out.colors.reserve(out.points.capacity());
+
+    for (std::size_t i = 0; i < cloud_.points.size(); ++i) {
+        if (!cloud_.mask.empty() && !cloud_.mask[i]) continue;
+        out.points.push_back(cloud_.points[i]);
+        out.colors.push_back({0.42f, 0.45f, 0.50f});
+    }
+
+    for (std::size_t i = 0; i < filledCloud_.points.size(); ++i) {
+        out.points.push_back(filledCloud_.points[i]);
+        if (filledInliers.count(i)) {
+            out.colors.push_back({1.0f, 0.55f, 0.15f});
+        } else {
+            out.colors.push_back({0.15f, 0.88f, 0.82f});
+        }
+    }
+    out.ResetMask();
+    out.RecomputeBounds();
+    out.sourcePath = u8"<填充视区显示>";
+}
+
+void Application::RefreshGpuFilled() {
+    if (!DualCloudViewActive()) return;
+
+    PointCloud display;
+    BuildFilledPaneDisplayCloud(display);
+    if (display.bounds.Valid()) {
+        filledZMin_ = display.bounds.min.z;
+        filledZMax_ = display.bounds.max.z;
+    }
+
+    UploadParams params;
+    params.maxDisplayPoints = maxDisplayPoints_;
+    params.zMin = filledZMin_;
+    params.zMax = filledZMax_;
+    params.usePointColors = true;
+    params.highlightRoi = nullptr;
+    displayFilledIndices_.clear();
+    gpuFilledPointCount_ = filledRenderer_.Upload(display, params, nullptr);
+    needUploadFilled_ = false;
+}
+
+bool Application::RunRoiProjectFill(std::string& error) {
+    if (cloud_.points.empty()) {
+        error = u8"请先加载点云";
+        return false;
+    }
+    const bool worldCircle =
+        measure_.roiShape == RoiShape::Circle && measure_.roiUseWorldSize && measure_.roiHasWorldCenter;
+    if (measure_.roiIndices.empty() && !worldCircle) {
+        error = u8"请先用圆形 ROI 框选区域（推荐世界尺寸圆形）";
+        return false;
+    }
+
+    bool clipCircle = measure_.roiShape == RoiShape::Circle;
+    Vec3 clipCenter = measure_.roiWorldCenter;
+    float clipRadius = measure_.roiWorldRadius;
+    if (clipCircle && !measure_.roiUseWorldSize && !measure_.roiIndices.empty()) {
+        clipCenter = Vec3{0, 0, 0};
+        for (std::size_t idx : measure_.roiIndices) clipCenter += cloud_.points[idx];
+        clipCenter = clipCenter / static_cast<float>(measure_.roiIndices.size());
+        clipRadius = 0.f;
+        for (std::size_t idx : measure_.roiIndices) {
+            const Vec3 d = cloud_.points[idx] - clipCenter;
+            clipRadius = std::max(clipRadius, std::hypot(d.x, d.y));
+        }
+    }
+
+    PointCloud filled;
+    PlaneModel plane;
+    float gridStep = 0.f;
+    const bool ok = PclTools::RoiProjectFill(cloud_, measure_.roiIndices, 2, measure_.roiFillGridStep,
+                                             clipCircle, clipCenter, clipRadius, filled, plane,
+                                             gridStep, error);
+    if (!ok) return false;
+
+    filledCloud_ = std::move(filled);
+    filledCloud_.colors.clear();
+    dualCloudView_ = true;
+    activeCloudPane_ = 1;
+    measure_.circle.reset();
+    measure_.plane = plane;
+    measure_.holeMeasure = {};
+    measure_.roiIndices.clear();
+    measure_.roiHasWorldCenter = false;
+    needUpload_ = true;
+    needUploadFilled_ = true;
+    UpdateOverlays();
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  u8"已生成填充视图：灰=原始参考，青=填充 (%zu 点，网格 %.4f mm)\n"
+                  u8"原始点仅叠加显示，框选与拟合只作用于青色填充点",
+                  filledCloud_.points.size(), gridStep);
+    measure_.status = buf;
+    return true;
+}
+
+void Application::ApplyProjectionToAxis(int axis) {
+    if (cloud_.points.empty()) {
+        measure_.status = u8"请先加载点云";
+        return;
+    }
+    Vec3 dir{0, 0, 1};
+    const char* planeName = "XY";
+    if (axis == 0) {
+        dir = {1, 0, 0};
+        planeName = "YZ";
+    }
+    if (axis == 1) {
+        dir = {0, 1, 0};
+        planeName = "XZ";
+    }
+    const Vec3 origin = cloud_.bounds.Valid() ? cloud_.bounds.Center() : Vec3{0, 0, 0};
+    PushHistory(u8"平面投影");
+    std::string error;
+    const bool ok = PclTools::ProjectOntoAxis(cloud_, origin, dir, error);
+    if (!ok) {
+        measure_.status = error;
+        return;
+    }
+    cloud_.colors.clear();
+    FitCameraToCloud();
+    needUpload_ = true;
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), u8"已投影到 %s 平面（法向 %s）", planeName,
+                  axis == 0 ? "X" : (axis == 1 ? "Y" : "Z"));
+    measure_.status = buf;
+}
+
+std::optional<std::size_t> Application::PickNearestWithBackend(
+    int fbW, int fbH, float mouseX, float mouseY, float maxPixelDist,
+    const std::vector<std::size_t>* onlyIndices) {
+    const PointCloud& cloud = EditableCloud();
+    if (EffectiveAlgoBackend() == AlgorithmBackend::PCL) {
+        return PclTools::PickNearest(cloud, camera_, fbW, fbH, mouseX, mouseY, maxPixelDist,
+                                     onlyIndices);
+    }
+    return MeasureTools::PickNearest(cloud, camera_, fbW, fbH, mouseX, mouseY, maxPixelDist,
+                                     onlyIndices);
+}
+
+void Application::ApplyRoiDeleteWithBackend(const std::vector<std::size_t>& roiIndices,
+                                            bool deleteInside) {
+    if (EffectiveAlgoBackend() == AlgorithmBackend::PCL) {
+        PclTools::ApplyRoiDelete(EditableCloud(), roiIndices, deleteInside);
+    } else {
+        MeasureTools::ApplyRoiDelete(EditableCloud(), roiIndices, deleteInside);
+    }
+}
+
+void Application::RestoreAllPointsWithBackend() {
+    PointCloud& cloud = EditableCloud();
+    if (EffectiveAlgoBackend() == AlgorithmBackend::PCL) {
+        PclTools::RestoreAllPoints(cloud);
+    } else {
+        MeasureTools::RestoreAllPoints(cloud);
+    }
+    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+        needUploadFilled_ = true;
+    } else {
+        needUpload_ = true;
+    }
 }
 
 void Application::ApplyFilterResult() {
@@ -710,36 +1180,149 @@ void Application::ClearFilterCompare() {
     measure_.status = u8"已取消滤波预览";
 }
 
+AlgoToolsHost Application::BuildAlgoToolsHost(AlgorithmBackend backend) {
+    AlgoToolsHost host;
+    host.backend = backend;
+    host.cloud = &cloud_;
+    host.measure = &measure_;
+    host.currentMode = measure_.mode;
+    host.canUndo = history_.CanUndo();
+    host.canRedo = history_.CanRedo();
+    host.filterCompareActive = filterCompareActive_;
+    host.filterLastKept = filterLastKept_;
+    host.filterLastRemoved = filterLastRemoved_;
+    host.filterHideRemoved = &filterHideRemoved_;
+    host.filterVoxelLeaf = &filterVoxelLeaf_;
+    host.filterRadius = &filterRadius_;
+    host.filterRadiusMinNeighbors = &filterRadiusMinNeighbors_;
+    host.filterStatMeanK = &filterStatMeanK_;
+    host.filterStatStdMul = &filterStatStdMul_;
+    host.showCreateSphere = &showCreateSphere_;
+    host.showCreateCylinder = &showCreateCylinder_;
+    host.genSphereRadius = &genSphereRadius_;
+    host.genSpherePoints = &genSpherePoints_;
+    host.genSphereNoise = &genSphereNoise_;
+    host.genCylRadius = &genCylRadius_;
+    host.genCylHeight = &genCylHeight_;
+    host.genCylPoints = &genCylPoints_;
+    host.genCylNoise = &genCylNoise_;
+
+    host.setToolMode = [this](ToolMode mode) { SetToolMode(mode); };
+    host.undo = [this]() { Undo(); };
+    host.redo = [this]() { Redo(); };
+    host.clearVisuals = [this]() { ClearToolVisuals(true); };
+    host.runFilterPreview = [this, backend](int type) {
+        algoBackend_ = backend;
+        RunFilterPreview(type, backend);
+    };
+    host.applyFilter = [this]() { ApplyFilterResult(); };
+    host.clearFilter = [this]() { ClearFilterCompare(); };
+    host.fitPlane = [this, backend](const std::vector<std::size_t>& indices, PlaneModel& out,
+                                    std::string& err) {
+        algoBackend_ = backend;
+        const bool ok = FitPlaneWithBackend(indices, out, err, backend);
+        return ok;
+    };
+    host.fitSphere = [this, backend](const std::vector<std::size_t>& indices, SphereModel& out,
+                                     std::string& err) {
+        algoBackend_ = backend;
+        if (backend == AlgorithmBackend::PCL) {
+            const bool ok = PclTools::FitSphereRANSAC(
+                cloud_, indices, pclToolsPanel_.PlaneDistThresh(), pclToolsPanel_.PlaneMaxIter(),
+                out, err);
+            if (ok) {
+                measure_.sphere = out;
+                measure_.circle.reset();
+                measure_.cylinder.reset();
+                SetToolMode(ToolMode::SphereFit);
+                UpdateOverlays();
+            }
+            return ok;
+        }
+        const bool ok = MeasureTools::FitSphere(cloud_, indices, out, err);
+        if (ok) {
+            measure_.sphere = out;
+            measure_.circle.reset();
+            measure_.cylinder.reset();
+            SetToolMode(ToolMode::SphereFit);
+            UpdateOverlays();
+        }
+        return ok;
+    };
+    host.fitCircle = [this](const std::vector<std::size_t>& indices, CircleModel& out,
+                            std::string& err) {
+        const bool ok = FitCircleWithBackend(indices, out, err, algoBackend_);
+        if (ok) {
+            measure_.circle = out;
+            measure_.sphere.reset();
+            measure_.cylinder.reset();
+            SetToolMode(ToolMode::CircleFit);
+            UpdateOverlays();
+        }
+        return ok;
+    };
+    host.fitCylinder = [this](const std::vector<std::size_t>& indices, CylinderModel& out,
+                              std::string& err) {
+        const bool ok = FitCylinderWithBackend(indices, out, err, algoBackend_);
+        if (ok) {
+            measure_.cylinder = out;
+            measure_.sphere.reset();
+            measure_.circle.reset();
+            SetToolMode(ToolMode::CylinderFit);
+            UpdateOverlays();
+        }
+        return ok;
+    };
+    host.showPlane = [this](const PlaneModel& plane) {
+        measure_.plane = plane;
+        SetToolMode(ToolMode::PlaneFit);
+        UpdateOverlays();
+    };
+    host.clearPlane = [this]() {
+        measure_.plane.reset();
+        UpdateOverlays();
+        measure_.status = u8"已清除拟合平面";
+    };
+    host.setStatus = [this](const std::string& s) { measure_.status = s; };
+    host.requestRefreshGpu = [this]() { needUpload_ = true; };
+    return host;
+}
+
 void Application::UpdateOverlays() {
+    renderer_.ClearFitWireOverlay();
+    filledRenderer_.ClearFitWireOverlay();
+    PointCloudRenderer& activeR =
+        (DualCloudViewActive() && activeCloudPane_ == 1) ? filledRenderer_ : renderer_;
+
     if (measure_.mode == ToolMode::StepHeight && (measure_.stepA || measure_.stepB)) {
-        renderer_.SetDistanceOverlay(measure_.stepA, measure_.stepB);
+        activeR.SetDistanceOverlay(measure_.stepA, measure_.stepB);
     } else if (measure_.distA || measure_.distB) {
-        renderer_.SetDistanceOverlay(measure_.distA, measure_.distB);
+        activeR.SetDistanceOverlay(measure_.distA, measure_.distB);
     } else {
-        renderer_.SetPickOverlay(measure_.picked);
+        activeR.SetPickOverlay(measure_.picked);
     }
     if (measure_.mode == ToolMode::Section) {
         SyncSectionCutPlane();
     } else if (measure_.mode == ToolMode::Flatness && measure_.flatness.valid) {
-        renderer_.SetPlaneOverlay(measure_.flatness.plane);
+        activeR.SetPlaneOverlay(measure_.flatness.plane);
     } else if (measure_.mode == ToolMode::StepGap && measure_.stepGap.hasPlane) {
-        renderer_.SetPlaneOverlay(measure_.stepGap.planeA);
+        activeR.SetPlaneOverlay(measure_.stepGap.planeA);
     } else if (measure_.mode == ToolMode::PlaneFit) {
-        renderer_.SetPlaneOverlay(measure_.plane);
+        activeR.SetPlaneOverlay(measure_.plane);
     } else {
-        renderer_.SetPlaneOverlay(std::nullopt);
+        activeR.SetPlaneOverlay(std::nullopt);
     }
 
-    if (measure_.mode == ToolMode::SphereFit && measure_.sphere) {
-        renderer_.SetSphereOverlay(measure_.sphere);
-    } else if (measure_.mode == ToolMode::CircleFit && measure_.circle) {
-        renderer_.SetCircleOverlay(measure_.circle);
+    if (IsSphereFitMode(measure_.mode) && measure_.sphere) {
+        activeR.SetSphereOverlay(measure_.sphere);
+    } else if (measure_.circle &&
+               (measure_.mode == ToolMode::CircleFit || measure_.mode == ToolMode::Roi)) {
+        activeR.SetCircleOverlay(measure_.circle);
     } else if (measure_.mode == ToolMode::CylinderFit && measure_.cylinder) {
-        renderer_.SetCylinderOverlay(measure_.cylinder);
-    } else {
-        renderer_.ClearFitWireOverlay();
+        activeR.SetCylinderOverlay(measure_.cylinder);
     }
     renderer_.SetAxes(showAxes_, axesLength_);
+    filledRenderer_.SetAxes(showAxes_, axesLength_);
 }
 
 void Application::SyncSectionCutPlane() {
@@ -838,27 +1421,69 @@ void Application::BeginRoiDrag(float mouseX, float mouseY) {
     measure_.roiDragging = true;
     measure_.roiX0 = measure_.roiX1 = mouseX;
     measure_.roiY0 = measure_.roiY1 = mouseY;
+    if (measure_.roiUseWorldSize && measure_.mode == ToolMode::Roi) RefreshWorldRoiAt(mouseX, mouseY);
 }
 
 void Application::UpdateRoiDrag(float mouseX, float mouseY) {
     if (!measure_.roiDragging) return;
     measure_.roiX1 = mouseX;
     measure_.roiY1 = mouseY;
+    if (measure_.roiUseWorldSize && measure_.mode == ToolMode::Roi) RefreshWorldRoiAt(mouseX, mouseY);
 }
 
-void Application::EndRoiDrag() {
-    if (!measure_.roiDragging) return;
-    measure_.roiDragging = false;
+void Application::RefreshWorldRoiAt(float mouseX, float mouseY) {
     int vx = 0, vy = 0, vw = 0, vh = 0;
     GetView3dFbRect(vx, vy, vw, vh);
-    MeasureTools::SelectRoi(cloud_, camera_, vw, vh, measure_.roiX0 - static_cast<float>(vx),
-                            measure_.roiY0 - static_cast<float>(vy),
-                            measure_.roiX1 - static_cast<float>(vx),
-                            measure_.roiY1 - static_cast<float>(vy), measure_.roiIndices);
+    const float lx = mouseX - static_cast<float>(vx);
+    const float ly = mouseY - static_cast<float>(vy);
+
+    if (const auto idx = PickNearestWithBackend(vw, vh, lx, ly, 24.f, nullptr)) {
+        measure_.roiWorldCenter = EditableCloud().points[*idx];
+        measure_.roiHasWorldCenter = true;
+    }
+
+    SelectRoiWithBackend(vw, vh, lx, ly, lx, ly, measure_.roiIndices, measure_.roiShape, true,
+                         measure_.roiWorldRadius, measure_.roiWorldWidth * 0.5f,
+                         measure_.roiWorldHeight * 0.5f, measure_.roiWorldCenter, nullptr,
+                         nullptr);
+
+    measure_.status = std::string(u8"世界尺寸框选预览 ") +
+                      std::to_string(measure_.roiIndices.size()) + u8" 点（松开确认）";
+    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+        needUploadFilled_ = true;
+    } else {
+        needUpload_ = true;
+    }
+}
+
+void Application::RunRoiSelection() {
+    int vx = 0, vy = 0, vw = 0, vh = 0;
+    GetView3dFbRect(vx, vy, vw, vh);
+    const float lx0 = measure_.roiX0 - static_cast<float>(vx);
+    const float ly0 = measure_.roiY0 - static_cast<float>(vy);
+    const float lx1 = measure_.roiX1 - static_cast<float>(vx);
+    const float ly1 = measure_.roiY1 - static_cast<float>(vy);
+
+    if (measure_.roiUseWorldSize && measure_.mode == ToolMode::Roi) {
+        const float pickX = lx1;
+        const float pickY = ly1;
+        if (const auto idx = PickNearestWithBackend(vw, vh, pickX, pickY, 24.f, nullptr)) {
+            measure_.roiWorldCenter = EditableCloud().points[*idx];
+            measure_.roiHasWorldCenter = true;
+        }
+        SelectRoiWithBackend(vw, vh, pickX, pickY, pickX, pickY, measure_.roiIndices,
+                             measure_.roiShape, true, measure_.roiWorldRadius,
+                             measure_.roiWorldWidth * 0.5f, measure_.roiWorldHeight * 0.5f,
+                             measure_.roiWorldCenter, nullptr, nullptr);
+    } else {
+        SelectRoiWithBackend(vw, vh, lx0, ly0, lx1, ly1, measure_.roiIndices, measure_.roiShape,
+                             false, measure_.roiWorldRadius, measure_.roiWorldWidth * 0.5f,
+                             measure_.roiWorldHeight * 0.5f, measure_.roiWorldCenter, nullptr,
+                             nullptr);
+    }
 
     if (measure_.mode == ToolMode::StepGap) {
         auto& sg = measure_.stepGap;
-        // 已拟合 A 或已进入选 B：后续框选写入 B；否则写入 A
         if (sg.hasPlane || sg.phase == StepGapPhase::SelectB || sg.phase == StepGapPhase::Done) {
             sg.regionB = measure_.roiIndices;
             sg.hasDistances = false;
@@ -885,16 +1510,46 @@ void Application::EndRoiDrag() {
                           u8" 个点";
     }
 
-    // 框选完成后清除屏幕矩形，改用 3D 投影框（随视角移动）
     measure_.roiX0 = measure_.roiX1 = 0.f;
     measure_.roiY0 = measure_.roiY1 = 0.f;
-    needUpload_ = true;
+    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+        needUploadFilled_ = true;
+    } else {
+        needUpload_ = true;
+    }
+}
+
+void Application::FinishRoiPolygon() {
+    if (measure_.roiPolyX.size() < 3) {
+        measure_.status = u8"自由多边形至少需要 3 个顶点";
+        return;
+    }
+    int vx = 0, vy = 0, vw = 0, vh = 0;
+    GetView3dFbRect(vx, vy, vw, vh);
+    SelectRoiWithBackend(vw, vh, 0.f, 0.f, 0.f, 0.f, measure_.roiIndices, RoiShape::FreePolygon,
+                         false, 0.f, 0.f, 0.f, measure_.roiWorldCenter, &measure_.roiPolyX,
+                         &measure_.roiPolyY);
+    measure_.roiPolyBuilding = false;
+    measure_.status = std::string(u8"多边形框选 ") +
+                      std::to_string(measure_.roiIndices.size()) + u8" 个点";
+    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+        needUploadFilled_ = true;
+    } else {
+        needUpload_ = true;
+    }
+}
+
+void Application::EndRoiDrag() {
+    if (!measure_.roiDragging) return;
+    measure_.roiDragging = false;
+    RunRoiSelection();
 }
 
 void Application::GenerateSection() {
     std::string error;
-    if (!MeasureTools::ExtractSection(cloud_, measure_.section.cutAlongX, measure_.section.position,
-                                      measure_.section.thickness, measure_.section, error)) {
+    if (!ExtractSectionWithBackend(measure_.section.cutAlongX, measure_.section.position,
+                                   measure_.section.thickness, measure_.section, error,
+                                   algoBackend_)) {
         measure_.status = error;
         SyncSectionCutPlane();
         return;
@@ -1020,7 +1675,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
     if (cloud_.points.empty()) return;
     if (measure_.mode == ToolMode::Navigate) return;
     if (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
-        measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::CircleFit ||
+        IsSphereFitMode(measure_.mode) || measure_.mode == ToolMode::CircleFit ||
         measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
         measure_.mode == ToolMode::StepGap)
         return;
@@ -1028,15 +1683,18 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
 
     int vx = 0, vy = 0, vw = 0, vh = 0;
     GetView3dFbRect(vx, vy, vw, vh);
-    const auto idx = MeasureTools::PickNearest(
-        cloud_, camera_, vw, vh, mouseX - static_cast<float>(vx), mouseY - static_cast<float>(vy),
-        12.f, displayIndices_.empty() ? nullptr : &displayIndices_);
+    const std::vector<std::size_t>* disp =
+        DualCloudViewActive()
+            ? nullptr
+            : (displayIndices_.empty() ? nullptr : &displayIndices_);
+    const auto idx = PickNearestWithBackend(
+        vw, vh, mouseX - static_cast<float>(vx), mouseY - static_cast<float>(vy), 12.f, disp);
     if (!idx) {
         measure_.status = u8"光标附近没有点";
         return;
     }
-    const Vec3 pLocal = cloud_.points[*idx];
-    const Vec3 p = cloud_.ToWorld(pLocal);
+    const Vec3 pLocal = EditableCloud().points[*idx];
+    const Vec3 p = EditableCloud().ToWorld(pLocal);
 
     if (measure_.mode == ToolMode::Pick) {
         measure_.picked = pLocal;
@@ -1068,7 +1726,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
         measure_.clipD = -n.Dot(pLocal);
         measure_.clipEnabled = true;
         PushHistory(u8"剖切平面");
-        MeasureTools::ApplyClipMask(cloud_, measure_.clipNormal, measure_.clipD, true);
+        ApplyClipMaskWithBackend(measure_.clipNormal, measure_.clipD, true);
         needUpload_ = true;
         measure_.status = u8"已通过该点设置剖切平面";
     } else if (measure_.mode == ToolMode::StepHeight) {
@@ -1098,45 +1756,64 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
 void Application::UpdateView3dLayout(float contentTop, float contentH, float sidebarW) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float imageW = ImagePanelWidth();
+    const float totalW = std::max(vp->Size.x - sidebarW - imageW, 1.f);
     view3dX_ = vp->Pos.x + sidebarW;
     view3dY_ = contentTop;
-    view3dW_ = std::max(vp->Size.x - sidebarW - imageW, 1.f);
     view3dH_ = std::max(contentH, 1.f);
+    if (DualCloudViewActive()) {
+        view3dPane0X_ = view3dX_;
+        view3dPane0W_ = 0.f;
+        view3dPane1X_ = view3dX_;
+        view3dPane1W_ = totalW;
+        view3dW_ = totalW;
+    } else {
+        view3dPane0X_ = view3dX_;
+        view3dPane0W_ = totalW;
+        view3dPane1X_ = 0.f;
+        view3dPane1W_ = 0.f;
+        view3dW_ = totalW;
+    }
 }
 
 bool Application::MouseInView3d(double mx, double my) const {
-    return mx >= static_cast<double>(view3dX_) && mx < static_cast<double>(view3dX_ + view3dW_) &&
-           my >= static_cast<double>(view3dY_) && my < static_cast<double>(view3dY_ + view3dH_);
+    if (my < static_cast<double>(view3dY_) || my >= static_cast<double>(view3dY_ + view3dH_)) {
+        return false;
+    }
+    if (DualCloudViewActive()) {
+        return mx >= static_cast<double>(view3dPane1X_) &&
+               mx < static_cast<double>(view3dPane1X_ + view3dPane1W_);
+    }
+    return mx >= static_cast<double>(view3dX_) && mx < static_cast<double>(view3dX_ + view3dW_);
 }
 
 void Application::GetView3dFbRect(int& x, int& y, int& w, int& h) const {
-    int winW = 0, winH = 0;
-    if (window_) glfwGetWindowSize(window_, &winW, &winH);
-    const float sx = (winW > 0) ? static_cast<float>(fbW_) / static_cast<float>(winW) : 1.f;
-    const float sy = (winH > 0) ? static_cast<float>(fbH_) / static_cast<float>(winH) : 1.f;
-    x = static_cast<int>(std::lround(view3dX_ * sx));
-    y = static_cast<int>(std::lround(view3dY_ * sy));
-    w = std::max(1, static_cast<int>(std::lround(view3dW_ * sx)));
-    h = std::max(1, static_cast<int>(std::lround(view3dH_ * sy)));
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x + w > fbW_) w = std::max(1, fbW_ - x);
-    if (y + h > fbH_) h = std::max(1, fbH_ - y);
+    GetCloudPaneFbRect(activeCloudPane_, x, y, w, h);
 }
 
 void Application::GetView3dGlViewport(int& x, int& y, int& w, int& h) const {
-    int fx = 0, fy = 0;
-    GetView3dFbRect(fx, fy, w, h);
-    // GLFW/FB Y 向下；OpenGL viewport Y 向上
-    x = fx;
-    y = fbH_ - fy - h;
-    if (y < 0) y = 0;
+    GetCloudPaneGlViewport(activeCloudPane_, x, y, w, h);
 }
 
 float Application::View3dAspect() const {
-    int x = 0, y = 0, w = 0, h = 0;
-    GetView3dFbRect(x, y, w, h);
-    return static_cast<float>(w) / static_cast<float>(std::max(h, 1));
+    return CloudPaneAspect(activeCloudPane_);
+}
+
+void Application::DrawDualCloudPaneLabels() {
+    if (!DualCloudViewActive()) return;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImU32 bg = IM_COL32(12, 16, 20, 200);
+    const ImU32 fg = IM_COL32(220, 235, 245, 255);
+    const ImU32 hi = IM_COL32(255, 200, 80, 255);
+
+    auto drawLabel = [&](float px, float pw, const char* text, bool active) {
+        const ImVec2 ts = ImGui::CalcTextSize(text);
+        const float tx = px + 10.f;
+        const float ty = view3dY_ + 8.f;
+        dl->AddRectFilled(ImVec2(tx - 4.f, ty - 2.f), ImVec2(tx + ts.x + 4.f, ty + ts.y + 2.f),
+                          bg, 4.f);
+        dl->AddText(ImVec2(tx, ty), active ? hi : fg, text);
+    };
+    drawLabel(view3dPane1X_, view3dPane1W_, u8"投影填充（灰=原始参考，青=填充）", true);
 }
 
 void Application::DrawRoiRegionOverlay(ImDrawList* dl, int winW, int winH,
@@ -1153,10 +1830,11 @@ void Application::DrawRoiRegionOverlay(ImDrawList* dl, int winW, int winH,
     pts.reserve(std::min(indices.size(), static_cast<std::size_t>(12000)) + 8);
     for (std::size_t k = 0; k < indices.size(); k += static_cast<std::size_t>(stride)) {
         const std::size_t idx = indices[k];
-        if (idx >= cloud_.points.size()) continue;
-        if (!cloud_.mask.empty() && !cloud_.mask[idx]) continue;
+        const PointCloud& cloud = EditableCloud();
+        if (idx >= cloud.points.size()) continue;
+        if (!cloud.mask.empty() && !cloud.mask[idx]) continue;
         float sx = 0.f, sy = 0.f;
-        if (!ProjectWorldToScreen(cloud_.points[idx], sx, sy)) continue;
+        if (!ProjectWorldToScreen(cloud.points[idx], sx, sy)) continue;
         pts.push_back(ImVec2(sx * scaleX, sy * scaleY));
     }
     if (pts.size() < 2) return;
@@ -1280,29 +1958,36 @@ void Application::HandleInput() {
     static bool leftWasDown = false;
     const bool roiStyle =
         (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
-         measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::CircleFit ||
+         measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::SphereBodyFit ||
+         measure_.mode == ToolMode::CircleFit ||
          measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
          measure_.mode == ToolMode::StepGap);
     const bool sectionStyle = (measure_.mode == ToolMode::Section);
 
     const bool inView3d = MouseInView3d(mx, my);
+    if (inView3d) {
+        activeCloudPane_ = DualCloudViewActive() ? 1 : CloudPaneAtMouse(mouseX);
+    }
     const bool uiCapture = io.WantCaptureMouse;
     // 点云视区内：中键 / Shift+左键 平移优先，不受 UI 抢鼠标影响
     const bool allowPan = inView3d && (!uiCapture || middle || (left && shift));
     const bool allow3d = inView3d && !uiCapture;
 
     // 双击点云：将旋转中心设为最近点
-    if (allow3d && !cloud_.points.empty() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+    if (allow3d && !EditableCloud().points.empty() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
         !shift && !alt) {
         int vx = 0, vy = 0, vw = 0, vh = 0;
         GetView3dFbRect(vx, vy, vw, vh);
-        const auto idx = MeasureTools::PickNearest(
-            cloud_, camera_, vw, vh, mouseX - static_cast<float>(vx),
-            mouseY - static_cast<float>(vy), 14.f,
-            displayIndices_.empty() ? nullptr : &displayIndices_);
+        const std::vector<std::size_t>* disp =
+            DualCloudViewActive()
+                ? nullptr
+                : (displayIndices_.empty() ? nullptr : &displayIndices_);
+        const auto idx = PickNearestWithBackend(
+            vw, vh, mouseX - static_cast<float>(vx),
+            mouseY - static_cast<float>(vy), 14.f, disp);
         if (idx) {
-            camera_.SetOrbitTarget(cloud_.points[*idx]);
-            const Vec3 w = cloud_.ToWorld(cloud_.points[*idx]);
+            camera_.SetOrbitTarget(EditableCloud().points[*idx]);
+            const Vec3 w = EditableCloud().ToWorld(EditableCloud().points[*idx]);
             char buf[160];
             std::snprintf(buf, sizeof(buf), u8"旋转中心已设为点 #%zu  (%.4f, %.4f, %.4f)", *idx, w.x,
                           w.y, w.z);
@@ -1354,9 +2039,23 @@ void Application::HandleInput() {
                     rotating_ = false;
                 }
             } else if (roiStyle) {
-                if (left && !leftWasDown && !shift) BeginRoiDrag(mouseX, mouseY);
-                if (measure_.roiDragging && left) UpdateRoiDrag(mouseX, mouseY);
-                if (measure_.roiDragging && !left) EndRoiDrag();
+                if (measure_.mode == ToolMode::Roi &&
+                    measure_.roiShape == RoiShape::FreePolygon) {
+                    if (left && !leftWasDown && !shift) {
+                        int vx = 0, vy = 0, vw = 0, vh = 0;
+                        GetView3dFbRect(vx, vy, vw, vh);
+                        measure_.roiPolyX.push_back(mouseX - static_cast<float>(vx));
+                        measure_.roiPolyY.push_back(mouseY - static_cast<float>(vy));
+                        measure_.roiPolyBuilding = true;
+                        measure_.status = std::string(u8"多边形顶点 #") +
+                                          std::to_string(measure_.roiPolyX.size()) +
+                                          u8"，点击「完成多边形」闭合";
+                    }
+                } else {
+                    if (left && !leftWasDown && !shift) BeginRoiDrag(mouseX, mouseY);
+                    if (measure_.roiDragging && left) UpdateRoiDrag(mouseX, mouseY);
+                    if (measure_.roiDragging && !left) EndRoiDrag();
+                }
 
                 if (right) {
                     if (!rotating_) {
@@ -1441,8 +2140,10 @@ void Application::DrawOverlays() {
     ImDrawList* dl = ImGui::GetForegroundDrawList();
 
     // 叠加标注限制在点云视区内，避免画进侧栏 / 2D 图像窗口
-    const ImVec2 clipMin(view3dX_, view3dY_);
-    const ImVec2 clipMax(view3dX_ + view3dW_, view3dY_ + view3dH_);
+    const float clipX = DualCloudViewActive() ? view3dPane1X_ : view3dX_;
+    const float clipW = DualCloudViewActive() ? view3dPane1W_ : view3dW_;
+    const ImVec2 clipMin(clipX, view3dY_);
+    const ImVec2 clipMax(clipX + clipW, view3dY_ + view3dH_);
     dlBg->PushClipRect(clipMin, clipMax, true);
     dl->PushClipRect(clipMin, clipMax, true);
 
@@ -1452,16 +2153,76 @@ void Application::DrawOverlays() {
         (measure_.roiX0 != measure_.roiX1 || measure_.roiY0 != measure_.roiY1);
 
     if (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
-        measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::CircleFit ||
+        IsSphereFitMode(measure_.mode) || measure_.mode == ToolMode::CircleFit ||
         measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness) {
         if (roiDraggingNow) {
-            dlBg->AddRect(ImVec2(measure_.roiX0 * sx, measure_.roiY0 * sy),
-                          ImVec2(measure_.roiX1 * sx, measure_.roiY1 * sy),
-                          IM_COL32(64, 200, 180, 230), 0.f, 0, 2.f);
+            if (measure_.roiUseWorldSize && measure_.roiHasWorldCenter) {
+                const float aspect = View3dAspect();
+                const int segs = 72;
+                const Vec3 c = measure_.roiWorldCenter;
+                if (measure_.roiShape == RoiShape::Circle) {
+                    const float r = measure_.roiWorldRadius;
+                    ImVec2 prev{};
+                    bool hasPrev = false;
+                    for (int si = 0; si <= segs; ++si) {
+                        const float a =
+                            6.2831853f * static_cast<float>(si) / static_cast<float>(segs);
+                        const Vec3 p{c.x + r * std::cos(a), c.y + r * std::sin(a), c.z};
+                        float px = 0.f, py = 0.f;
+                        if (!ProjectWorldToScreen(p, px, py)) {
+                            hasPrev = false;
+                            continue;
+                        }
+                        const ImVec2 cur(px * sx, py * sy);
+                        if (hasPrev) dlBg->AddLine(prev, cur, IM_COL32(255, 200, 60, 240), 2.f);
+                        prev = cur;
+                        hasPrev = true;
+                    }
+                    float ccx = 0.f, ccy = 0.f;
+                    if (ProjectWorldToScreen(c, ccx, ccy)) {
+                        dlBg->AddCircleFilled(ImVec2(ccx * sx, ccy * sy), 4.f,
+                                              IM_COL32(255, 200, 60, 255));
+                    }
+                    (void)aspect;
+                } else {
+                    const float hw = measure_.roiWorldWidth * 0.5f;
+                    const float hh = measure_.roiWorldHeight * 0.5f;
+                    const Vec3 corners[4] = {
+                        {c.x - hw, c.y - hh, c.z}, {c.x + hw, c.y - hh, c.z},
+                        {c.x + hw, c.y + hh, c.z}, {c.x - hw, c.y + hh, c.z},
+                    };
+                    ImVec2 scr[4];
+                    int valid = 0;
+                    for (int ci = 0; ci < 4; ++ci) {
+                        float px = 0.f, py = 0.f;
+                        if (ProjectWorldToScreen(corners[ci], px, py)) {
+                            scr[ci] = ImVec2(px * sx, py * sy);
+                            ++valid;
+                        }
+                    }
+                    if (valid == 4) {
+                        for (int ci = 0; ci < 4; ++ci)
+                            dlBg->AddLine(scr[ci], scr[(ci + 1) % 4], IM_COL32(255, 200, 60, 240),
+                                          2.f);
+                    }
+                }
+            } else if (measure_.roiShape == RoiShape::Circle && !measure_.roiUseWorldSize) {
+                const float cx = measure_.roiX0 * sx;
+                const float cy = measure_.roiY0 * sy;
+                const float r = std::hypot((measure_.roiX1 - measure_.roiX0) * sx,
+                                           (measure_.roiY1 - measure_.roiY0) * sy);
+                dlBg->AddCircle(ImVec2(cx, cy), std::max(r, 1.f), IM_COL32(64, 200, 180, 230),
+                                0, 2.f);
+            } else {
+                dlBg->AddRect(ImVec2(measure_.roiX0 * sx, measure_.roiY0 * sy),
+                              ImVec2(measure_.roiX1 * sx, measure_.roiY1 * sy),
+                              IM_COL32(64, 200, 180, 230), 0.f, 0, 2.f);
+            }
         } else if (!measure_.roiIndices.empty()) {
             const char* label = u8"框选区域";
             if (measure_.mode == ToolMode::PlaneFit) label = u8"平面拟合区域";
             if (measure_.mode == ToolMode::SphereFit) label = u8"球面拟合区域";
+            if (measure_.mode == ToolMode::SphereBodyFit) label = u8"球体拟合区域";
             if (measure_.mode == ToolMode::CircleFit) label = u8"圆拟合区域";
             if (measure_.mode == ToolMode::CylinderFit) label = u8"圆柱拟合区域";
             if (measure_.mode == ToolMode::Flatness) label = u8"平面度区域";
@@ -1473,6 +2234,15 @@ void Application::DrawOverlays() {
             !measure_.flatness.indices.empty() && measure_.roiIndices.empty()) {
             DrawRoiRegionOverlay(dlBg, winW, winH, measure_.flatness.indices, u8"平面度区域",
                                  IM_COL32(64, 200, 180, 240), IM_COL32(120, 230, 210, 255));
+        }
+    }
+
+    if (measure_.mode == ToolMode::Roi && measure_.roiShape == RoiShape::FreePolygon &&
+        measure_.roiPolyX.size() >= 2) {
+        for (std::size_t i = 1; i < measure_.roiPolyX.size(); ++i) {
+            dlBg->AddLine(ImVec2(measure_.roiPolyX[i - 1] * sx, measure_.roiPolyY[i - 1] * sy),
+                          ImVec2(measure_.roiPolyX[i] * sx, measure_.roiPolyY[i] * sy),
+                          IM_COL32(64, 200, 180, 230), 2.f);
         }
     }
 
@@ -1942,6 +2712,8 @@ const char* ToolModeLabel(ToolMode mode) {
             return u8"平面拟合";
         case ToolMode::SphereFit:
             return u8"球面拟合";
+        case ToolMode::SphereBodyFit:
+            return u8"球体拟合";
         case ToolMode::CircleFit:
             return u8"圆拟合";
         case ToolMode::CylinderFit:
@@ -2002,17 +2774,28 @@ void Application::SetToolMode(ToolMode mode) {
     ClearToolVisuals(false);
     measure_.mode = mode;
 
+    if (mode == ToolMode::PlaneFit || mode == ToolMode::SphereFit || mode == ToolMode::SphereBodyFit ||
+        mode == ToolMode::CircleFit || mode == ToolMode::CylinderFit || mode == ToolMode::Flatness ||
+        mode == ToolMode::StepGap) {
+        ResetFitRoiSelection();
+    }
+
     if (mode == ToolMode::Flatness) {
         measure_.status = u8"平面度：框选区域后点击计算";
     } else if (mode == ToolMode::StepGap) {
         measure_.stepGap.phase = StepGapPhase::SelectA;
         measure_.status = u8"段差：先框选基准区域 A";
     } else if (mode == ToolMode::Roi) {
-        measure_.status = u8"ROI：左键拖拽框选可见表面（不含遮挡点）";
+        measure_.roiPolyX.clear();
+        measure_.roiPolyY.clear();
+        measure_.roiPolyBuilding = false;
+        measure_.status = u8"ROI：矩形/圆形拖拽框选，或自由多边形逐点点击";
     } else if (mode == ToolMode::PlaneFit) {
         measure_.status = u8"平面拟合：框选可见表面后拟合";
     } else if (mode == ToolMode::SphereFit) {
         measure_.status = u8"球面拟合：框选可见表面后拟合";
+    } else if (mode == ToolMode::SphereBodyFit) {
+        measure_.status = u8"球体拟合：框选可见表面后拟合球体";
     } else if (mode == ToolMode::CircleFit) {
         measure_.status = u8"圆拟合：框选可见表面后拟合";
     } else if (mode == ToolMode::CylinderFit) {
@@ -2039,6 +2822,7 @@ void Application::SetToolMode(ToolMode mode) {
     }
 
     needUpload_ = true;
+    if (DualCloudViewActive()) needUploadFilled_ = true;
     UpdateOverlays();
 }
 
@@ -2072,6 +2856,7 @@ float Application::DrawMenuBar() {
     if (ImGui::BeginMenu(u8"创建")) {
         if (ImGui::MenuItem(u8"球面点云…")) showCreateSphere_ = true;
         if (ImGui::MenuItem(u8"圆柱点云…")) showCreateCylinder_ = true;
+        if (ImGui::MenuItem(u8"圆面点云…")) showCreateDisk_ = true;
         ImGui::EndMenu();
     }
 
@@ -2102,6 +2887,11 @@ float Application::DrawMenuBar() {
         ImGui::Separator();
         toolItem(ToolMode::Flatness);
         toolItem(ToolMode::StepGap);
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"PCL 正交投影");
+        if (ImGui::MenuItem(u8"投影到 YZ 平面（法向 X）")) ApplyProjectionToAxis(0);
+        if (ImGui::MenuItem(u8"投影到 XZ 平面（法向 Y）")) ApplyProjectionToAxis(1);
+        if (ImGui::MenuItem(u8"投影到 XY 平面（法向 Z）")) ApplyProjectionToAxis(2);
         ImGui::EndMenu();
     }
 
@@ -2114,13 +2904,45 @@ float Application::DrawMenuBar() {
         };
         toolItem(ToolMode::PlaneFit);
         toolItem(ToolMode::SphereFit);
+        toolItem(ToolMode::SphereBodyFit);
         toolItem(ToolMode::CircleFit);
         toolItem(ToolMode::CylinderFit);
         ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu(u8"滤波")) {
+        ImGui::TextDisabled(u8"后端: %s", AlgorithmBackendLabel(EffectiveAlgoBackend()));
         DrawFilterMenuItems();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu(u8"设置")) {
+        const bool nativeActive =
+            algoBackend_ == AlgorithmBackend::Native && nativeAlgoUnlocked_;
+        if (ImGui::MenuItem(u8"自研算法", nullptr, nativeActive)) {
+            if (nativeAlgoUnlocked_) {
+                algoBackend_ = AlgorithmBackend::Native;
+                measure_.status = u8"已切换为自研算法";
+            } else {
+                showNativeAlgoPassword_ = true;
+            }
+        }
+        if (ImGui::MenuItem(u8"PCL 算法", nullptr, algoBackend_ == AlgorithmBackend::PCL)) {
+            algoBackend_ = AlgorithmBackend::PCL;
+            measure_.status = u8"已切换为 PCL 算法";
+        }
+        if (!nativeAlgoUnlocked_) {
+            ImGui::TextDisabled(u8"自研算法需输入密码启用");
+        }
+        if (algoBackend_ == AlgorithmBackend::PCL) {
+            ImGui::Separator();
+            ImGui::TextDisabled(u8"PCL RANSAC 参数（平面/球/圆/圆柱/平面度）");
+            ImGui::SetNextItemWidth(160.f);
+            ImGui::DragFloat(u8"平面距离阈值", &pclToolsPanel_.PlaneDistThresh(), 0.001f, 1e-4f,
+                             10.f, "%.4f");
+            ImGui::SetNextItemWidth(160.f);
+            ImGui::DragInt(u8"最大迭代", &pclToolsPanel_.PlaneMaxIter(), 50, 50, 10000);
+        }
         ImGui::EndMenu();
     }
 
@@ -2200,6 +3022,44 @@ void Application::DrawAboutPopup() {
     }
 }
 
+void Application::DrawNativeAlgoPasswordPopup() {
+    if (showNativeAlgoPassword_) {
+        ImGui::OpenPopup(u8"启用自研算法");
+        showNativeAlgoPassword_ = false;
+        std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(360.f, 0.f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(u8"启用自研算法", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(u8"自研点云算法尚未完全替换，需输入密码后方可启用。");
+        ImGui::Spacing();
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputText(u8"密码##native_algo", nativeAlgoPasswordBuf_, sizeof(nativeAlgoPasswordBuf_),
+                         ImGuiInputTextFlags_Password);
+        ImGui::Spacing();
+        if (ImGui::Button(u8"确定", ImVec2(120.f, 0.f))) {
+            if (std::strcmp(nativeAlgoPasswordBuf_, "111") == 0) {
+                nativeAlgoUnlocked_ = true;
+                algoBackend_ = AlgorithmBackend::Native;
+                measure_.status = u8"自研算法已启用";
+                std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
+                ImGui::CloseCurrentPopup();
+            } else {
+                measure_.status = u8"密码错误，仍使用 PCL 算法";
+                std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(u8"取消", ImVec2(120.f, 0.f))) {
+            std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void Application::DrawCreatePopups() {
     if (showCreateSphere_) {
         ImGui::OpenPopup(u8"创建球面点云");
@@ -2209,14 +3069,19 @@ void Application::DrawCreatePopups() {
         ImGui::OpenPopup(u8"创建圆柱点云");
         showCreateCylinder_ = false;
     }
+    if (showCreateDisk_) {
+        ImGui::OpenPopup(u8"创建圆面点云");
+        showCreateDisk_ = false;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(360.f, 0.f), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal(u8"创建球面点云", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextWrapped(u8"生成均匀分布的球面点云，可用于测试球面拟合。");
+        ImGui::TextWrapped(u8"生成均匀分布的球面点云（黄金角螺旋），可用于测试球面拟合。");
         ImGui::Spacing();
         ImGui::DragFloat(u8"半径", &genSphereRadius_, 0.1f, 0.01f, 1e6f, "%.3f");
         ImGui::DragInt(u8"点数", &genSpherePoints_, 100.f, 16, 2000000);
-        ImGui::DragFloat(u8"径向噪声", &genSphereNoise_, 0.001f, 0.f, 100.f, "%.4f");
+        ImGui::DragFloat(u8"法向噪声", &genSphereNoise_, 0.001f, 0.f, 100.f, "%.4f");
+        ImGui::TextDisabled(u8"噪声为 0 时球面光滑稳定；增大后可模拟测量抖动。");
         ImGui::Spacing();
         if (ImGui::Button(u8"生成", ImVec2(120.f, 0))) {
             CreateSphereCloud();
@@ -2238,6 +3103,25 @@ void Application::DrawCreatePopups() {
         ImGui::Spacing();
         if (ImGui::Button(u8"生成", ImVec2(120.f, 0))) {
             CreateCylinderCloud();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(u8"取消", ImVec2(120.f, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(360.f, 0.f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(u8"创建圆面点云", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            u8"生成 XY 平面上的圆盘点云（黄金角螺旋排布），可用于测试圆拟合。");
+        ImGui::Spacing();
+        ImGui::DragFloat(u8"半径", &genDiskRadius_, 0.1f, 0.01f, 1e6f, "%.3f");
+        ImGui::DragInt(u8"点数", &genDiskPoints_, 100.f, 16, 2000000);
+        ImGui::DragFloat(u8"Z 向噪声", &genDiskNoise_, 0.001f, 0.f, 100.f, "%.4f");
+        ImGui::TextDisabled(u8"噪声为 0 时圆面完全平整；有噪声时旋转视角可能出现深度闪烁。");
+        ImGui::Spacing();
+        if (ImGui::Button(u8"生成", ImVec2(120.f, 0))) {
+            CreateDiskCloud();
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -2555,6 +3439,15 @@ void Application::DrawToolbar(float y, float height) {
     ImGui::SameLine(0.f, 16.f);
     ImGui::TextDisabled("|");
     ImGui::SameLine();
+    ImGui::TextDisabled(u8"算法");
+    ImGui::SameLine();
+    ImGui::TextColored(EffectiveAlgoBackend() == AlgorithmBackend::PCL
+                           ? ImVec4(0.55f, 0.90f, 0.65f, 1.f)
+                           : ImVec4(0.75f, 0.75f, 0.80f, 1.f),
+                       "%s", AlgorithmBackendLabel(EffectiveAlgoBackend()));
+    ImGui::SameLine(0.f, 16.f);
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
     if (ImGui::Button(u8"清空显示", ImVec2(0.f, btnH))) {
         ClearToolVisuals(true);
     }
@@ -2579,21 +3472,21 @@ void Application::DrawFilterMenuItems() {
     ImGui::TextDisabled(u8"体素下采样");
     ImGui::SetNextItemWidth(160.f);
     ImGui::DragFloat(u8"体素边长##v", &filterVoxelLeaf_, 0.01f, 1e-4f, 1e6f, "%.4f");
-    if (ImGui::MenuItem(u8"预览体素滤波")) RunFilterPreview(0);
+    if (ImGui::MenuItem(u8"预览体素滤波")) RunFilterPreview(0, algoBackend_);
     ImGui::Separator();
     ImGui::TextDisabled(u8"半径离群点");
     ImGui::SetNextItemWidth(160.f);
     ImGui::DragFloat(u8"搜索半径##r", &filterRadius_, 0.01f, 1e-4f, 1e6f, "%.4f");
     ImGui::SetNextItemWidth(160.f);
     ImGui::DragInt(u8"最少邻居##r", &filterRadiusMinNeighbors_, 1, 1, 200);
-    if (ImGui::MenuItem(u8"预览半径滤波")) RunFilterPreview(1);
+    if (ImGui::MenuItem(u8"预览半径滤波")) RunFilterPreview(1, algoBackend_);
     ImGui::Separator();
     ImGui::TextDisabled(u8"统计离群点");
     ImGui::SetNextItemWidth(160.f);
     ImGui::DragInt(u8"邻域点数 K##s", &filterStatMeanK_, 1, 2, 200);
     ImGui::SetNextItemWidth(160.f);
     ImGui::DragFloat(u8"标准差倍数##s", &filterStatStdMul_, 0.05f, 0.1f, 10.f, "%.2f");
-    if (ImGui::MenuItem(u8"预览统计滤波")) RunFilterPreview(2);
+    if (ImGui::MenuItem(u8"预览统计滤波")) RunFilterPreview(2, algoBackend_);
     ImGui::Separator();
     if (filterCompareActive_) {
         if (ImGui::Checkbox(u8"仅显示滤波后（隐藏红色点）", &filterHideRemoved_)) {
@@ -2758,10 +3651,11 @@ void Application::DrawToolPanel() {
                 } else {
                     std::string error;
                     PlaneModel plane;
-                    if (MeasureTools::FitPlaneSVD(cloud_, measure_.roiIndices, plane, error)) {
+                    if (FitPlaneWithBackend(measure_.roiIndices, plane, error, algoBackend_)) {
                         measure_.plane = plane;
                         UpdateOverlays();
-                        measure_.status = u8"框选拟合完成";
+                        measure_.status = std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
+                                          u8" 框选拟合完成";
                     } else {
                         measure_.status = error;
                     }
@@ -2771,10 +3665,12 @@ void Application::DrawToolPanel() {
                 std::string error;
                 PlaneModel plane;
                 std::vector<std::size_t> empty;
-                if (MeasureTools::FitPlaneSVD(cloud_, empty, plane, error)) {
+                if (FitPlaneWithBackend(empty, plane, error, algoBackend_)) {
                     measure_.plane = plane;
                     UpdateOverlays();
-                    measure_.status = u8"全点云拟合完成";
+                    measure_.status =
+                        std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
+                                          u8" 全点云拟合完成";
                 } else {
                     measure_.status = error;
                 }
@@ -2785,27 +3681,36 @@ void Application::DrawToolPanel() {
             }
             break;
         case ToolMode::SphereFit:
+        case ToolMode::SphereBodyFit: {
+            const bool bodyFit = measure_.mode == ToolMode::SphereBodyFit;
             ImGui::TextWrapped(
-                u8"① 左键拖拽框选可见表面\n"
-                u8"② 点击下方按钮拟合球\n"
-                u8"③ 橙色线框为拟合球面");
+                bodyFit ? u8"① 左键拖拽框选可见表面\n"
+                          u8"② 点击下方按钮拟合球体\n"
+                          u8"③ 橙色三圆为拟合球线框\n"
+                          u8"④ 青蓝=拟合内点，灰蓝=外点（对比色）"
+                        : u8"① 左键拖拽框选可见表面\n"
+                          u8"② 点击下方按钮拟合球\n"
+                          u8"③ 橙色三圆为拟合球线框\n"
+                          u8"④ 青蓝=拟合内点，灰蓝=外点（对比色）");
             ImGui::Text(u8"当前框选: %zu 点", measure_.roiIndices.size());
             ImGui::Spacing();
-            if (ImGui::Button(u8"对框选区域拟合球", ImVec2(-1, 32.f))) {
+            if (ImGui::Button(u8"对框选区域拟合", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
                     measure_.status = u8"请先框选区域，或改用“对全部可见点拟合”";
                 } else {
                     std::string error;
                     SphereModel sphere;
-                    if (MeasureTools::FitSphere(cloud_, measure_.roiIndices, sphere, error)) {
+                    if (FitSphereWithBackend(measure_.roiIndices, sphere, error, algoBackend_)) {
                         measure_.sphere = sphere;
                         measure_.circle.reset();
                         measure_.cylinder.reset();
                         UpdateOverlays();
-                        char buf[160];
+                        needUpload_ = true;
+                        char buf[192];
                         std::snprintf(buf, sizeof(buf),
-                                      u8"球面拟合完成 R=%.6f RMS=%.6f（%d 点）", sphere.radius,
-                                      sphere.rms, sphere.pointCount);
+                                      u8"%s 完成 R=%.6f RMS=%.6f（内点 %zu）",
+                                      AlgorithmBackendLabel(EffectiveAlgoBackend()), sphere.radius,
+                                      sphere.rms, sphere.inlierIndices.size());
                         measure_.status = buf;
                     } else {
                         measure_.status = error;
@@ -2816,14 +3721,16 @@ void Application::DrawToolPanel() {
                 std::string error;
                 SphereModel sphere;
                 std::vector<std::size_t> empty;
-                if (MeasureTools::FitSphere(cloud_, empty, sphere, error)) {
+                if (FitSphereWithBackend(empty, sphere, error, algoBackend_)) {
                     measure_.sphere = sphere;
                     measure_.circle.reset();
                     measure_.cylinder.reset();
                     UpdateOverlays();
-                    char buf[160];
-                    std::snprintf(buf, sizeof(buf), u8"全点云球面拟合 R=%.6f RMS=%.6f",
-                                  sphere.radius, sphere.rms);
+                    needUpload_ = true;
+                    char buf[192];
+                    std::snprintf(buf, sizeof(buf), u8"%s 全点云拟合 R=%.6f RMS=%.6f（内点 %zu）",
+                                  AlgorithmBackendLabel(EffectiveAlgoBackend()), sphere.radius,
+                                  sphere.rms, sphere.inlierIndices.size());
                     measure_.status = buf;
                 } else {
                     measure_.status = error;
@@ -2840,14 +3747,16 @@ void Application::DrawToolPanel() {
             if (measure_.sphere && ImGui::Button(u8"清除拟合显示", ImVec2(-1, 0))) {
                 measure_.sphere.reset();
                 UpdateOverlays();
+                needUpload_ = true;
             }
             break;
+        }
         case ToolMode::CircleFit:
             ImGui::TextWrapped(
-                u8"① 左键拖拽框选可见表面\n"
-                u8"② 先拟合支撑平面，再在平面内拟合圆\n"
-                u8"③ 青色线框为拟合圆，黄线为法向");
-            ImGui::Text(u8"当前框选: %zu 点", measure_.roiIndices.size());
+                u8"① 执行「投影并填充」后，左键拖拽框选青色填充点\n"
+                u8"② 灰色为原始参考（仅显示，不参与框选与拟合）\n"
+                u8"③ 橙色线框为拟合圆；拟合后近圆点为橙色");
+            DrawFitRoiShapeControls();
             ImGui::Spacing();
             if (ImGui::Button(u8"对框选区域拟合圆", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
@@ -2855,15 +3764,21 @@ void Application::DrawToolPanel() {
                 } else {
                     std::string error;
                     CircleModel circle;
-                    if (MeasureTools::FitCircle3D(cloud_, measure_.roiIndices, circle, error)) {
+                    if (FitCircleWithBackend(measure_.roiIndices, circle, error, algoBackend_)) {
                         measure_.circle = circle;
                         measure_.sphere.reset();
                         measure_.cylinder.reset();
                         UpdateOverlays();
-                        char buf[160];
+                        if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+                            needUploadFilled_ = true;
+                        } else {
+                            needUpload_ = true;
+                        }
+                        char buf[192];
                         std::snprintf(buf, sizeof(buf),
-                                      u8"圆拟合完成 R=%.6f RMS=%.6f（%d 点）", circle.radius,
-                                      circle.rms, circle.pointCount);
+                                      u8"%s 圆拟合 R=%.6f RMS=%.6f（近圆点 %zu）",
+                                      AlgorithmBackendLabel(EffectiveAlgoBackend()), circle.radius,
+                                      circle.rms, circle.inlierIndices.size());
                         measure_.status = buf;
                     } else {
                         measure_.status = error;
@@ -2874,14 +3789,20 @@ void Application::DrawToolPanel() {
                 std::string error;
                 CircleModel circle;
                 std::vector<std::size_t> empty;
-                if (MeasureTools::FitCircle3D(cloud_, empty, circle, error)) {
+                if (FitCircleWithBackend(empty, circle, error, algoBackend_)) {
                     measure_.circle = circle;
                     measure_.sphere.reset();
                     measure_.cylinder.reset();
                     UpdateOverlays();
-                    char buf[160];
-                    std::snprintf(buf, sizeof(buf), u8"全点云圆拟合 R=%.6f RMS=%.6f",
-                                  circle.radius, circle.rms);
+                    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+                        needUploadFilled_ = true;
+                    } else {
+                        needUpload_ = true;
+                    }
+                    char buf[192];
+                    std::snprintf(buf, sizeof(buf), u8"%s 全点云圆拟合 R=%.6f RMS=%.6f（近圆点 %zu）",
+                                  AlgorithmBackendLabel(EffectiveAlgoBackend()), circle.radius,
+                                  circle.rms, circle.inlierIndices.size());
                     measure_.status = buf;
                 } else {
                     measure_.status = error;
@@ -2900,6 +3821,11 @@ void Application::DrawToolPanel() {
             if (measure_.circle && ImGui::Button(u8"清除拟合显示", ImVec2(-1, 0))) {
                 measure_.circle.reset();
                 UpdateOverlays();
+                if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+                    needUploadFilled_ = true;
+                } else {
+                    needUpload_ = true;
+                }
             }
             break;
         case ToolMode::CylinderFit:
@@ -2915,14 +3841,15 @@ void Application::DrawToolPanel() {
                 } else {
                     std::string error;
                     CylinderModel cyl;
-                    if (MeasureTools::FitCylinder(cloud_, measure_.roiIndices, cyl, error)) {
+                    if (FitCylinderWithBackend(measure_.roiIndices, cyl, error, algoBackend_)) {
                         measure_.cylinder = cyl;
                         measure_.sphere.reset();
                         measure_.circle.reset();
                         UpdateOverlays();
                         char buf[160];
                         std::snprintf(buf, sizeof(buf),
-                                      u8"圆柱拟合完成 R=%.6f RMS=%.6f（%d 点）", cyl.radius,
+                                      u8"%s 圆柱拟合完成 R=%.6f RMS=%.6f（%d 点）",
+                                      AlgorithmBackendLabel(EffectiveAlgoBackend()), cyl.radius,
                                       cyl.rms, cyl.pointCount);
                         measure_.status = buf;
                     } else {
@@ -2934,14 +3861,15 @@ void Application::DrawToolPanel() {
                 std::string error;
                 CylinderModel cyl;
                 std::vector<std::size_t> empty;
-                if (MeasureTools::FitCylinder(cloud_, empty, cyl, error)) {
+                if (FitCylinderWithBackend(empty, cyl, error, algoBackend_)) {
                     measure_.cylinder = cyl;
                     measure_.sphere.reset();
                     measure_.circle.reset();
                     UpdateOverlays();
                     char buf[160];
-                    std::snprintf(buf, sizeof(buf), u8"全点云圆柱拟合 R=%.6f RMS=%.6f",
-                                  cyl.radius, cyl.rms);
+                    std::snprintf(buf, sizeof(buf), u8"%s 全点云圆柱拟合 R=%.6f RMS=%.6f",
+                                  AlgorithmBackendLabel(EffectiveAlgoBackend()), cyl.radius,
+                                  cyl.rms);
                     measure_.status = buf;
                 } else {
                     measure_.status = error;
@@ -2974,14 +3902,15 @@ void Application::DrawToolPanel() {
             if (ImGui::Button(u8"计算平面度", ImVec2(-1, 36.f))) {
                 std::string error;
                 FlatnessResult fr;
-                if (MeasureTools::ComputeFlatness(cloud_, measure_.roiIndices, fr, error)) {
+                if (ComputeFlatnessWithBackend(measure_.roiIndices, fr, error, algoBackend_)) {
                     measure_.flatness = std::move(fr);
                     measure_.plane = measure_.flatness.plane;
                     needUpload_ = true;
                     UpdateOverlays();
                     char buf[192];
                     std::snprintf(buf, sizeof(buf),
-                                  u8"平面度 PV=%.6f mm，RMS=%.6f（%d 点）",
+                                  u8"%s 平面度 PV=%.6f mm，RMS=%.6f（%d 点）",
+                                  AlgorithmBackendLabel(EffectiveAlgoBackend()),
                                   measure_.flatness.peakToValley, measure_.flatness.rms,
                                   measure_.flatness.plane.pointCount);
                     measure_.status = buf;
@@ -3030,14 +3959,15 @@ void Application::DrawToolPanel() {
                 } else {
                     std::string error;
                     PlaneModel plane;
-                    if (MeasureTools::FitPlaneSVD(cloud_, sg.regionA, plane, error)) {
+                    if (FitPlaneWithBackend(sg.regionA, plane, error, algoBackend_)) {
                         sg.planeA = plane;
                         sg.hasPlane = true;
                         sg.hasDistances = false;
                         sg.phase = StepGapPhase::SelectB;
                         measure_.plane = plane;
                         UpdateOverlays();
-                        measure_.status = u8"区域 A 平面已拟合，请框选区域 B";
+                        measure_.status = std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
+                                          u8" 区域 A 平面已拟合，请框选区域 B";
                         needUpload_ = true;
                     } else {
                         measure_.status = error;
@@ -3051,8 +3981,8 @@ void Application::DrawToolPanel() {
                     measure_.status = u8"请先框选区域 B";
                 } else {
                     std::string error;
-                    if (MeasureTools::ComputeStepGapZHeight(cloud_, sg.regionA, sg.regionB, sg,
-                                                            error)) {
+                    if (ComputeStepGapZHeightWithBackend(sg.regionA, sg.regionB, sg, error,
+                                                         algoBackend_)) {
                         needUpload_ = true;
                         UpdateOverlays();
                         char buf[192];
@@ -3086,8 +4016,38 @@ void Application::DrawToolPanel() {
             }
             break;
         }
-        case ToolMode::Roi:
-            ImGui::TextWrapped(u8"左键拖拽框选。框选后点绿色高亮，再选择操作：");
+        case ToolMode::Roi: {
+            ImGui::TextWrapped(
+                u8"框选形状：矩形/圆形拖拽；自由多边形逐点点击后「完成多边形」。\n"
+                u8"勾选「世界尺寸」后：按下并拖动可移动框选位置，松手确认；按下方半径或边长（mm）框选。");
+            int shape = static_cast<int>(measure_.roiShape);
+            if (ImGui::RadioButton(u8"矩形", shape == 0)) measure_.roiShape = RoiShape::Rect;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"圆形", shape == 1)) measure_.roiShape = RoiShape::Circle;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"自由多边形", shape == 2)) {
+                measure_.roiShape = RoiShape::FreePolygon;
+            }
+            ImGui::Checkbox(u8"使用世界尺寸 (mm)", &measure_.roiUseWorldSize);
+            if (measure_.roiShape == RoiShape::Circle) {
+                ImGui::DragFloat(u8"圆半径 (mm)", &measure_.roiWorldRadius, 0.1f, 0.1f, 1e6f,
+                                 "%.3f");
+            } else if (measure_.roiShape == RoiShape::Rect) {
+                ImGui::DragFloat(u8"矩形宽 (mm)", &measure_.roiWorldWidth, 0.1f, 0.1f, 1e6f,
+                                 "%.3f");
+                ImGui::DragFloat(u8"矩形高 (mm)", &measure_.roiWorldHeight, 0.1f, 0.1f, 1e6f,
+                                 "%.3f");
+            }
+            if (measure_.roiShape == RoiShape::FreePolygon) {
+                ImGui::Text(u8"顶点数: %zu", measure_.roiPolyX.size());
+                if (ImGui::Button(u8"完成多边形", ImVec2(-1, 0))) FinishRoiPolygon();
+                if (ImGui::Button(u8"清除多边形顶点", ImVec2(-1, 0))) {
+                    measure_.roiPolyX.clear();
+                    measure_.roiPolyY.clear();
+                    measure_.roiPolyBuilding = false;
+                }
+            }
+            ImGui::Spacing();
             ImGui::Text(u8"已选 %zu 点", measure_.roiIndices.size());
             ImGui::Spacing();
             if (ImGui::Button(u8"清除框选内的点", ImVec2(-1, 32.f))) {
@@ -3095,11 +4055,15 @@ void Application::DrawToolPanel() {
                     measure_.status = u8"请先框选区域";
                 } else {
                     PushHistory(u8"清除框内点");
-                    MeasureTools::ApplyRoiDelete(cloud_, measure_.roiIndices, true);
+                    ApplyRoiDeleteWithBackend(measure_.roiIndices, true);
                     measure_.status = std::string(u8"已清除框内点，可见 ") +
-                                      std::to_string(cloud_.VisibleCount());
+                                      std::to_string(EditableCloud().VisibleCount());
                     measure_.roiIndices.clear();
-                    needUpload_ = true;
+                    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+                        needUploadFilled_ = true;
+                    } else {
+                        needUpload_ = true;
+                    }
                 }
             }
             if (ImGui::Button(u8"清除框选外的点（只留框内）", ImVec2(-1, 32.f))) {
@@ -3107,33 +4071,58 @@ void Application::DrawToolPanel() {
                     measure_.status = u8"请先框选区域";
                 } else {
                     PushHistory(u8"清除框外点");
-                    MeasureTools::ApplyRoiDelete(cloud_, measure_.roiIndices, false);
+                    ApplyRoiDeleteWithBackend(measure_.roiIndices, false);
                     measure_.status = std::string(u8"已清除框外点，可见 ") +
-                                      std::to_string(cloud_.VisibleCount());
+                                      std::to_string(EditableCloud().VisibleCount());
                     measure_.roiIndices.clear();
-                    needUpload_ = true;
+                    if (activeCloudPane_ == 1 && DualCloudViewActive()) {
+                        needUploadFilled_ = true;
+                    } else {
+                        needUpload_ = true;
+                    }
                 }
             }
             if (ImGui::Button(u8"恢复全部点显示", ImVec2(-1, 0))) {
                 PushHistory(u8"恢复全部点前");
-                MeasureTools::RestoreAllPoints(cloud_);
+                RestoreAllPointsWithBackend();
                 measure_.clipEnabled = false;
                 measure_.status = u8"已恢复全部点";
                 needUpload_ = true;
             }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextDisabled(u8"投影 → 填充");
+            ImGui::DragFloat(u8"填充网格步长 (mm)", &measure_.roiFillGridStep, 0.05f, 0.f, 100.f,
+                             measure_.roiFillGridStep <= 0.f ? u8"自动" : "%.3f");
+            if (ImGui::Button(u8"执行：投影并填充", ImVec2(-1, 36.f))) {
+                std::string err;
+                if (!RunRoiProjectFill(err)) measure_.status = err;
+            }
+            if (DualCloudViewActive()) {
+                ImGui::Text(u8"填充 %zu 点（叠加原始参考 %zu 点，仅显示）", filledCloud_.points.size(),
+                            cloud_.VisibleCount());
+                if (ImGui::Button(u8"关闭填充视图", ImVec2(-1, 0))) {
+                    CloseDualCloudView();
+                    measure_.status = u8"已关闭填充视图";
+                }
+            }
+            ImGui::TextWrapped(
+                u8"流程：圆形 ROI 框选挖孔区域 →「投影并填充」→ 单视区显示填充结果"
+                u8"（灰色为原始参考，仅显示）。用「拟合→圆拟合」在青色填充点上测量。");
             break;
+        }
         case ToolMode::ClipPlane:
             ImGui::TextWrapped(u8"点击一点设置剖切（优先用法向，否则 +Z）。");
             if (ImGui::Checkbox(u8"启用剖切", &measure_.clipEnabled)) {
                 if (measure_.clipEnabled) PushHistory(u8"启用剖切");
-                MeasureTools::ApplyClipMask(cloud_, measure_.clipNormal, measure_.clipD,
+                ApplyClipMaskWithBackend(measure_.clipNormal, measure_.clipD,
                                             measure_.clipEnabled);
                 needUpload_ = true;
             }
             if (ImGui::Button(u8"清除剖切", ImVec2(-1, 0))) {
                 PushHistory(u8"清除剖切前");
                 measure_.clipEnabled = false;
-                MeasureTools::RestoreAllPoints(cloud_);
+                RestoreAllPointsWithBackend();
                 needUpload_ = true;
             }
             break;
@@ -3241,6 +4230,7 @@ void Application::DrawUi() {
         };
         algoEditor_.SetHost(host);
         DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
         DrawCreatePopups();
         algoEditor_.Draw(menuBottom);
         return;
@@ -3316,7 +4306,9 @@ void Application::DrawUi() {
     // 左边缘拖拽可能改了宽度，同帧刷新点云视区，避免差一帧
     UpdateView3dLayout(contentTop, contentH, sidebarW);
     DrawAboutPopup();
+    DrawNativeAlgoPasswordPopup();
     DrawCreatePopups();
+    DrawDualCloudPaneLabels();
     DrawOverlays();
 }
 
@@ -3332,6 +4324,7 @@ void Application::Run() {
         DrawUi();
 
         if (needUpload_ && !algoEditor_.IsVisible()) RefreshGpu();
+        if (needUploadFilled_ && !algoEditor_.IsVisible()) RefreshGpuFilled();
 
         glfwGetFramebufferSize(window_, &fbW_, &fbH_);
         glDisable(GL_SCISSOR_TEST);
@@ -3340,15 +4333,27 @@ void Application::Run() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         if (!algoEditor_.IsVisible()) {
-            int vx = 0, vy = 0, vw = 0, vh = 0;
-            GetView3dGlViewport(vx, vy, vw, vh);
-            glViewport(vx, vy, vw, vh);
-            glEnable(GL_SCISSOR_TEST);
-            glScissor(vx, vy, vw, vh);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            renderer_.Draw(camera_, vw, vh, pointSize_, opacity_);
-            glDisable(GL_SCISSOR_TEST);
-            glViewport(0, 0, fbW_, fbH_);
+            if (DualCloudViewActive()) {
+                int vx = 0, vy = 0, vw = 0, vh = 0;
+                GetCloudPaneGlViewport(1, vx, vy, vw, vh);
+                glViewport(vx, vy, vw, vh);
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(vx, vy, vw, vh);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                filledRenderer_.Draw(camera_, vw, vh, pointSize_, opacity_);
+                glDisable(GL_SCISSOR_TEST);
+                glViewport(0, 0, fbW_, fbH_);
+            } else {
+                int vx = 0, vy = 0, vw = 0, vh = 0;
+                GetView3dGlViewport(vx, vy, vw, vh);
+                glViewport(vx, vy, vw, vh);
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(vx, vy, vw, vh);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                renderer_.Draw(camera_, vw, vh, pointSize_, opacity_);
+                glDisable(GL_SCISSOR_TEST);
+                glViewport(0, 0, fbW_, fbH_);
+            }
         }
 
         ImGui::Render();
@@ -3362,6 +4367,7 @@ void Application::Shutdown() {
     DestroyImageView(depthImage_);
     DestroyImageView(brightnessImage_);
     renderer_.Shutdown();
+    filledRenderer_.Shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

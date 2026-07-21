@@ -14,6 +14,7 @@ enum class ToolMode {
     Distance,
     PlaneFit,
     SphereFit,
+    SphereBodyFit,
     CircleFit,
     CylinderFit,
     Roi,
@@ -22,6 +23,16 @@ enum class ToolMode {
     StepHeight,
     Flatness,   // 平面度
     StepGap     // 段差（区域A平面 → 区域B距离图）
+};
+
+inline bool IsSphereFitMode(ToolMode mode) {
+    return mode == ToolMode::SphereFit || mode == ToolMode::SphereBodyFit;
+}
+
+enum class RoiShape {
+    Rect = 0,
+    Circle,
+    FreePolygon,
 };
 
 struct PlaneModel {
@@ -34,11 +45,21 @@ struct PlaneModel {
     float halfExtentV = 1.f;   // 平面局部 V 向半宽
 };
 
+struct HoleMeasureResult {
+    bool valid = false;
+    float innerRadius = 0.f;
+    float outerRadius = 0.f;
+    Vec3 holeCenter{0, 0, 0};
+    PlaneModel plane;
+    int boundaryPointCount = 0;
+};
+
 struct SphereModel {
     Vec3 center{0, 0, 0};
     float radius = 0.f;
     float rms = 0.f;
     int pointCount = 0;
+    std::vector<std::size_t> inlierIndices;  // 拟合内点（用于对比着色）
 };
 
 struct CircleModel {
@@ -47,6 +68,7 @@ struct CircleModel {
     float radius = 0.f;
     float rms = 0.f;
     int pointCount = 0;
+    std::vector<std::size_t> inlierIndices;  // 拟合内点（用于对比着色）
 };
 
 struct CylinderModel {
@@ -116,6 +138,17 @@ struct MeasureState {
     std::optional<PlaneModel> plane;
     bool roiDragging = false;
     float roiX0 = 0, roiY0 = 0, roiX1 = 0, roiY1 = 0;
+    RoiShape roiShape = RoiShape::Rect;
+    bool roiUseWorldSize = false;
+    float roiWorldRadius = 5.f;
+    float roiWorldWidth = 10.f;
+    float roiWorldHeight = 10.f;
+    Vec3 roiWorldCenter{0, 0, 0};
+    bool roiHasWorldCenter = false;
+    std::vector<float> roiPolyX;
+    std::vector<float> roiPolyY;
+    bool roiPolyBuilding = false;
+    float roiFillGridStep = 0.f;  // 0 = 自动网格步长 (mm)
     std::vector<std::size_t> roiIndices;
     bool clipEnabled = false;
     Vec3 clipNormal{0, 0, 1};
@@ -130,6 +163,7 @@ struct MeasureState {
     std::optional<SphereModel> sphere;
     std::optional<CircleModel> circle;
     std::optional<CylinderModel> cylinder;
+    HoleMeasureResult holeMeasure;
     std::string status;
 };
 
@@ -150,6 +184,11 @@ bool FitSphere(const PointCloud& cloud, const std::vector<std::size_t>& indices,
 bool FitCircle3D(const PointCloud& cloud, const std::vector<std::size_t>& indices, CircleModel& out,
                  std::string& error);
 
+// 已知平面后在平面内拟合圆（支持圆环与填充圆盘）
+bool FitCircleOnPlane(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                      const PlaneModel& plane, float inlierBand, CircleModel& out,
+                      std::string& error);
+
 // PCA 候选轴 + 垂面圆拟合，取径向残差最小者
 bool FitCylinder(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                  CylinderModel& out, std::string& error);
@@ -168,8 +207,43 @@ bool ComputeStepGapZHeight(const PointCloud& cloud, const std::vector<std::size_
 
 void SelectRoi(const PointCloud& cloud, const Camera& camera, int fbW, int fbH, float x0, float y0,
                float x1, float y1, std::vector<std::size_t>& outIndices);
-// 框选仅选当前视角可见表面点（深度缓冲遮挡剔除，不含被挡住的背面/下层点）
 
+void SelectRoiCircle(const PointCloud& cloud, const Camera& camera, int fbW, int fbH, float cx,
+                     float cy, float radiusPx, std::vector<std::size_t>& outIndices);
+
+void SelectRoiPolygon(const PointCloud& cloud, const Camera& camera, int fbW, int fbH,
+                      const std::vector<float>& polyX, const std::vector<float>& polyY,
+                      std::vector<std::size_t>& outIndices);
+
+// 世界坐标 XY 平面圆形/矩形 ROI（适用于水平圆面）
+void SelectRoiWorldCircleXY(const PointCloud& cloud, const Camera& camera, int fbW, int fbH,
+                            const Vec3& center, float radius,
+                            std::vector<std::size_t>& outIndices);
+
+void SelectRoiWorldRectXY(const PointCloud& cloud, const Camera& camera, int fbW, int fbH,
+                          const Vec3& center, float halfW, float halfH,
+                          std::vector<std::size_t>& outIndices);
+
+// 孔径：在环状/带孔点云上估计内圆半径（平面 + 内边界径向分位）
+bool MeasureHoleRadius(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                       HoleMeasureResult& out, std::string& error);
+
+bool MeasureHoleRadiusOnPlane(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                              const PlaneModel& plane, HoleMeasureResult& out,
+                              std::string& error);
+
+// ROI 点集 → 投影到垂直于 axis 的平面 → 网格/极坐标填充；filledOut 为填充后点云
+bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,
+                    float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+                    PointCloud& filledOut, PlaneModel& planeOut, float& outGridStep,
+                    std::string& error);
+
+// 同上并在填充结果上圆拟合（旧接口，对比视图请用 RoiProjectFill）
+bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                                int axis, float gridStepMm, bool clipCircle,
+                                const Vec3& clipCenter, float clipRadius, PointCloud& filledOut,
+                                CircleModel& circleOut, PlaneModel& planeOut, float& outGridStep,
+                                std::string& error);
 
 void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);
 

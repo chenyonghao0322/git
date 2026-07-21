@@ -36,20 +36,16 @@ bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& er
     std::normal_distribution<float> noiseN(0.f, params.noise > 0.f ? params.noise : 0.f);
 
     const Vec3 center{params.centerX, params.centerY, params.centerZ};
-    // Fibonacci sphere for even surface coverage
     const float golden = kPi * (3.f - std::sqrt(5.f));
     for (int i = 0; i < params.pointCount; ++i) {
         const float y = 1.f - 2.f * (static_cast<float>(i) + 0.5f) /
                                   static_cast<float>(params.pointCount);
         const float rHoriz = std::sqrt(std::max(0.f, 1.f - y * y));
         const float theta = golden * static_cast<float>(i);
-        const float x = std::cos(theta) * rHoriz;
-        const float z = std::sin(theta) * rHoriz;
-        float r = params.radius;
-        if (params.noise > 0.f) r += noiseN(rng);
-        if (r < 1e-4f) r = 1e-4f;
-        out.points.push_back(center + Vec3{x, y, z} * r);
-        (void)uni01;  // keep distribution constructed for future jitter options
+        const Vec3 dir{std::cos(theta) * rHoriz, y, std::sin(theta) * rHoriz};
+        Vec3 p = center + dir * params.radius;
+        if (params.noise > 0.f) p += dir * noiseN(rng);
+        out.points.push_back(p);
     }
 
     FinalizeCloud(out, u8"<生成:球面>");
@@ -94,6 +90,40 @@ bool GenerateCylinder(const CylinderParams& params, PointCloud& out, std::string
     }
 
     FinalizeCloud(out, u8"<生成:圆柱>");
+    return true;
+}
+
+bool GenerateDisk(const DiskParams& params, PointCloud& out, std::string& error) {
+    if (params.radius <= 1e-6f) {
+        error = u8"圆面半径必须大于 0。";
+        return false;
+    }
+    if (params.pointCount < 16) {
+        error = u8"点数至少为 16。";
+        return false;
+    }
+
+    out.Clear();
+    out.points.reserve(static_cast<std::size_t>(params.pointCount));
+
+    std::mt19937 rng(77u);
+    std::uniform_real_distribution<float> uni01(0.f, 1.f);
+    std::normal_distribution<float> noiseN(0.f, params.noise > 0.f ? params.noise : 0.f);
+
+    const Vec3 center{params.centerX, params.centerY, params.centerZ};
+    // 黄金角螺旋：面积均匀、确定性排布，旋转视角时不闪烁
+    const float golden = kPi * (3.f - std::sqrt(5.f));
+    for (int i = 0; i < params.pointCount; ++i) {
+        const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(params.pointCount);
+        const float r = params.radius * std::sqrt(t);
+        const float theta = golden * static_cast<float>(i);
+        float z = 0.f;
+        if (params.noise > 0.f) z += noiseN(rng);
+        out.points.push_back(center + Vec3{r * std::cos(theta), r * std::sin(theta), z});
+    }
+    (void)uni01;
+
+    FinalizeCloud(out, u8"<生成:圆面>");
     return true;
 }
 

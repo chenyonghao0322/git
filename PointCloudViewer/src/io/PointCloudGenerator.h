@@ -9,7 +9,7 @@ namespace PointCloudGenerator {
 struct SphereParams {
     float radius = 10.f;
     int pointCount = 20000;
-    float noise = 0.05f;  // 径向噪声幅度（绝对单位）
+    float noise = 0.f;  // 沿法向噪声（绝对单位），0 = 光滑球面
     float centerX = 0.f;
     float centerY = 0.f;
     float centerZ = 0.f;
@@ -25,7 +25,17 @@ struct CylinderParams {
     float centerZ = 0.f;  // 圆柱中心
 };
 
+struct DiskParams {
+    float radius = 10.f;
+    int pointCount = 20000;
+    float noise = 0.f;  // 法向（Z）噪声，0 = 完全平整
+    float centerX = 0.f;
+    float centerY = 0.f;
+    float centerZ = 0.f;
+};
+
 bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& error);
 bool GenerateCylinder(const CylinderParams& params, PointCloud& out, std::string& error);
+bool GenerateDisk(const DiskParams& params, PointCloud& out, std::string& error);
 
 }  // namespace PointCloudGenerator

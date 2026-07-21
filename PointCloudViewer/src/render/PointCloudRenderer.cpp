@@ -309,33 +309,19 @@ void PointCloudRenderer::SetSphereOverlay(const std::optional<SphereModel>& sphe
     const float R = sphere->radius;
     const Vec3 col{1.f, 0.55f, 0.15f};
     std::vector<float> verts;
-    verts.reserve(64 * 3 * 2 * 6);
-    constexpr int N = 48;
+    verts.reserve(64 * 3 * 2);
+    constexpr int N = 64;
     constexpr float kPi = 3.14159265f;
-    // Equator + two meridians (XZ, YZ) + a few latitude rings
-    auto ring = [&](float elev) {
-        const float ce = std::cos(elev);
-        const float se = std::sin(elev);
+
+    // 三条正交大圆（清晰球体轮廓，避免多条纬线像“多个圆”）
+    const Vec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (const Vec3& axis : axes) {
+        const Vec3 u = OrthoU(axis);
+        const Vec3 v = axis.Cross(u).Normalized();
         Vec3 prev;
         for (int i = 0; i <= N; ++i) {
             const float a = 2.f * kPi * static_cast<float>(i) / N;
-            const Vec3 p = c + Vec3{R * ce * std::cos(a), R * se, R * ce * std::sin(a)};
-            if (i > 0) PushSeg(verts, prev, p, col);
-            prev = p;
-        }
-    };
-    ring(0.f);
-    ring(kPi / 4.f);
-    ring(-kPi / 4.f);
-    // Meridians
-    for (int m = 0; m < 4; ++m) {
-        const float lon = 0.5f * kPi * static_cast<float>(m);
-        Vec3 prev;
-        for (int i = 0; i <= N; ++i) {
-            const float lat = -0.5f * kPi + kPi * static_cast<float>(i) / N;
-            const Vec3 p =
-                c + Vec3{R * std::cos(lat) * std::cos(lon), R * std::sin(lat),
-                         R * std::cos(lat) * std::sin(lon)};
+            const Vec3 p = c + u * (R * std::cos(a)) + v * (R * std::sin(a));
             if (i > 0) PushSeg(verts, prev, p, col);
             prev = p;
         }
@@ -353,7 +339,7 @@ void PointCloudRenderer::SetCircleOverlay(const std::optional<CircleModel>& circ
     const Vec3 v = n.Cross(u).Normalized();
     const Vec3 c = circle->center;
     const float R = circle->radius;
-    const Vec3 col{0.25f, 0.95f, 0.75f};
+    const Vec3 col{1.f, 0.55f, 0.15f};
     std::vector<float> verts;
     constexpr int N = 64;
     constexpr float kPi = 3.14159265f;

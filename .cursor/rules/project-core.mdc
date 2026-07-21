@@ -1,0 +1,48 @@
+---
+description: 点云查看器项目背景、沟通方式与通用开发原则
+alwaysApply: true
+---
+
+# 项目背景
+
+- 使用者：软件算法工程师，行业为自动化，公司产品为自研线扫相机。
+- 软件定位：个人使用的 Windows 桌面点云查看/分析工具，用于快速打开点云、检查数据质量、辅助算法调试。
+- 不是面向客户的量产软件，优先保证：开发效率、调试便利性、算法验证速度。
+
+# 沟通语言
+
+- Agent 回答尽量使用中文。
+- 除代码标识符、API 名称、第三方库名、Git 命令等必须保留英文外，说明性文字一律用中文。
+- 若必须使用英文术语，后面用括号补充中文，例如：
+  - Point Cloud（点云）
+  - Line Scan Camera（线扫相机）
+  - ROI（感兴趣区域）
+  - Voxel Grid（体素网格）
+
+# 技术栈
+
+- 语言：C++17
+- 构建：CMake + MSVC（Visual Studio 2022, x64）
+- UI：Dear ImGui + GLFW
+- 渲染：OpenGL
+- 平台：Windows 桌面
+
+# 开发原则
+
+1. **最小改动**：只改与当前需求相关的代码，不顺手重构无关模块。
+2. **先读再写**：修改前先阅读周边代码，保持命名风格、目录结构、错误处理方式一致。
+3. **实用优先**：功能以算法工程师日常调试场景为准，避免过度抽象和企业级框架化。
+4. **可编译可运行**：涉及功能改动后，应能按 README 方式完成 Release 编译。
+5. **不擅自提交**：除非用户明确要求，不要自动 `git commit` / `git push`。
+
+# 仓库与路径
+
+- 唯一 Git 仓库目录：`D:\jingya\test\pointedit\7.16\pointedit`
+- 远程：Gitee `origin`；GitHub 如有 `github` remote，仅在用户要求时推送。
+- 可执行文件：`PointCloudViewer/build/Release/PointCloudViewer.exe`
+
+# 领域术语（线扫/点云）
+
+- 深度图（Depth Map）、亮度图（Brightness Map）、点云（Point Cloud）是常见输入。
+- 关注：Z 高度伪彩、剖切、ROI 框选、平面拟合、测距、滤波对比等调试能力。
+- UI 文案优先中文，与现有界面风格保持一致。

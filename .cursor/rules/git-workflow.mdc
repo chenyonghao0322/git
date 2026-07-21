@@ -1,0 +1,14 @@
+---
+description: Git 提交与远程推送约定
+alwaysApply: false
+---
+
+# Git 约定
+
+- 工作目录固定为：`D:\jingya\test\pointedit\7.16\pointedit`
+- 默认远程：`origin`（Gitee）
+- 仅在用户明确要求时推送到 GitHub（`github` remote）
+- 提交说明风格示例：
+  - `7.21 点云编辑器 0.2版本测试`
+  - `fix: 修复深度图与亮度图尺寸不一致时的联动异常`
+- 不要嵌套多个 `.git` 仓库；`third_party` 内依赖库不要单独 init。

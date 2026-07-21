@@ -53,6 +53,7 @@ const AlgorithmEditor::ModuleDef* AlgorithmEditor::Catalog() {
     return kDefs;
 }
 
+
 int AlgorithmEditor::CatalogSize() { return static_cast<int>(ModuleType::Count); }
 
 const char* AlgorithmEditor::TypeName(ModuleType t) {
