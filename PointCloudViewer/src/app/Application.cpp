@@ -2558,24 +2558,6 @@ void Application::DrawToolbar(float y, float height) {
     if (ImGui::Button(u8"清空显示", ImVec2(0.f, btnH))) {
         ClearToolVisuals(true);
     }
-    ImGui::SameLine(0.f, 16.f);
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
-    const bool canSync = depthImage_.valid() && brightnessImage_.valid();
-    if (!canSync) ImGui::BeginDisabled();
-    if (ImGui::Button(imageSyncEnabled_ ? u8"关闭联动" : u8"深度亮度联动", ImVec2(0.f, btnH))) {
-        if (imageSyncEnabled_) {
-            imageSyncEnabled_ = false;
-            ClearImageSyncPick();
-            measure_.status = u8"已关闭深度/亮度联动";
-        } else {
-            TryEnableImageSync();
-        }
-    }
-    if (!canSync) ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        ImGui::SetTooltip(u8"深度图与亮度图同尺寸时，点选一图同步十字线到另一图");
-    }
 
     if (filterCompareActive_) {
         ImGui::SameLine(0.f, 24.f);
