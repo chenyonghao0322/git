@@ -1,5 +1,10 @@
 #pragma once
 
+// AlgorithmEditor — 节点式算法编辑器（可视化流水线）
+//
+// 通过 AlgoHost 与主程序交互：读取当前点云、将处理结果发布回 Application。
+// 独立于主工具栏的 ROI/测量流程，适合组合滤波、裁剪等自定义流程。
+
 #include "core/PointCloud.h"
 #include "render/Camera.h"
 #include "tools/MeasureTools.h"
@@ -19,8 +24,8 @@ struct AlgoHost {
 
 class AlgorithmEditor {
 public:
-    void SetHost(const AlgoHost& host) { host_ = host; }
-    void Draw(float menuBottomY);
+    void SetHost(const AlgoHost& host) { host_ = host; }  // 注入点云读写回调
+    void Draw(float menuBottomY, float bottomInset = 0.f);   // 绘制节点编辑器窗口
     void SetVisible(bool v);
     bool IsVisible() const { return visible_; }
     void ToggleVisible();

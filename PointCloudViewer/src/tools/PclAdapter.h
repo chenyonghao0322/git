@@ -1,5 +1,7 @@
 #pragma once
 
+// PclAdapter — PointCloud 与 PCL 点云格式互转
+
 #include "core/PointCloud.h"
 
 #include <pcl/point_cloud.h>

@@ -957,53 +957,207 @@ bool FitCircleOnFilledDisk(const PointCloud& filled, const PlaneModel& plane,
     return true;
 }
 
+bool FillPlaneHolesOnly(const PointCloud& cloud, const Vec3& normal, const Vec3& centroid,
+                        const Vec3& u, const Vec3& v, float minX, float maxX, float minY,
+                        float maxY, float step, PointCloud& filledOut, std::string& error) {
+    filledOut.Clear();
+    if (step <= 0.f) {
+        error = u8"网格步长无效";
+        return false;
+    }
+
+    const int gridW = std::max(1, static_cast<int>(std::ceil((maxX - minX) / step)) + 1);
+    const int gridH = std::max(1, static_cast<int>(std::ceil((maxY - minY) / step)) + 1);
+    if (static_cast<std::int64_t>(gridW) * gridH > 4000000) {
+        error = u8"填充网格过大，请增大网格步长";
+        return false;
+    }
+
+    const float planeD = -centroid.Dot(normal);
+    std::vector<uint8_t> surface(static_cast<std::size_t>(gridW) * static_cast<std::size_t>(gridH),
+                                 0);
+    auto markCell = [&](float x, float y) {
+        const int ix = static_cast<int>((x - minX) / step);
+        const int iy = static_cast<int>((y - minY) / step);
+        if (ix < 0 || iy < 0 || ix >= gridW || iy >= gridH) return;
+        surface[static_cast<std::size_t>(iy * gridW + ix)] = 1;
+    };
+
+    for (std::size_t i = 0; i < cloud.points.size(); ++i) {
+        if (!cloud.mask.empty() && !cloud.mask[i]) continue;
+        const Vec3& p = cloud.points[i];
+        const Vec3 proj = p - normal * (p.Dot(normal) + planeD);
+        const Vec3 d = proj - centroid;
+        const float x = d.Dot(u);
+        const float y = d.Dot(v);
+        if (x < minX || x > maxX || y < minY || y > maxY) continue;
+        markCell(x, y);
+    }
+
+    std::vector<uint8_t> dilated = surface;
+    for (int iy = 0; iy < gridH; ++iy) {
+        for (int ix = 0; ix < gridW; ++ix) {
+            if (!surface[static_cast<std::size_t>(iy * gridW + ix)]) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int nx = ix + dx;
+                    const int ny = iy + dy;
+                    if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
+                    dilated[static_cast<std::size_t>(ny * gridW + nx)] = 1;
+                }
+            }
+        }
+    }
+    surface = std::move(dilated);
+
+    std::vector<uint8_t> outside(static_cast<std::size_t>(gridW) * static_cast<std::size_t>(gridH),
+                                 0);
+    std::vector<int> queue;
+    queue.reserve(static_cast<std::size_t>(gridW + gridH) * 2);
+    auto tryPush = [&](int ix, int iy) {
+        if (ix < 0 || iy < 0 || ix >= gridW || iy >= gridH) return;
+        const std::size_t gi = static_cast<std::size_t>(iy * gridW + ix);
+        if (surface[gi] || outside[gi]) return;
+        outside[gi] = 1;
+        queue.push_back(iy * gridW + ix);
+    };
+    for (int ix = 0; ix < gridW; ++ix) {
+        tryPush(ix, 0);
+        tryPush(ix, gridH - 1);
+    }
+    for (int iy = 0; iy < gridH; ++iy) {
+        tryPush(0, iy);
+        tryPush(gridW - 1, iy);
+    }
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const int ix = queue[qi] % gridW;
+        const int iy = queue[qi] / gridW;
+        tryPush(ix - 1, iy);
+        tryPush(ix + 1, iy);
+        tryPush(ix, iy - 1);
+        tryPush(ix, iy + 1);
+    }
+
+    filledOut.points.reserve(surface.size() / 8 + 8);
+    for (int iy = 0; iy < gridH; ++iy) {
+        for (int ix = 0; ix < gridW; ++ix) {
+            const std::size_t gi = static_cast<std::size_t>(iy * gridW + ix);
+            if (surface[gi] || outside[gi]) continue;
+            const float cx = minX + (static_cast<float>(ix) + 0.5f) * step;
+            const float cy = minY + (static_cast<float>(iy) + 0.5f) * step;
+            filledOut.points.push_back(centroid + u * cx + v * cy);
+        }
+    }
+
+    if (filledOut.points.empty()) {
+        error = u8"未检测到可填充孔洞（请确认已挖孔且矩形框住孔缘）";
+        return false;
+    }
+    return true;
+}
+
+void CollectAnnulusIndices(const PointCloud& cloud, const Vec3& center, float holeRadius,
+                           std::vector<std::size_t>& out) {
+    if (holeRadius <= 0.f) return;
+    const float rInner = holeRadius * 1.02f;
+    const float rOuter = holeRadius * 4.f;
+    for (std::size_t i = 0; i < cloud.points.size(); ++i) {
+        if (!cloud.mask.empty() && !cloud.mask[i]) continue;
+        const Vec3 d = cloud.points[i] - center;
+        const float r = std::hypot(d.x, d.y);
+        if (r >= rInner && r <= rOuter) out.push_back(i);
+    }
+}
+
+float MeanCoordZ(const PointCloud& cloud, const std::vector<std::size_t>& idx, float fallback) {
+    if (idx.empty()) return fallback;
+    double sum = 0.0;
+    for (std::size_t i : idx) sum += cloud.points[i].z;
+    return static_cast<float>(sum / static_cast<double>(idx.size()));
+}
+
 }  // namespace
 
-bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,
-                    float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
-                    PointCloud& filledOut, PlaneModel& planeOut, float& outGridStep,
-                    std::string& error) {
+bool RoiFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, RoiFillMode mode,
+             int axis, float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+             const std::vector<std::size_t>* planeFitIndices, PointCloud& filledOut,
+             PlaneModel& planeOut, float& outGridStep, std::string& error) {
     filledOut.Clear();
     planeOut = {};
     outGridStep = 0.f;
 
     const std::vector<std::size_t> use = CollectIndices(cloud, indices);
     const bool circleOnly = clipCircle && clipRadius > 0.f;
-    if (use.size() < 3 && !circleOnly) {
+    if (mode != RoiFillMode::FitPlane && use.size() < 3 && !circleOnly) {
         error = u8"至少需要 3 个框选点，或设置世界尺寸圆形 ROI";
         return false;
     }
-    if (axis < 0 || axis > 2) {
+    if (mode == RoiFillMode::ProjectAxis && (axis < 0 || axis > 2)) {
         error = u8"投影轴无效";
         return false;
     }
 
     Vec3 normal, u, v;
-    PlaneAxes(axis, normal, u, v);
-
-    std::vector<Vec3> projected;
-    projected.reserve(use.size());
     Vec3 centroid = clipCenter;
-    if (!use.empty()) {
-        centroid = Vec3{0, 0, 0};
-        for (std::size_t idx : use) centroid += cloud.points[idx];
-        centroid = centroid / static_cast<float>(use.size());
-    }
-    const float planeD = -centroid.Dot(normal);
-
-    for (std::size_t idx : use) {
-        const Vec3& p = cloud.points[idx];
-        const float t = p.Dot(normal) + planeD;
-        projected.push_back(p - normal * t);
-    }
-
     std::vector<float> xs, ys;
-    xs.reserve(projected.size());
-    ys.reserve(projected.size());
-    for (const Vec3& p : projected) {
-        const Vec3 d = p - centroid;
-        xs.push_back(d.Dot(u));
-        ys.push_back(d.Dot(v));
+    xs.reserve(use.size());
+    ys.reserve(use.size());
+
+    if (mode == RoiFillMode::FitPlane) {
+        if (!planeFitIndices || planeFitIndices->size() < 3) {
+            error = u8"请先用矩形框选区域 A（用于平面拟合）";
+            return false;
+        }
+        const std::vector<std::size_t>& fitIdx = *planeFitIndices;
+        if (!FitPlaneSVD(cloud, fitIdx, planeOut, error)) return false;
+        normal = planeOut.normal;
+        centroid = planeOut.centroid;
+        OrthonormalBasis(normal, u, v);
+        const float planeD = -centroid.Dot(normal);
+        for (std::size_t idx : fitIdx) {
+            const Vec3& p = cloud.points[idx];
+            const Vec3 proj = p - normal * (p.Dot(normal) + planeD);
+            const Vec3 d = proj - centroid;
+            xs.push_back(d.Dot(u));
+            ys.push_back(d.Dot(v));
+        }
+    } else if (mode == RoiFillMode::DirectXY) {
+        normal = {0, 0, 1};
+        u = {1, 0, 0};
+        v = {0, 1, 0};
+        std::vector<std::size_t> refIdx = use;
+        if (refIdx.empty() && circleOnly) {
+            CollectAnnulusIndices(cloud, clipCenter, clipRadius, refIdx);
+        }
+        const float zRef = MeanCoordZ(cloud, refIdx, clipCenter.z);
+        if (!use.empty()) {
+            centroid = Vec3{0, 0, 0};
+            for (std::size_t idx : use) centroid += cloud.points[idx];
+            centroid = centroid / static_cast<float>(use.size());
+        }
+        centroid.z = zRef;
+        for (std::size_t idx : use) {
+            xs.push_back(cloud.points[idx].x - centroid.x);
+            ys.push_back(cloud.points[idx].y - centroid.y);
+        }
+        planeOut.normal = normal;
+        planeOut.centroid = centroid;
+    } else {
+        PlaneAxes(axis, normal, u, v);
+        if (!use.empty()) {
+            centroid = Vec3{0, 0, 0};
+            for (std::size_t idx : use) centroid += cloud.points[idx];
+            centroid = centroid / static_cast<float>(use.size());
+        }
+        const float planeD = -centroid.Dot(normal);
+        for (std::size_t idx : use) {
+            const Vec3& p = cloud.points[idx];
+            const float t = p.Dot(normal) + planeD;
+            const Vec3 proj = p - normal * t;
+            const Vec3 d = proj - centroid;
+            xs.push_back(d.Dot(u));
+            ys.push_back(d.Dot(v));
+        }
     }
 
     float step = gridStepMm;
@@ -1019,7 +1173,8 @@ bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& ind
             }
         }
     }
-    const bool fullCircleFill = clipCircle && clipR > 0.f;
+    const bool fullCircleFill =
+        mode != RoiFillMode::FitPlane && clipCircle && clipR > 0.f;
 
     if (step <= 0.f) {
         if (!xs.empty()) {
@@ -1038,6 +1193,27 @@ bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& ind
 
     if (fullCircleFill) {
         FillCirclePolar(clipUx, clipUy, clipR, step, centroid, u, v, filledOut);
+    } else if (mode == RoiFillMode::FitPlane) {
+        if (xs.empty()) {
+            error = u8"框选区域内没有点";
+            return false;
+        }
+        float minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+        for (std::size_t i = 1; i < xs.size(); ++i) {
+            minX = std::min(minX, xs[i]);
+            maxX = std::max(maxX, xs[i]);
+            minY = std::min(minY, ys[i]);
+            maxY = std::max(maxY, ys[i]);
+        }
+        const float pad = step * 0.5f;
+        minX -= pad;
+        maxX += pad;
+        minY -= pad;
+        maxY += pad;
+        if (!FillPlaneHolesOnly(cloud, normal, centroid, u, v, minX, maxX, minY, maxY, step,
+                                filledOut, error)) {
+            return false;
+        }
     } else {
         if (xs.empty()) {
             error = u8"框选区域内没有点";
@@ -1138,11 +1314,27 @@ bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& ind
 
     filledOut.ResetMask();
     filledOut.RecomputeBounds();
-    filledOut.sourcePath = u8"<投影填充>";
+    if (mode == RoiFillMode::FitPlane) {
+        filledOut.sourcePath = u8"<平面拟合填充>";
+    } else if (mode == RoiFillMode::DirectXY) {
+        filledOut.sourcePath = u8"<直接填充>";
+    } else {
+        filledOut.sourcePath = u8"<投影填充>";
+    }
 
-    planeOut.normal = normal;
-    planeOut.centroid = centroid;
+    if (mode != RoiFillMode::FitPlane) {
+        planeOut.normal = normal;
+        planeOut.centroid = centroid;
+    }
     return true;
+}
+
+bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,
+                    float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+                    PointCloud& filledOut, PlaneModel& planeOut, float& outGridStep,
+                    std::string& error) {
+    return RoiFill(cloud, indices, RoiFillMode::ProjectAxis, axis, gridStepMm, clipCircle,
+                   clipCenter, clipRadius, nullptr, filledOut, planeOut, outGridStep, error);
 }
 
 bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::size_t>& indices,
@@ -1464,6 +1656,58 @@ bool ComputeStepGapZHeight(const PointCloud& cloud, const std::vector<std::size_
     out.median = sorted[sorted.size() / 2];
     out.hasDistances = true;
     out.phase = StepGapPhase::Done;
+    return true;
+}
+
+bool AlignCloudToPlaneNormal(PointCloud& cloud, const PlaneModel& plane, const Vec3& targetNormal,
+                             PlaneModel& outPlane, std::string& error) {
+    if (cloud.points.empty()) {
+        error = u8"点云为空";
+        return false;
+    }
+    Vec3 srcN = plane.normal.Normalized();
+    Vec3 dstN = targetNormal.Normalized();
+    if (srcN.Length() < 1e-8f || dstN.Length() < 1e-8f) {
+        error = u8"平面法向无效";
+        return false;
+    }
+
+    const float dot = srcN.Dot(dstN);
+    if (dot > 0.9999f) {
+        error = u8"平面已与目标方向对齐，无需旋转";
+        return false;
+    }
+
+    const Mat4 rot = RotationFromTo(srcN, dstN);
+    const Vec3 pivot = plane.centroid;
+    for (Vec3& p : cloud.points) {
+        const Vec3 local = p - pivot;
+        p = rot.TransformVector(local) + pivot;
+    }
+
+    outPlane = plane;
+    outPlane.normal = dstN;
+    outPlane.centroid = pivot;
+
+    // 旋转平面局部 U/V 轴用于显示
+    Vec3 tmp = (std::fabs(dstN.x) < 0.9f) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+    Vec3 uAxis = dstN.Cross(tmp).Normalized();
+    Vec3 vAxis = dstN.Cross(uAxis).Normalized();
+    Vec3 oldU = srcN.Cross(tmp).Normalized();
+    if (oldU.Length() < 1e-8f) oldU = uAxis;
+    oldU = rot.TransformVector(oldU).Normalized();
+    float maxU = outPlane.halfExtentU;
+    float maxV = outPlane.halfExtentV;
+    if (std::fabs(oldU.Dot(uAxis)) >= std::fabs(oldU.Dot(vAxis))) {
+        outPlane.halfExtentU = maxU;
+        outPlane.halfExtentV = maxV;
+    } else {
+        outPlane.halfExtentU = maxV;
+        outPlane.halfExtentV = maxU;
+    }
+    outPlane.halfSize = std::max(outPlane.halfExtentU, outPlane.halfExtentV);
+
+    cloud.RecomputeBounds();
     return true;
 }
 

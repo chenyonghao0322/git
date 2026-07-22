@@ -754,6 +754,11 @@ bool ProjectOntoAxis(PointCloud& cloud, const Vec3& axisOrigin, const Vec3& axis
     return true;
 }
 
+bool AlignCloudToPlaneNormal(PointCloud& cloud, const PlaneModel& plane, const Vec3& targetNormal,
+                             PlaneModel& outPlane, std::string& error) {
+    return MeasureTools::AlignCloudToPlaneNormal(cloud, plane, targetNormal, outPlane, error);
+}
+
 bool MeasureHoleRadius(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                        float planeDistThresh, int planeMaxIter, HoleMeasureResult& out,
                        std::string& error) {
@@ -770,6 +775,15 @@ bool MeasureHoleRadius(const PointCloud& cloud, const std::vector<std::size_t>& 
     PlaneModel plane;
     if (!FitPlaneRANSAC(cloud, use, planeDistThresh, planeMaxIter, plane, error)) return false;
     return MeasureTools::MeasureHoleRadiusOnPlane(cloud, use, plane, out, error);
+}
+
+bool RoiFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, RoiFillMode mode,
+             int axis, float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+             const std::vector<std::size_t>* planeFitIndices, PointCloud& filledOut,
+             PlaneModel& planeOut, float& outGridStep, std::string& error) {
+    return MeasureTools::RoiFill(cloud, indices, mode, axis, gridStepMm, clipCircle, clipCenter,
+                                 clipRadius, planeFitIndices, filledOut, planeOut, outGridStep,
+                                 error);
 }
 
 bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,

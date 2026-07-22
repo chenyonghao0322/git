@@ -118,7 +118,57 @@ struct Mat4 {
         if (std::fabs(r.w) < 1e-12f) return {r.x, r.y, r.z};
         return {r.x / r.w, r.y / r.w, r.z / r.w};
     }
+
+    Vec3 TransformVector(const Vec3& v) const {
+        return {
+            m[0] * v.x + m[4] * v.y + m[8] * v.z,
+            m[1] * v.x + m[5] * v.y + m[9] * v.z,
+            m[2] * v.x + m[6] * v.y + m[10] * v.z,
+        };
+    }
 };
+
+// 绕单位轴 axis 旋转 angleRad（Rodrigues）
+inline Mat4 RotationAxisAngle(const Vec3& axisUnit, float angleRad) {
+    const float x = axisUnit.x;
+    const float y = axisUnit.y;
+    const float z = axisUnit.z;
+    const float c = std::cos(angleRad);
+    const float s = std::sin(angleRad);
+    const float t = 1.f - c;
+    Mat4 r{};
+    r.m[0] = t * x * x + c;
+    r.m[4] = t * x * y - s * z;
+    r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z;
+    r.m[5] = t * y * y + c;
+    r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y;
+    r.m[6] = t * y * z + s * x;
+    r.m[10] = t * z * z + c;
+    r.m[15] = 1.f;
+    return r;
+}
+
+// 将 fromDir 旋转到 toDir 的最小旋转矩阵（输入方向会自动归一化）
+inline Mat4 RotationFromTo(Vec3 fromDir, Vec3 toDir) {
+    fromDir = fromDir.Normalized();
+    toDir = toDir.Normalized();
+    float c = fromDir.Dot(toDir);
+    c = std::clamp(c, -1.f, 1.f);
+    if (c > 0.9999f) return Mat4::Identity();
+
+    Vec3 axis = fromDir.Cross(toDir);
+    const float s = axis.Length();
+    if (s < 1e-8f) {
+        Vec3 perp = (std::fabs(fromDir.x) < 0.9f) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+        axis = fromDir.Cross(perp).Normalized();
+        return RotationAxisAngle(axis, 3.14159265f);
+    }
+    axis = axis / s;
+    const float angle = std::atan2(s, c);
+    return RotationAxisAngle(axis, angle);
+}
 
 struct Aabb {
     Vec3 min{1e30f, 1e30f, 1e30f};

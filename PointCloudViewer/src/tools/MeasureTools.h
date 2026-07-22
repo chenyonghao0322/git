@@ -1,5 +1,10 @@
 #pragma once
 
+// MeasureTools — 自研几何/测量算法（无 PCL 依赖）
+//
+// 提供：屏幕 ROI 框选、平面/圆/球/圆柱拟合、剖切、截面、平面度、段差、
+//       ROI 填充（投影/拟合平面/直接 XY）等。Application 与 PclTools 均可调用。
+
 #include "core/MathTypes.h"
 #include "core/PointCloud.h"
 #include "render/Camera.h"
@@ -13,6 +18,7 @@ enum class ToolMode {
     Pick,
     Distance,
     PlaneFit,
+    PlaneAlign,  // 平面校准：框选基准面后旋转点云（线扫倾斜校正）
     SphereFit,
     SphereBodyFit,
     CircleFit,
@@ -129,6 +135,12 @@ struct SectionData {
     float zDistance = 0.f;     // Z 向距离 |ΔV|
 };
 
+enum class RoiFillMode {
+    ProjectAxis = 0,  // 投影到固定轴平面后填充
+    FitPlane = 1,     // 拟合支撑平面后投影填充
+    DirectXY = 2,     // 不投影，XY 平面直接填充（Z 取参考值）
+};
+
 struct MeasureState {
     ToolMode mode = ToolMode::Navigate;
     std::optional<Vec3> picked;
@@ -149,6 +161,8 @@ struct MeasureState {
     std::vector<float> roiPolyY;
     bool roiPolyBuilding = false;
     float roiFillGridStep = 0.f;  // 0 = 自动网格步长 (mm)
+    int roiFillMode = 0;          // RoiFillMode
+    std::vector<std::size_t> roiFillPlaneIndices;  // 平面拟合填充：区域 A（矩形框选）
     std::vector<std::size_t> roiIndices;
     bool clipEnabled = false;
     Vec3 clipNormal{0, 0, 1};
@@ -169,11 +183,13 @@ struct MeasureState {
 
 namespace MeasureTools {
 
+// 屏幕拾取：返回距鼠标最近的可见点索引
 std::optional<std::size_t> PickNearest(const PointCloud& cloud, const Camera& camera, int fbW,
                                        int fbH, float mouseX, float mouseY,
                                        float maxPixelDist = 12.f,
                                        const std::vector<std::size_t>* onlyIndices = nullptr);
 
+// SVD 最小二乘拟合平面
 bool FitPlaneSVD(const PointCloud& cloud, const std::vector<std::size_t>& indices, PlaneModel& out,
                  std::string& error);
 
@@ -193,9 +209,11 @@ bool FitCircleOnPlane(const PointCloud& cloud, const std::vector<std::size_t>& i
 bool FitCylinder(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                  CylinderModel& out, std::string& error);
 
+// 拟合平面并计算各点到平面的偏差统计（平面度 PV 等）
 bool ComputeFlatness(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                      FlatnessResult& out, std::string& error);
 
+// 已知平面 A 后，计算区域 B 各点到平面的有符号距离
 bool ComputeStepGapDistances(const PointCloud& cloud, const PlaneModel& planeA,
                              const std::vector<std::size_t>& regionB, StepGapResult& out,
                              std::string& error);
@@ -205,12 +223,15 @@ bool ComputeStepGapZHeight(const PointCloud& cloud, const std::vector<std::size_
                            const std::vector<std::size_t>& regionB, StepGapResult& out,
                            std::string& error);
 
+// 屏幕矩形框选可见点
 void SelectRoi(const PointCloud& cloud, const Camera& camera, int fbW, int fbH, float x0, float y0,
                float x1, float y1, std::vector<std::size_t>& outIndices);
 
+// 屏幕圆形框选可见点
 void SelectRoiCircle(const PointCloud& cloud, const Camera& camera, int fbW, int fbH, float cx,
                      float cy, float radiusPx, std::vector<std::size_t>& outIndices);
 
+// 屏幕多边形框选可见点
 void SelectRoiPolygon(const PointCloud& cloud, const Camera& camera, int fbW, int fbH,
                       const std::vector<float>& polyX, const std::vector<float>& polyY,
                       std::vector<std::size_t>& outIndices);
@@ -232,28 +253,42 @@ bool MeasureHoleRadiusOnPlane(const PointCloud& cloud, const std::vector<std::si
                               const PlaneModel& plane, HoleMeasureResult& out,
                               std::string& error);
 
-// ROI 点集 → 投影到垂直于 axis 的平面 → 网格/极坐标填充；filledOut 为填充后点云
+// ROI 点集 → 按模式填充；filledOut 为填充后点云
+bool RoiFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, RoiFillMode mode,
+             int axis, float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+             const std::vector<std::size_t>* planeFitIndices, PointCloud& filledOut,
+             PlaneModel& planeOut, float& outGridStep, std::string& error);
+
+// ROI 点集 → 投影到垂直于 axis 的平面 → 极坐标/网格填充
 bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,
                     float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
                     PointCloud& filledOut, PlaneModel& planeOut, float& outGridStep,
                     std::string& error);
 
-// 同上并在填充结果上圆拟合（旧接口，对比视图请用 RoiProjectFill）
+// 投影填充后在结果上圆拟合（旧接口）
 bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                                 int axis, float gridStepMm, bool clipCircle,
                                 const Vec3& clipCenter, float clipRadius, PointCloud& filledOut,
                                 CircleModel& circleOut, PlaneModel& planeOut, float& outGridStep,
                                 std::string& error);
 
+// 按半空间法向剖切，隐藏法向负侧点（改 mask）
 void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);
 
+// ROI 软删除：deleteInside=true 清除框内，false 只保留框内
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices, bool deleteInside);
 
-void RestoreAllPoints(PointCloud& cloud);
+void RestoreAllPoints(PointCloud& cloud);  // mask 全部置 1
 
+// 提取截面附近点并展开为 2D 轮廓
 bool ExtractSection(const PointCloud& cloud, bool cutAlongX, float position, float thickness,
                     SectionData& out, std::string& error, int maxPoints = 200000);
 
+// 构造截面切割平面的可视化模型
 PlaneModel MakeSectionCutPlane(const PointCloud& cloud, bool cutAlongX, float position);
+
+// 绕 plane.centroid 旋转点云，使 plane.normal 与 targetNormal 对齐（线扫倾斜校正）
+bool AlignCloudToPlaneNormal(PointCloud& cloud, const PlaneModel& plane, const Vec3& targetNormal,
+                             PlaneModel& outPlane, std::string& error);
 
 }  // namespace MeasureTools

@@ -1,5 +1,9 @@
 #pragma once
 
+// AlgoToolsPanel — 算法工具侧栏 UI（自研 / PCL 共用）
+//
+// 通过 AlgoToolsHost 回调与 Application 解耦：切换工具、撤销、滤波预览、拟合等。
+
 #include "core/PointCloud.h"
 #include "tools/AlgorithmBackend.h"
 #include "tools/MeasureTools.h"
@@ -57,6 +61,7 @@ struct AlgoToolsHost {
 
 namespace AlgoToolsPanel {
 
+// 绘制算法工具侧栏窗口（工具切换、滤波、拟合、撤销等）
 void Draw(bool& visible, const char* windowTitle, const AlgoToolsHost& host);
 
 }  // namespace AlgoToolsPanel

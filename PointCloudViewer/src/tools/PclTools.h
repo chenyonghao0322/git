@@ -1,5 +1,10 @@
 #pragma once
 
+// PclTools — 基于 PCL 1.x 的算法封装
+//
+// 与 MeasureTools 接口对齐：滤波、RANSAC 拟合、ROI 填充、孔径测量等。
+// Application 通过 AlgorithmBackend 在「自研 / PCL」两套实现间切换。
+
 #include "core/PointCloud.h"
 #include "render/Camera.h"
 #include "tools/MeasureTools.h"
@@ -11,8 +16,9 @@
 
 namespace PclTools {
 
-const char* VersionString();
+const char* VersionString();  // 返回 PCL 版本字符串
 
+// --- 滤波（输出 keepMask，1=保留）---
 bool VoxelDownsample(const PointCloud& cloud, float leafSize, std::vector<uint8_t>& keepMask,
                      std::string& error, int* outKept = nullptr);
 
@@ -22,6 +28,7 @@ bool RadiusOutlier(const PointCloud& cloud, float radius, int minNeighbors,
 bool StatisticalOutlier(const PointCloud& cloud, int meanK, float stdMul,
                         std::vector<uint8_t>& keepMask, std::string& error, int* outKept = nullptr);
 
+// --- RANSAC 拟合 ---
 bool FitPlaneRANSAC(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                     float distanceThreshold, int maxIterations, PlaneModel& out,
                     std::string& error);
@@ -38,6 +45,7 @@ bool FitCylinderRANSAC(const PointCloud& cloud, const std::vector<std::size_t>& 
                        float distanceThreshold, int maxIterations, CylinderModel& out,
                        std::string& error);
 
+// --- 测量 ---
 bool ComputeFlatness(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                      float distanceThreshold, int maxIterations, FlatnessResult& out,
                      std::string& error);
@@ -49,28 +57,40 @@ bool ComputeStepGapZHeight(const PointCloud& cloud, const std::vector<std::size_
 bool ExtractSection(const PointCloud& cloud, bool cutAlongX, float position, float thickness,
                     SectionData& out, std::string& error, int maxPoints = 200000);
 
-void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);
+// --- 点云编辑 ---
+void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);  // 半空间剖切掩码
 
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices,
-                    bool deleteInside);
+                    bool deleteInside);  // true=删框内 false=只留框内
 
-void RestoreAllPoints(PointCloud& cloud);
+void RestoreAllPoints(PointCloud& cloud);  // 重置 mask 为全可见
 
+// --- 拾取与框选 ---
 std::optional<std::size_t> PickNearest(const PointCloud& cloud, const Camera& camera, int fbW,
                                        int fbH, float mouseX, float mouseY,
                                        float maxPixelDist = 12.f,
                                        const std::vector<std::size_t>* onlyIndices = nullptr);
 
 void SelectRoi(const PointCloud& cloud, const Camera& camera, int fbW, int fbH, float x0, float y0,
-               float x1, float y1, std::vector<std::size_t>& outIndices);
+               float x1, float y1, std::vector<std::size_t>& outIndices);  // 屏幕矩形框选
 
-// 将可见点正交投影到垂直于指定轴的平面（PCL 管线入口，几何实现）
+// 将可见点正交投影到垂直于指定轴的平面
 bool ProjectOntoAxis(PointCloud& cloud, const Vec3& axisOrigin, const Vec3& axisDir,
                      std::string& error);
+
+// 以拟合平面为基准旋转点云，使法向与 targetNormal 对齐
+bool AlignCloudToPlaneNormal(PointCloud& cloud, const PlaneModel& plane, const Vec3& targetNormal,
+                             PlaneModel& outPlane, std::string& error);
 
 bool MeasureHoleRadius(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                        float planeDistThresh, int planeMaxIter, HoleMeasureResult& out,
                        std::string& error);
+
+// --- ROI 填充 ---
+bool RoiFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, RoiFillMode mode,
+             int axis, float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,
+             const std::vector<std::size_t>* planeFitIndices, PointCloud& filledOut,
+             PlaneModel& planeOut, float& outGridStep, std::string& error);
 
 bool RoiProjectFill(const PointCloud& cloud, const std::vector<std::size_t>& indices, int axis,
                     float gridStepMm, bool clipCircle, const Vec3& clipCenter, float clipRadius,

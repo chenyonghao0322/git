@@ -19,6 +19,8 @@ const char* ToolModeLabel(ToolMode mode) {
             return u8"测距";
         case ToolMode::PlaneFit:
             return u8"平面拟合";
+        case ToolMode::PlaneAlign:
+            return u8"平面校准";
         case ToolMode::SphereFit:
             return u8"球面拟合";
         case ToolMode::SphereBodyFit:
@@ -75,6 +77,7 @@ void DrawToolsTab(const AlgoToolsHost& host) {
     ToolButton(host, ToolMode::Pick);
     ToolButton(host, ToolMode::Distance);
     ToolButton(host, ToolMode::Roi);
+    ToolButton(host, ToolMode::PlaneAlign);
     ToolButton(host, ToolMode::ClipPlane);
     ToolButton(host, ToolMode::Section);
     ToolButton(host, ToolMode::StepHeight);

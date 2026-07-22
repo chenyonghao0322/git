@@ -1,5 +1,9 @@
 #pragma once
 
+// PointCloudIO — 点云与深度图读写
+//
+// 支持 PLY/PCD/XYZ/OBJ 加载与导出；深度图转点云（DepthMapParams）。
+
 #include "core/PointCloud.h"
 
 #include <string>
@@ -18,15 +22,13 @@ struct DepthMapParams {
     int step = 1;              // subsample >= 1
 };
 
-bool Load(const std::string& path, PointCloud& out, std::string& error);
+bool Load(const std::string& path, PointCloud& out, std::string& error);  // PLY/PCD/XYZ/OBJ
 
-// Save PLY / XYZ / TXT. Writes world coordinates (display + originOffset).
-// visibleOnly: skip mask==0 points when mask is present.
+// 保存为世界坐标；visibleOnly 时跳过 mask==0 的点
 bool Save(const std::string& path, const PointCloud& cloud, std::string& error,
           bool visibleOnly = true);
 
-// depthPath required; brightnessPath optional (empty = height coloring later).
-// On success with brightness: out.colors filled with intensity RGB.
+// 深度图（+可选亮度图）转点云
 bool LoadDepthMaps(const std::string& depthPath, const std::string& brightnessPath,
                    const DepthMapParams& params, PointCloud& out, std::string& error);
 

@@ -5,32 +5,34 @@ void UndoHistory::Clear() {
     redo_.clear();
 }
 
-void UndoHistory::Push(const std::vector<uint8_t>& mask, const std::string& label) {
-    undo_.push_back({mask, label});
+void UndoHistory::Push(const CloudSnapshot& snap) {
+    undo_.push_back(snap);
     if (undo_.size() > kMaxDepth) {
         undo_.erase(undo_.begin());
     }
     redo_.clear();
 }
 
-bool UndoHistory::Undo(std::vector<uint8_t>& currentMask, std::string& outLabel) {
+bool UndoHistory::PopUndo(CloudSnapshot& outRestore) {
     if (undo_.empty()) return false;
-    redo_.push_back({currentMask, "redo-temp"});
-    MaskSnapshot snap = std::move(undo_.back());
+    outRestore = std::move(undo_.back());
     undo_.pop_back();
-    currentMask = std::move(snap.mask);
-    outLabel = snap.label;
     return true;
 }
 
-bool UndoHistory::Redo(std::vector<uint8_t>& currentMask, std::string& outLabel) {
+void UndoHistory::PushRedo(CloudSnapshot snap) {
+    redo_.push_back(std::move(snap));
+}
+
+bool UndoHistory::PopRedo(CloudSnapshot& outRestore) {
     if (redo_.empty()) return false;
-    undo_.push_back({currentMask, "undo-temp"});
-    MaskSnapshot snap = std::move(redo_.back());
+    outRestore = std::move(redo_.back());
     redo_.pop_back();
-    currentMask = std::move(snap.mask);
-    outLabel = snap.label;
     return true;
+}
+
+void UndoHistory::PushUndo(CloudSnapshot snap) {
+    undo_.push_back(std::move(snap));
 }
 
 const std::string& UndoHistory::LastUndoLabel() const {

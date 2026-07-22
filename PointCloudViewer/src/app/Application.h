@@ -1,10 +1,19 @@
 #pragma once
 
+// Application — 主程序：窗口、UI、输入、点云生命周期与工具调度
+//
+// 职责概览：
+// - 持有主点云 cloud_ 与填充点云 filledCloud_，协调渲染与 GPU 上传
+// - 根据 ToolMode 分发点击/框选/测量逻辑
+// - 在 MeasureTools（自研）与 PclTools（PCL）之间按设置选择后端
+// - 管理撤销栈、滤波预览、双视图（原始+填充叠加）等应用状态
+
 #include "core/PointCloud.h"
 #include "render/Camera.h"
 #include "render/PointCloudRenderer.h"
 #include "tools/MeasureTools.h"
 #include "tools/UndoHistory.h"
+#include "tools/OpenCv2D.h"
 #include "app/AlgorithmEditor.h"
 #include "app/AlgoToolsPanel.h"
 #include "app/PclPanel.h"
@@ -19,11 +28,126 @@
 struct GLFWwindow;
 struct ImDrawList;
 
+enum class Image2DTool {
+    None = 0,
+    CaliperLine,
+    CaliperArc,
+    LineDistance,
+    ArcDistance,
+    CircleFit,
+    PointDistance,
+    LineAngle,
+    CircleGap,
+    PointLineDistance,
+    CaliperPoint,
+    CaliperCircle,
+    ArcLength,
+    ThreePointCircle,
+    ParallelLineDistance,
+    RectCaliper,
+    EllipseFit,
+    ProfileWidth,
+    PointProjection,
+    Concentricity,
+    Roundness,
+    RegionBlob,
+    DepthHeightDiff,
+    DepthProfile,
+};
+
+enum class ThreePointPhase : int {
+    Pick0 = 0,
+    Pick1 = 1,
+    Pick2 = 2,
+};
+
+enum class PointPickPhase : int {
+    PickA = 0,
+    PickB = 1,
+};
+
+enum class CircleCaliperPhase : int {
+    PickCenter = 0,
+    DragRadius = 1,
+};
+
+inline const char* Image2DToolLabel(Image2DTool tool) {
+    switch (tool) {
+        case Image2DTool::CaliperLine:
+            return u8"提取线段（卡尺）";
+        case Image2DTool::CaliperArc:
+            return u8"提取圆弧（卡尺）";
+        case Image2DTool::LineDistance:
+            return u8"线线距离（间隙）";
+        case Image2DTool::ArcDistance:
+            return u8"圆弧线线距离（间隙）";
+        case Image2DTool::CircleFit:
+            return u8"拟合圆";
+        case Image2DTool::PointDistance:
+            return u8"点点距离";
+        case Image2DTool::LineAngle:
+            return u8"两线夹角";
+        case Image2DTool::CircleGap:
+            return u8"圆心距 / 圆间隙";
+        case Image2DTool::PointLineDistance:
+            return u8"点线距离";
+        case Image2DTool::CaliperPoint:
+            return u8"单点卡尺";
+        case Image2DTool::CaliperCircle:
+            return u8"圆卡尺（整圆）";
+        case Image2DTool::ArcLength:
+            return u8"弧长 / 弦长";
+        case Image2DTool::ThreePointCircle:
+            return u8"三点定圆";
+        case Image2DTool::ParallelLineDistance:
+            return u8"平行线距离";
+        case Image2DTool::RectCaliper:
+            return u8"矩形卡尺";
+        case Image2DTool::EllipseFit:
+            return u8"拟合椭圆";
+        case Image2DTool::ProfileWidth:
+            return u8"剖面测宽";
+        case Image2DTool::PointProjection:
+            return u8"投影点 / 垂足";
+        case Image2DTool::Concentricity:
+            return u8"同心度";
+        case Image2DTool::Roundness:
+            return u8"圆度";
+        case Image2DTool::RegionBlob:
+            return u8"区域面积 / 质心";
+        case Image2DTool::DepthHeightDiff:
+            return u8"两点高度差";
+        case Image2DTool::DepthProfile:
+            return u8"剖面高度曲线";
+        default:
+            return u8"无";
+    }
+}
+
+enum class ArcMeasurePhase : int {
+    PickA = 0,
+    PickB = 1,
+    DragBulge = 2,
+};
+
+inline const char* ArcMeasurePhaseHint(ArcMeasurePhase phase) {
+    switch (phase) {
+        case ArcMeasurePhase::PickA:
+            return u8"① 点击设置 A 点";
+        case ArcMeasurePhase::PickB:
+            return u8"② 点击设置 B 点";
+        case ArcMeasurePhase::DragBulge:
+            return u8"③ 拖拽拱高线段调节弧线，松开预览";
+        default:
+            return u8"";
+    }
+}
+
 class Application {
 public:
-    bool Init();
-    void Run();
-    void Shutdown();
+    bool Init();      // 初始化 GLFW、OpenGL、ImGui 与渲染器
+    void Run();       // 主循环：处理事件、更新、绘制
+    void Shutdown();  // 释放 GPU 与窗口资源
 
 private:
     struct ImageView {
@@ -38,22 +162,26 @@ private:
         bool valid() const { return texId != 0 && width > 0 && height > 0; }
     };
 
-    void DrawUi();
-    float DrawMenuBar();  // returns menu bar bottom Y
+    // --- UI 绘制 ---
+    void DrawUi();                    // 整帧 ImGui 布局入口
+    float DrawMenuBar();              // 顶部菜单栏，返回底边 Y
     void DrawToolbar(float y, float height);
-    void DrawToolPanel();
+    void DrawToolPanel();             // 左侧工具面板（ROI、拟合、剖切等）
     void DrawViewAxisWidget(float contentTop, float contentBottom, float leftInset);
     void DrawAboutPopup();
     void DrawNativeAlgoPasswordPopup();
-    void DrawSectionPanel();
-    void DrawStepGapPanel();
-    void DrawFilterMenuItems();
-    void DrawCreatePopups();
-    void DrawImagePanel();
-    void HandleInput();
+    void DrawSectionPanel();          // 截面 2D 图与测距面板
+    void DrawStepGapPanel();          // 段差结果面板
+    void DrawFilterMenuItems();       // 菜单栏滤波子项
+    void Draw2DOperatorMenuItems();   // 菜单栏 2D 算子（OpenCV）
+    void DrawCreatePopups();          // 创建球/柱/圆盘弹窗
+    void DrawImagePanel();            // 右侧深度/亮度图面板
+    void HandleInput();               // 键盘快捷键（撤销、工具切换等）
+
+    // --- 文件与点云 ---
     bool LoadPath(const std::string& path);
     bool SaveCloud();
-    bool ApplyCloud(PointCloud&& cloud, const char* statusMsg);
+    bool ApplyCloud(PointCloud&& cloud, const char* statusMsg);  // 加载后重置状态与撤销栈
     void CreateSphereCloud();
     void CreateCylinderCloud();
     void CreateDiskCloud();
@@ -61,37 +189,47 @@ private:
     bool OpenBrightnessImage();
     void DestroyImageView(ImageView& view);
     bool UploadImageTexture(ImageView& view);
+
+    // --- 相机与 3D 视图 ---
     void FitCameraToCloud();
     void ApplyViewPreset(int preset);  // 0顶 1侧X 2侧Z 3沿Y 4包围盒
     void SetToolMode(ToolMode mode);
     void ClearToolVisuals(bool resetStatus = true);
-    void RefreshGpu();
-    void RebuildAnalysisColors();
-    void OnLeftClick(float mouseX, float mouseY);
+    void RefreshGpu();                 // 上传主点云到 GPU
+    void RebuildAnalysisColors();    // 按分析结果（平面度/段差/拟合）着色
+    void OnLeftClick(float mouseX, float mouseY);  // 3D 视区左键：点选/测距/剖切等
     void DrawOverlays();
-    void UpdateOverlays();
+    void UpdateOverlays();           // 同步拟合线框、测距线等到渲染器
+
+    // --- ROI 框选 ---
     void BeginRoiDrag(float mouseX, float mouseY);
     void UpdateRoiDrag(float mouseX, float mouseY);
     void EndRoiDrag();
     void FinishRoiPolygon();
-    void RunRoiSelection();
-    void RefreshWorldRoiAt(float mouseX, float mouseY);
-    void ApplyProjectionToAxis(int axis);
-    bool RunRoiProjectFill(std::string& error);
-    void RefreshGpuFilled();
+    void RunRoiSelection();          // 结束拖拽后计算 roiIndices
+    void RefreshWorldRoiAt(float mouseX, float mouseY);  // 世界尺寸 ROI 中心拾取
+
+    // --- 投影与填充 ---
+    void ApplyProjectionToAxis(int axis);  // 投影到 XY/YZ/XZ 平面
+    void AlignCloudToReferencePlane(const std::vector<std::size_t>* roiIndices,
+                                    const PlaneModel* existingPlane);
+    bool RunRoiProjectFill(std::string& error);  // 执行 ROI 填充并进入双视区
+    void RefreshGpuFilled();           // 上传填充视区合成显示
     void CloseDualCloudView();
     bool DualCloudViewActive() const;
     int CloudPaneAtMouse(float mouseX) const;
     void GetCloudPaneFbRect(int pane, int& x, int& y, int& w, int& h) const;
     void GetCloudPaneGlViewport(int pane, int& x, int& y, int& w, int& h) const;
     float CloudPaneAspect(int pane) const;
-    PointCloud& EditableCloud();
+    PointCloud& EditableCloud();       // 当前可编辑点云（主云或填充云）
     const PointCloud& EditableCloud() const;
     void DrawDualCloudPaneLabels();
     void DrawFitRoiShapeControls();
     void ResetFitRoiSelection();
-    void BuildFilledPaneDisplayCloud(PointCloud& out);
+    void BuildFilledPaneDisplayCloud(PointCloud& out);  // 灰原+青补合成
     bool MeasureHoleRadiusWithBackend(HoleMeasureResult& out, std::string& error);
+
+    // --- 截面 ---
     void GenerateSection();
     void OnSectionPlotClick(float plotX, float plotY, float plotW, float plotH);
     void UpdateSectionDistances();
@@ -104,32 +242,138 @@ private:
     void UpdateSectionDrag(float mouseX, float mouseY);
     void EndSectionDrag();
     bool ProjectWorldToScreen(const Vec3& p, float& sx, float& sy) const;
-    void PushHistory(const std::string& label);
+
+    // --- 撤销 / 重做 ---
+    void PushHistory(const std::string& label, bool captureMainPoints = false);
+    void PushMainCloudHistory(const std::string& label, bool captureMainPoints = false);
+    CloudSnapshot CaptureCloudSnapshot(HistoryCloudTarget target, const std::string& label,
+                                     bool captureMainPoints) const;
+    void ApplyCloudSnapshot(const CloudSnapshot& snap, bool closeDualOnMain);
     void Undo();
     void Redo();
+
+    // --- 布局与坐标 ---
     void UpdateAxesLength();
     void UpdateView3dLayout(float contentTop, float contentH, float sidebarW);
     bool MouseInView3d(double mx, double my) const;
-    // 点云视区在 framebuffer 中的矩形（原点左上，与鼠标 FB 坐标一致）
-    void GetView3dFbRect(int& x, int& y, int& w, int& h) const;
-    // OpenGL viewport（原点左下）
-    void GetView3dGlViewport(int& x, int& y, int& w, int& h) const;
+    void GetView3dFbRect(int& x, int& y, int& w, int& h) const;       // FB 坐标，原点左上
+    void GetView3dGlViewport(int& x, int& y, int& w, int& h) const;  // GL 视口，原点左下
     float View3dAspect() const;
     bool HasImagePanel() const;
     float ImagePanelWidth() const;
+    float SidebarWidth() const;
+    void DrawSidebarSplitter(float contentTop, float contentH);
+    void DrawConsolePanel();
+    void DrawConsoleSplitter(float contentTop, float contentH);
+    void AppendConsoleLog(const std::string& msg);
+    void SetStatus(const std::string& msg, bool logConsole = true);
+    float ConsoleHeight() const;
+
+    // --- 深度/亮度图联动 ---
     bool TryEnableImageSync();
     void ClearImageSyncPick();
     void SetImageSyncPixel(int col, int row);
     void RebuildDepthDisplay();
+    void ClearLineMeasure();
+    void ClearArcMeasure();
+    void ResetArcMeasurePick();
+    void ClearMeasuredLinesOnly();
+    void ClearMeasuredArcsOnly();
+    void ClearAllMeasuredLines();
+    void PreviewLineMeasure(ImageView& view);
+    void PreviewArcMeasure(ImageView& view);
+    void ConfirmLineMeasure();
+    void ConfirmArcMeasure();
+    void CancelCaliperPending();
+    void PreviewCircleFitFromRoi(ImageView& view);
+    void PreviewCircleFitFromMeasuredArc(int arcIndex);
+    void ConfirmCircleFit();
+    void CancelCircleFitPending();
+    void UndoLastMeasuredLine();
+    bool CanUndoMeasuredLine() const;
+    void Undo2DOrCloud();
+    int ImageSourceOf(const ImageView& view) const;
+    ImageView* ImageViewFromSource(int source);
+    const ImageView* ImageViewFromSource(int source) const;
+    void ComputeSelectedLineDistance();
+    void ClearLineDistance();
+    void PickLineForDistance(int lineIndex);
+    int FindClosestMeasuredLine(int imageSource, float px, float py, float maxDistPx) const;
+    void ComputeSelectedArcDistance();
+    void ClearArcDistance();
+    void PickArcForDistance(int arcIndex);
+    int FindClosestMeasuredArc(int imageSource, float px, float py, float maxDistPx) const;
+    int FindClosestMeasuredCircleFit(int imageSource, float px, float py, float maxDistPx) const;
+    void AddPointDistance(float ax, float ay, float bx, float by, int imageSource);
+    void PickLineForAngle(int lineIndex);
+    void ComputeSelectedLineAngle();
+    void ClearLineAngle();
+    void PickCircleForGap(int circleIndex);
+    void ComputeSelectedCircleGap();
+    void ClearCircleGap();
+    void PickPointForPointLine(float px, float py, int imageSource);
+    void PickLineForPointLine(int lineIndex);
+    void ComputePointLineDistance();
+    void ClearPointLineDistance();
+    void PreviewCaliperPoint(ImageView& view);
+    void ConfirmCaliperPoint();
+    void CancelCaliperPointPending();
+    void PreviewCircleCaliper(ImageView& view);
+    void ConfirmCircleCaliper();
+    void CancelCircleCaliperPending();
+    void PickArcForLength(int arcIndex);
+    void ComputeSelectedArcLength();
+    void ClearArcLength();
+    void ConfirmThreePointCircle();
+    void ClearThreePointCircle();
+    void PickLineForParallelDist(int lineIndex);
+    void ComputeParallelLineDistance();
+    void ClearParallelLineDistance();
+    void PreviewRectCaliper(ImageView& view);
+    void ConfirmRectCaliper();
+    void CancelRectCaliperPending();
+    void PreviewEllipseFitFromRoi(ImageView& view);
+    void PreviewEllipseFitFromMeasuredArc(int arcIndex);
+    void ConfirmEllipseFit();
+    void CancelEllipseFitPending();
+    void PreviewProfileWidth(ImageView& view);
+    void ConfirmProfileWidth();
+    void CancelProfileWidthPending();
+    void PickPointForProjection(float px, float py, int imageSource);
+    void PickLineForProjection(int lineIndex);
+    void ComputePointProjection();
+    void ClearPointProjection();
+    void PickCircleForConcentricity(int circleIndex);
+    void ComputeConcentricity();
+    void ClearConcentricity();
+    void PickCircleForRoundness(int circleIndex);
+    void ComputeRoundness();
+    void ClearRoundness();
+    int FindClosestMeasuredCircleCaliper(int imageSource, float px, float py, float maxDistPx) const;
+    void PreviewRegionBlob(ImageView& view);
+    void ConfirmRegionBlob();
+    void CancelRegionBlobPending();
+    void AddDepthHeightSample(float px, float py, int imageSource);
+    void ClearDepthHeightDiff();
+    void PreviewDepthProfile(ImageView& view);
+    void ClearDepthProfile();
+    void ResetImage2dView();
+    void DrawLineMeasureOverlay(ImDrawList* dl, const ImageView& view, float cursorX, float cursorY,
+                                float drawW, float drawH);
+    void DrawImage2DToolPanel();
     void DrawImageWithSyncMarker(ImageView& view, const char* label);
     void DrawDepthRenderControls();
     void DrawRoiRegionOverlay(ImDrawList* dl, int winW, int winH,
                               const std::vector<std::size_t>& indices, const char* label,
                               unsigned int col, unsigned int textCol);
     void DrawStepGapRegionOverlays(ImDrawList* dl, int winW, int winH);
-    void RunFilterPreview(int type, AlgorithmBackend backend);
+
+    // --- 滤波 ---
+    void RunFilterPreview(int type, AlgorithmBackend backend);  // 0体素 1半径 2统计
     void ApplyFilterResult();
     void ClearFilterCompare();
+
+    // --- 算法后端桥接（自研 / PCL 二选一）---
     bool FitPlaneWithBackend(const std::vector<std::size_t>& indices, PlaneModel& plane,
                              std::string& error, AlgorithmBackend backend);
     bool FitSphereWithBackend(const std::vector<std::size_t>& indices, SphereModel& sphere,
@@ -158,22 +402,22 @@ private:
                                                       const std::vector<std::size_t>* onlyIndices);
     void ApplyRoiDeleteWithBackend(const std::vector<std::size_t>& roiIndices, bool deleteInside);
     void RestoreAllPointsWithBackend();
-    AlgoToolsHost BuildAlgoToolsHost(AlgorithmBackend backend);
+    AlgoToolsHost BuildAlgoToolsHost(AlgorithmBackend backend);  // 供侧栏面板回调
 
-    AlgorithmBackend EffectiveAlgoBackend() const;
+    AlgorithmBackend EffectiveAlgoBackend() const;  // 当前生效的算法后端
 
     GLFWwindow* window_ = nullptr;
-    PointCloud cloud_;
-    PointCloud filledCloud_;
+    PointCloud cloud_;           // 主点云：加载/编辑的原始数据
+    PointCloud filledCloud_;     // 填充点云：ROI 填充生成的补点（仅掩码可编辑）
     Camera camera_;
     PointCloudRenderer renderer_;
-    PointCloudRenderer filledRenderer_;
+    PointCloudRenderer filledRenderer_;  // 填充视区专用渲染器（灰原+青补叠加）
     MeasureState measure_;
     UndoHistory history_;
     std::vector<std::size_t> displayIndices_;
     std::vector<std::size_t> displayFilledIndices_;
-    bool dualCloudView_ = false;
-    int activeCloudPane_ = 0;  // 0=原始 1=投影填充
+    bool dualCloudView_ = false;   // true：显示「灰原+青补」填充视区
+    int activeCloudPane_ = 0;    // 0=主点云 1=填充点云（双视区时框选/删除作用对象）
 
     float pointSize_ = 2.5f;
     float opacity_ = 1.f;
@@ -196,7 +440,7 @@ private:
     bool showCreateSphere_ = false;
     bool showCreateCylinder_ = false;
     bool showCreateDisk_ = false;
-    static constexpr const char* kAppVersion = "0.1";
+    static constexpr const char* kAppVersion = "0.4";
 
     // 创建点云参数
     float genSphereRadius_ = 10.f;
@@ -215,10 +459,14 @@ private:
     ImageView brightnessImage_;
     bool showImagePanel_ = false;
     int imagePanelTab_ = 0;  // 0 深度 1 亮度
+    float sidebarPreferredW_ = 360.f;
     float imagePanelPreferredW_ = 420.f;
     float image2dZoom_ = 1.f;
+    float image2dPanX_ = 0.f;
+    float image2dPanY_ = 0.f;
     bool saveVisibleOnly_ = true;
     bool useIntensityColors_ = false;
+    bool view2DMode_ = false;
     std::vector<Vec3> intensityColors_;
 
     // 深度图 / 亮度图同源联动（仅 2D）
@@ -236,6 +484,287 @@ private:
     float depthDisplayMax_ = 1.f;
     bool depthSkipZero_ = true;
 
+    // OpenCV 2D 算子：卡尺提线
+    Image2DTool image2DTool_ = Image2DTool::None;
+    bool lineMeasureDragging_ = false;
+    float lineMeasureRoiX0_ = 0.f;
+    float lineMeasureRoiY0_ = 0.f;
+    float lineMeasureRoiX1_ = 0.f;
+    float lineMeasureRoiY1_ = 0.f;
+    int lineMeasureDragSource_ = -1;  // 0 深度 1 亮度
+    bool lineMeasurePending_ = false;
+    int lineMeasurePendingSource_ = -1;
+    OpenCv2D::CaliperLineResult lineMeasurePendingResult_;
+    OpenCv2D::CaliperLineParams lineMeasureParams_;
+    bool showLineMeasureOverlay_ = true;
+
+    struct MeasuredImageLine {
+        int id = 0;
+        int imageSource = 0;  // 0 深度 1 亮度
+        OpenCv2D::CaliperLineResult result;
+    };
+    struct MeasuredImageArc {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::CaliperArcResult result;
+    };
+    std::vector<MeasuredImageLine> measuredLines_;
+    std::vector<MeasuredImageArc> measuredArcs_;
+    int nextMeasuredLineId_ = 1;
+    int nextMeasuredArcId_ = 1;
+
+    ArcMeasurePhase arcMeasurePhase_ = ArcMeasurePhase::PickA;
+    int arcMeasureSource_ = -1;
+    bool arcBulgeDragging_ = false;
+    float arcRoiP0X_ = 0.f;
+    float arcRoiP0Y_ = 0.f;
+    float arcRoiP1X_ = 0.f;
+    float arcRoiP1Y_ = 0.f;
+    float arcRoiP2X_ = 0.f;
+    float arcRoiP2Y_ = 0.f;
+    bool arcMeasurePending_ = false;
+    int arcMeasurePendingSource_ = -1;
+    OpenCv2D::CaliperArcResult arcMeasurePendingResult_;
+
+    struct MeasuredCircleFit {
+        int id = 0;
+        int imageSource = 0;
+        int sourceArcId = -1;  // 来自已有圆弧时记录圆弧 id，否则 -1
+        OpenCv2D::CircleFitResult result;
+        std::vector<OpenCv2D::CaliperEdgePoint> edgePoints;
+    };
+    std::vector<MeasuredCircleFit> measuredCircleFits_;
+    int nextCircleFitId_ = 1;
+    bool circleFitPending_ = false;
+    int circleFitPendingSource_ = -1;
+    int circleFitPendingFromArcId_ = -1;
+    OpenCv2D::CircleFitResult circleFitPendingResult_;
+    std::vector<OpenCv2D::CaliperEdgePoint> circleFitPendingEdgePoints_;
+
+    int lineDistPickA_ = -1;
+    int lineDistPickB_ = -1;
+    bool lineDistValid_ = false;
+    int lineDistSampleCount_ = 32;
+    float lineDistPx_ = 0.f;
+    float lineDistMinPx_ = 0.f;
+    float lineDistMaxPx_ = 0.f;
+    std::vector<OpenCv2D::GapSample> lineDistSamples_;
+
+    int arcDistPickA_ = -1;
+    int arcDistPickB_ = -1;
+    bool arcDistValid_ = false;
+    int arcDistSampleCount_ = 32;
+    float arcDistPx_ = 0.f;
+    float arcDistMinPx_ = 0.f;
+    float arcDistMaxPx_ = 0.f;
+    std::vector<OpenCv2D::GapSample> arcDistSamples_;
+
+    struct MeasuredPointDist {
+        int id = 0;
+        int imageSource = 0;
+        float ax = 0.f;
+        float ay = 0.f;
+        float bx = 0.f;
+        float by = 0.f;
+        float distance = 0.f;
+        float dx = 0.f;
+        float dy = 0.f;
+    };
+    std::vector<MeasuredPointDist> measuredPointDists_;
+    int nextPointDistId_ = 1;
+    PointPickPhase pointDistPhase_ = PointPickPhase::PickA;
+    int pointDistSource_ = -1;
+    float pointDistAx_ = 0.f;
+    float pointDistAy_ = 0.f;
+
+    int lineAnglePickA_ = -1;
+    int lineAnglePickB_ = -1;
+    bool lineAngleValid_ = false;
+    float lineAngleDeg_ = 0.f;
+
+    int circleGapPickA_ = -1;
+    int circleGapPickB_ = -1;
+    bool circleGapValid_ = false;
+    float circleGapCenterDist_ = 0.f;
+    float circleGapSurfaceGap_ = 0.f;
+
+    PointPickPhase pointLinePhase_ = PointPickPhase::PickA;
+    int pointLineSource_ = -1;
+    float pointLinePx_ = 0.f;
+    float pointLinePy_ = 0.f;
+    int pointLinePick_ = -1;
+    bool pointLineValid_ = false;
+    float pointLineDistPx_ = 0.f;
+    float pointLineFootX_ = 0.f;
+    float pointLineFootY_ = 0.f;
+
+    bool caliperPointDragging_ = false;
+    int caliperPointDragSource_ = -1;
+    float caliperPointRoiX0_ = 0.f;
+    float caliperPointRoiY0_ = 0.f;
+    float caliperPointRoiX1_ = 0.f;
+    float caliperPointRoiY1_ = 0.f;
+    bool caliperPointPending_ = false;
+    int caliperPointPendingSource_ = -1;
+    OpenCv2D::CaliperEdgePoint caliperPointPendingEdge_;
+    struct MeasuredCaliperPoint {
+        int id = 0;
+        int imageSource = 0;
+        float x = 0.f;
+        float y = 0.f;
+        float roiX0 = 0.f;
+        float roiY0 = 0.f;
+        float roiX1 = 0.f;
+        float roiY1 = 0.f;
+    };
+    std::vector<MeasuredCaliperPoint> measuredCaliperPoints_;
+    int nextCaliperPointId_ = 1;
+
+    CircleCaliperPhase circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+    int circleCaliperSource_ = -1;
+    bool circleCaliperDragging_ = false;
+    float circleCaliperCx_ = 0.f;
+    float circleCaliperCy_ = 0.f;
+    float circleCaliperR_ = 0.f;
+    bool circleCaliperPending_ = false;
+    int circleCaliperPendingSource_ = -1;
+    OpenCv2D::CaliperCircleResult circleCaliperPendingResult_;
+    struct MeasuredCircleCaliper {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::CaliperCircleResult result;
+    };
+    std::vector<MeasuredCircleCaliper> measuredCircleCalipers_;
+    int nextCircleCaliperId_ = 1;
+
+    int arcLengthPick_ = -1;
+    bool arcLengthValid_ = false;
+    OpenCv2D::ArcMetrics arcLengthMetrics_;
+
+    ThreePointPhase threePointPhase_ = ThreePointPhase::Pick0;
+    int threePointSource_ = -1;
+    float threePointX_[3] = {};
+    float threePointY_[3] = {};
+    struct MeasuredThreePointCircle {
+        int id = 0;
+        int imageSource = 0;
+        float centerX = 0.f;
+        float centerY = 0.f;
+        float radius = 0.f;
+    };
+    std::vector<MeasuredThreePointCircle> measuredThreePointCircles_;
+    int nextThreePointCircleId_ = 1;
+
+    int parallelDistPickA_ = -1;
+    int parallelDistPickB_ = -1;
+    bool parallelDistValid_ = false;
+    float parallelDistPx_ = 0.f;
+
+    bool rectCaliperDragging_ = false;
+    int rectCaliperDragSource_ = -1;
+    float rectCaliperRoiX0_ = 0.f;
+    float rectCaliperRoiY0_ = 0.f;
+    float rectCaliperRoiX1_ = 0.f;
+    float rectCaliperRoiY1_ = 0.f;
+    bool rectCaliperPending_ = false;
+    int rectCaliperPendingSource_ = -1;
+    OpenCv2D::CaliperRectResult rectCaliperPendingResult_;
+    struct MeasuredRectCaliper {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::CaliperRectResult result;
+    };
+    std::vector<MeasuredRectCaliper> measuredRectCalipers_;
+    int nextRectCaliperId_ = 1;
+
+    bool ellipseFitPending_ = false;
+    int ellipseFitPendingSource_ = -1;
+    int ellipseFitPendingFromArcId_ = -1;
+    OpenCv2D::EllipseFitResult ellipseFitPendingResult_;
+    std::vector<OpenCv2D::CaliperEdgePoint> ellipseFitPendingEdgePoints_;
+    struct MeasuredEllipseFit {
+        int id = 0;
+        int imageSource = 0;
+        int sourceArcId = -1;
+        OpenCv2D::EllipseFitResult result;
+        std::vector<OpenCv2D::CaliperEdgePoint> edgePoints;
+    };
+    std::vector<MeasuredEllipseFit> measuredEllipseFits_;
+    int nextEllipseFitId_ = 1;
+
+    bool profileWidthDragging_ = false;
+    int profileWidthDragSource_ = -1;
+    float profileWidthRoiX0_ = 0.f;
+    float profileWidthRoiY0_ = 0.f;
+    float profileWidthRoiX1_ = 0.f;
+    float profileWidthRoiY1_ = 0.f;
+    bool profileWidthPending_ = false;
+    int profileWidthPendingSource_ = -1;
+    OpenCv2D::ProfileWidthResult profileWidthPendingResult_;
+    struct MeasuredProfileWidth {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::ProfileWidthResult result;
+    };
+    std::vector<MeasuredProfileWidth> measuredProfileWidths_;
+    int nextProfileWidthId_ = 1;
+
+    PointPickPhase pointProjPhase_ = PointPickPhase::PickA;
+    int pointProjSource_ = -1;
+    float pointProjPx_ = 0.f;
+    float pointProjPy_ = 0.f;
+    int pointProjLinePick_ = -1;
+    bool pointProjValid_ = false;
+    OpenCv2D::PointProjectionResult pointProjResult_;
+
+    int concentricityPickA_ = -1;
+    int concentricityPickB_ = -1;
+    bool concentricityValid_ = false;
+    OpenCv2D::ConcentricityResult concentricityResult_;
+
+    int roundnessPick_ = -1;
+    int roundnessCircleSource_ = 0;  // 0=fit 1=caliper
+    bool roundnessValid_ = false;
+    OpenCv2D::RoundnessResult roundnessResult_;
+
+    bool regionBlobDragging_ = false;
+    int regionBlobDragSource_ = -1;
+    float regionBlobRoiX0_ = 0.f;
+    float regionBlobRoiY0_ = 0.f;
+    float regionBlobRoiX1_ = 0.f;
+    float regionBlobRoiY1_ = 0.f;
+    float regionBlobThreshold_ = 128.f;
+    bool regionBlobGreaterThan_ = true;
+    bool regionBlobPending_ = false;
+    int regionBlobPendingSource_ = -1;
+    OpenCv2D::RegionBlobResult regionBlobPendingResult_;
+    struct MeasuredRegionBlob {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::RegionBlobResult result;
+    };
+    std::vector<MeasuredRegionBlob> measuredRegionBlobs_;
+    int nextRegionBlobId_ = 1;
+
+    PointPickPhase depthHeightPhase_ = PointPickPhase::PickA;
+    int depthHeightSource_ = -1;
+    float depthHeightAx_ = 0.f;
+    float depthHeightAy_ = 0.f;
+    float depthHeightAz_ = 0.f;
+    float depthHeightBz_ = 0.f;
+    bool depthHeightValid_ = false;
+    float depthHeightDelta_ = 0.f;
+
+    bool depthProfileDragging_ = false;
+    int depthProfileDragSource_ = -1;
+    float depthProfileRoiX0_ = 0.f;
+    float depthProfileRoiY0_ = 0.f;
+    float depthProfileRoiX1_ = 0.f;
+    float depthProfileRoiY1_ = 0.f;
+    bool depthProfileValid_ = false;
+    int depthProfileSampleCount_ = 64;
+    std::vector<OpenCv2D::LineProfileSample> depthProfileSamples_;
+
     // 滤波
     float filterVoxelLeaf_ = 0.5f;
     float filterRadius_ = 1.0f;
@@ -250,12 +779,14 @@ private:
     int filterLastRemoved_ = 0;
 
     AlgorithmBackend algoBackend_ = AlgorithmBackend::PCL;
+    int planeAlignTarget_ = 0;  // 0=+Z 水平  1=+Y  2=+X
     PclPanel pclPanel_;
     PclToolsPanel pclToolsPanel_;
 
     bool rotating_ = false;
     bool panning_ = false;
     bool sectionDragging_ = false;
+    bool showSectionPanel_ = true;
     int sectionPlotDragTarget_ = 0;
     double lastX_ = 0.0;
     double lastY_ = 0.0;
@@ -273,6 +804,15 @@ private:
     float view3dPane0W_ = 800.f;
     float view3dPane1X_ = 0.f;
     float view3dPane1W_ = 0.f;
+
+    struct ConsoleLine {
+        std::string time;  // HH:MM:SS
+        std::string text;
+    };
+    std::vector<ConsoleLine> consoleLog_;
+    float consoleHeight_ = 148.f;
+    bool consoleAutoScroll_ = true;
+    static constexpr std::size_t kConsoleMaxLines = 500;
 
     AlgorithmEditor algoEditor_;
 };

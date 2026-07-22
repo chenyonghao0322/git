@@ -6,6 +6,7 @@
 #include "io/PointCloudGenerator.h"
 #include "io/PointCloudIO.h"
 #include "tools/FilterTools.h"
+#include "tools/OpenCv2D.h"
 #include "tools/PclTools.h"
 
 #include <glad/gl.h>
@@ -15,10 +16,13 @@
 #include <imgui_impl_opengl3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
+#include <functional>
 #include <unordered_set>
 #include <vector>
 
@@ -49,10 +53,39 @@ bool LoadChineseFont() {
         cfg.OversampleH = 2;
         cfg.OversampleV = 2;
         ImFont* font = io.Fonts->AddFontFromFileTTF(
-            path, 19.0f, &cfg, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+            path, 18.0f, &cfg, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
         if (font) return true;
     }
     return false;
+}
+
+void ProjectBulgePoint(float ax, float ay, float bx, float by, float mx, float my, float& p2x,
+                       float& p2y) {
+    const float mx0 = (ax + bx) * 0.5f;
+    const float my0 = (ay + by) * 0.5f;
+    const float dx = bx - ax;
+    const float dy = by - ay;
+    const float len = std::hypot(dx, dy);
+    if (len < 1e-3f) {
+        p2x = mx;
+        p2y = my;
+        return;
+    }
+    const float nx = -dy / len;
+    const float ny = dx / len;
+    const float t = (mx - mx0) * nx + (my - my0) * ny;
+    p2x = mx0 + nx * t;
+    p2y = my0 + ny * t;
+}
+
+float ArcChordBulgePx(float ax, float ay, float bx, float by, float p2x, float p2y) {
+    const float mx0 = (ax + bx) * 0.5f;
+    const float my0 = (ay + by) * 0.5f;
+    const float dx = bx - ax;
+    const float dy = by - ay;
+    const float len = std::hypot(dx, dy);
+    if (len < 1e-3f) return 0.f;
+    return std::fabs((p2x - mx0) * dy - (p2y - my0) * dx) / len;
 }
 
 }  // namespace
@@ -97,7 +130,7 @@ bool Application::Init() {
     ImGui_ImplGlfw_InitForOpenGL(window_, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    measure_.status = u8"请打开点云文件（PLY / PCD / XYZ / OBJ），或打开深度/亮度图对照查看";
+    SetStatus(u8"请打开点云文件（PLY / PCD / XYZ / OBJ），或打开深度/亮度图对照查看");
     return true;
 }
 
@@ -128,12 +161,12 @@ bool Application::ApplyCloud(PointCloud&& cloud, const char* statusMsg) {
     }
 
     if (statusMsg && statusMsg[0]) {
-        measure_.status = statusMsg;
+        SetStatus(statusMsg);
     } else {
         char buf[256];
         std::snprintf(buf, sizeof(buf), u8"已加载 %zu 个点（显示上限约 %d）", cloud_.points.size(),
                       maxDisplayPoints_);
-        measure_.status = buf;
+        SetStatus(buf);
     }
     FitCameraToCloud();
     needUpload_ = true;
@@ -142,20 +175,20 @@ bool Application::ApplyCloud(PointCloud&& cloud, const char* statusMsg) {
 
 bool Application::SaveCloud() {
     if (cloud_.points.empty()) {
-        measure_.status = u8"当前没有点云可保存";
+        SetStatus(u8"当前没有点云可保存");
         return false;
     }
     const std::string path = FileDialog::SavePointCloudFile();
     if (path.empty()) return false;
     std::string error;
     if (!PointCloudIO::Save(path, cloud_, error, saveVisibleOnly_)) {
-        measure_.status = error;
+        SetStatus(error);
         return false;
     }
     char buf[320];
     std::snprintf(buf, sizeof(buf), u8"已保存 %s（%s）", path.c_str(),
                   saveVisibleOnly_ ? u8"仅可见点" : u8"全部点");
-    measure_.status = buf;
+    SetStatus(buf);
     return true;
 }
 
@@ -248,11 +281,16 @@ bool Application::OpenDepthImage() {
     ImageIO::GrayImage gray;
     std::string error;
     if (!ImageIO::LoadGray(path, gray, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return false;
     }
 
     DestroyImageView(depthImage_);
+    measuredLines_.erase(
+        std::remove_if(measuredLines_.begin(), measuredLines_.end(),
+                       [](const MeasuredImageLine& l) { return l.imageSource == 0; }),
+        measuredLines_.end());
+    lineDistValid_ = false;
     depthImage_.path = path;
     depthImage_.width = gray.width;
     depthImage_.height = gray.height;
@@ -264,7 +302,7 @@ bool Application::OpenDepthImage() {
     depthImage_.valueMax = depthDataMax_;
     RebuildDepthDisplay();
     if (!depthImage_.valid()) {
-        measure_.status = u8"深度图纹理上传失败";
+        SetStatus(u8"深度图纹理上传失败");
         DestroyImageView(depthImage_);
         return false;
     }
@@ -280,7 +318,7 @@ bool Application::OpenDepthImage() {
     char buf[320];
     std::snprintf(buf, sizeof(buf), u8"已打开深度图 %s（%dx%d）", FileNameOf(path).c_str(),
                   depthImage_.width, depthImage_.height);
-    measure_.status = buf;
+    SetStatus(buf);
     return true;
 }
 
@@ -300,11 +338,16 @@ bool Application::OpenBrightnessImage() {
     ImageIO::RgbImage rgb;
     std::string error;
     if (!ImageIO::LoadRgb(path, rgb, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return false;
     }
 
     DestroyImageView(brightnessImage_);
+    measuredLines_.erase(
+        std::remove_if(measuredLines_.begin(), measuredLines_.end(),
+                       [](const MeasuredImageLine& l) { return l.imageSource == 1; }),
+        measuredLines_.end());
+    lineDistValid_ = false;
     brightnessImage_.path = path;
     brightnessImage_.width = rgb.width;
     brightnessImage_.height = rgb.height;
@@ -313,7 +356,7 @@ bool Application::OpenBrightnessImage() {
     brightnessImage_.valueMin = 0.f;
     brightnessImage_.valueMax = 255.f;
     if (!UploadImageTexture(brightnessImage_)) {
-        measure_.status = u8"亮度图纹理上传失败";
+        SetStatus(u8"亮度图纹理上传失败");
         DestroyImageView(brightnessImage_);
         return false;
     }
@@ -329,20 +372,167 @@ bool Application::OpenBrightnessImage() {
     char buf[320];
     std::snprintf(buf, sizeof(buf), u8"已打开亮度图 %s（%dx%d）", FileNameOf(path).c_str(),
                   brightnessImage_.width, brightnessImage_.height);
-    measure_.status = buf;
+    SetStatus(buf);
     return true;
 }
 
 bool Application::HasImagePanel() const {
+    if (view2DMode_) return true;
     return showImagePanel_ && (depthImage_.valid() || brightnessImage_.valid());
 }
 
 float Application::ImagePanelWidth() const {
-    if (!HasImagePanel()) return 0.f;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    // 至少留给左侧栏 + 点云视区约 600px
+    if (view2DMode_) return std::max(vp->Size.x - SidebarWidth(), 1.f);
+    if (!showImagePanel_ || (!depthImage_.valid() && !brightnessImage_.valid())) return 0.f;
     const float maxW = std::max(vp->Size.x - 600.f, 240.f);
     return std::clamp(imagePanelPreferredW_, 240.f, maxW);
+}
+
+float Application::SidebarWidth() const {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float maxW = std::max(vp->Size.x - 480.f, 280.f);
+    return std::clamp(sidebarPreferredW_, 280.f, maxW);
+}
+
+void Application::DrawSidebarSplitter(float contentTop, float contentH) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float sidebarW = SidebarWidth();
+    const float maxW = std::max(vp->Size.x - 480.f, 280.f);
+    constexpr float kSplitHit = 8.f;
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + sidebarW - kSplitHit * 0.5f, contentTop));
+    ImGui::SetNextWindowSize(ImVec2(kSplitHit, contentH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::Begin(u8"##侧栏分割条", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::InvisibleButton(u8"##sidebar_split", ImVec2(kSplitHit, contentH));
+    const bool splitHover = ImGui::IsItemHovered();
+    const bool splitDrag = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+    if (splitDrag) {
+        sidebarPreferredW_ = std::clamp(ImGui::GetIO().MousePos.x - vp->Pos.x, 280.f, maxW);
+    }
+    if (splitHover || splitDrag) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+void Application::AppendConsoleLog(const std::string& msg) {
+    if (msg.empty()) return;
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tmLocal{};
+#if defined(_WIN32)
+    localtime_s(&tmLocal, &t);
+#else
+    localtime_r(&t, &tmLocal);
+#endif
+    char timeBuf[16];
+    std::snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", tmLocal.tm_hour, tmLocal.tm_min,
+                  tmLocal.tm_sec);
+
+    consoleLog_.push_back({timeBuf, msg});
+    if (consoleLog_.size() > kConsoleMaxLines) {
+        consoleLog_.erase(consoleLog_.begin(),
+                          consoleLog_.begin() +
+                              static_cast<std::ptrdiff_t>(consoleLog_.size() - kConsoleMaxLines));
+    }
+}
+
+void Application::SetStatus(const std::string& msg, bool logConsole) {
+    measure_.status = msg;
+    if (logConsole) AppendConsoleLog(msg);
+}
+
+float Application::ConsoleHeight() const {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float maxH = std::max(vp->Size.y * 0.45f, 120.f);
+    return std::clamp(consoleHeight_, 88.f, maxH);
+}
+
+void Application::DrawConsoleSplitter(float contentTop, float contentH) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float splitY = contentTop + contentH;
+    constexpr float kSplitHit = 6.f;
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, splitY - kSplitHit * 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, kSplitHit));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::Begin(u8"##控制台分割条", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::InvisibleButton(u8"##console_split", ImVec2(vp->Size.x, kSplitHit));
+    const bool splitHover = ImGui::IsItemHovered();
+    const bool splitDrag = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+    if (splitDrag) {
+        const float maxH = std::max(vp->Size.y * 0.45f, 120.f);
+        consoleHeight_ =
+            std::clamp(vp->Pos.y + vp->Size.y - ImGui::GetIO().MousePos.y, 88.f, maxH);
+    }
+    if (splitHover || splitDrag) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+void Application::DrawConsolePanel() {
+    const UiPalette& pal = GetUiPalette();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float h = ConsoleHeight();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + vp->Size.y - h));
+    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, h));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 8.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.bgDeep);
+    ImGui::Begin(u8"##输出台", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    UiSectionHeader(u8"输出台", nullptr, &pal.sectionTitle, true);
+    ImGui::SameLine(0.f, 12.f);
+    if (ImGui::SmallButton(u8"清空")) consoleLog_.clear();
+    ImGui::SameLine();
+    ImGui::Checkbox(u8"自动滚动", &consoleAutoScroll_);
+    if (!consoleLog_.empty()) {
+        ImGui::SameLine();
+        char countBuf[24];
+        std::snprintf(countBuf, sizeof(countBuf), u8"%zu 条", consoleLog_.size());
+        ImGui::TextDisabled("%s", countBuf);
+    }
+    if (!measure_.status.empty()) {
+        ImGui::SameLine(0.f, 16.f);
+        ImGui::TextDisabled(u8"状态");
+        ImGui::SameLine();
+        ImGui::TextColored(pal.accent, "%s", measure_.status.c_str());
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, pal.panelRaised);
+    ImGui::BeginChild(u8"##console_scroll", ImVec2(0.f, 0.f), true,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+    for (const ConsoleLine& line : consoleLog_) {
+        ImGui::TextColored(pal.consoleTime, "[%s]", line.time.c_str());
+        ImGui::SameLine(0.f, 6.f);
+        ImGui::TextUnformatted(line.text.c_str());
+    }
+    if (consoleAutoScroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.f) {
+        ImGui::SetScrollHereY(1.f);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 }
 
 void Application::ClearImageSyncPick() {
@@ -353,12 +543,12 @@ void Application::ClearImageSyncPick() {
 
 bool Application::TryEnableImageSync() {
     if (!depthImage_.valid() || !brightnessImage_.valid()) {
-        measure_.status = u8"请先同时打开深度图和亮度图";
+        SetStatus(u8"请先同时打开深度图和亮度图");
         return false;
     }
     if (depthImage_.width != brightnessImage_.width ||
         depthImage_.height != brightnessImage_.height) {
-        measure_.status = u8"深度图与亮度图尺寸不一致，无法联动";
+        SetStatus(u8"深度图与亮度图尺寸不一致，无法联动");
         return false;
     }
 
@@ -371,7 +561,7 @@ bool Application::TryEnableImageSync() {
     std::snprintf(buf, sizeof(buf),
                   u8"已启用深度/亮度联动 %dx%d：在任一图上单击，另一图同步十字线", syncWidth_,
                   syncHeight_);
-    measure_.status = buf;
+    SetStatus(buf);
     return true;
 }
 
@@ -420,14 +610,14 @@ void Application::SetImageSyncPixel(int col, int row) {
     } else {
         std::snprintf(buf, sizeof(buf), u8"联动 (%d,%d)", col, row);
     }
-    measure_.status = buf;
+    SetStatus(buf);
 }
 
 bool Application::LoadPath(const std::string& path) {
     std::string error;
     PointCloud cloud;
     if (!PointCloudIO::Load(path, cloud, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return false;
     }
     char buf[256];
@@ -447,7 +637,7 @@ void Application::CreateSphereCloud() {
     std::string error;
     PointCloud cloud;
     if (!PointCloudGenerator::GenerateSphere(p, cloud, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return;
     }
     char buf[192];
@@ -465,7 +655,7 @@ void Application::CreateCylinderCloud() {
     std::string error;
     PointCloud cloud;
     if (!PointCloudGenerator::GenerateCylinder(p, cloud, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return;
     }
     char buf[192];
@@ -482,7 +672,7 @@ void Application::CreateDiskCloud() {
     std::string error;
     PointCloud cloud;
     if (!PointCloudGenerator::GenerateDisk(p, cloud, error)) {
-        measure_.status = error;
+        SetStatus(error);
         return;
     }
     char buf[192];
@@ -512,23 +702,23 @@ void Application::ApplyViewPreset(int preset) {
     switch (preset) {
         case 0:  // 俯视 +Y
             camera_.SetYawPitch(0.f, 1.52f);
-            measure_.status = u8"视角: 俯视 (+Y → XZ 平面)";
+            SetStatus(u8"视角: 俯视 (+Y → XZ 平面)");
             break;
         case 1:  // 侧视 从 +X 看 YZ
             camera_.SetYawPitch(0.f, 0.f);
-            measure_.status = u8"视角: 侧视 (沿 +X 看 YZ)";
+            SetStatus(u8"视角: 侧视 (沿 +X 看 YZ)");
             break;
         case 2:  // 侧视 从 +Z 看 XY
             camera_.SetYawPitch(pi * 0.5f, 0.f);
-            measure_.status = u8"视角: 侧视 (沿 +Z 看 XY)";
+            SetStatus(u8"视角: 侧视 (沿 +Z 看 XY)");
             break;
         case 3:  // 沿运动方向 Y
             camera_.SetYawPitch(0.f, -1.35f);
-            measure_.status = u8"视角: 沿运动方向 (沿 Y)";
+            SetStatus(u8"视角: 沿运动方向 (沿 Y)");
             break;
         default:
             camera_.Reset();
-            measure_.status = u8"视角: 复位到包围盒";
+            SetStatus(u8"视角: 复位到包围盒");
             break;
     }
     UpdateAxesLength();
@@ -544,33 +734,102 @@ void Application::UpdateAxesLength() {
     renderer_.SetAxes(showAxes_, axesLength_);
 }
 
-void Application::PushHistory(const std::string& label) {
+void Application::PushHistory(const std::string& label, bool captureMainPoints) {
+    PointCloud& target = EditableCloud();
+    if (target.mask.size() != target.points.size()) target.ResetMask();
+    const HistoryCloudTarget targetId =
+        (&target == &filledCloud_) ? HistoryCloudTarget::Filled : HistoryCloudTarget::Main;
+    history_.Push(CaptureCloudSnapshot(targetId, label, captureMainPoints));
+}
+
+void Application::PushMainCloudHistory(const std::string& label, bool captureMainPoints) {
     if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
-    history_.Push(cloud_.mask, label);
+    history_.Push(CaptureCloudSnapshot(HistoryCloudTarget::Main, label, captureMainPoints));
+}
+
+CloudSnapshot Application::CaptureCloudSnapshot(HistoryCloudTarget target, const std::string& label,
+                                                bool captureMainPoints) const {
+    const PointCloud& cloud =
+        (target == HistoryCloudTarget::Filled) ? filledCloud_ : cloud_;
+    CloudSnapshot snap;
+    snap.target = target;
+    snap.label = label;
+    if (cloud.mask.size() == cloud.points.size()) {
+        snap.mask = cloud.mask;
+    }
+    if (captureMainPoints && target == HistoryCloudTarget::Main) {
+        snap.points = cloud.points;
+    }
+    return snap;
+}
+
+void Application::ApplyCloudSnapshot(const CloudSnapshot& snap, bool closeDualOnMain) {
+    if (snap.target == HistoryCloudTarget::Main) {
+        if (!snap.mask.empty()) {
+            cloud_.mask = snap.mask;
+        } else if (cloud_.mask.size() != cloud_.points.size()) {
+            cloud_.ResetMask();
+        }
+        if (!snap.points.empty()) {
+            cloud_.points = snap.points;
+            cloud_.RecomputeBounds();
+            cloud_.colors.clear();
+        }
+        if (closeDualOnMain && DualCloudViewActive()) {
+            CloseDualCloudView();
+        }
+        ClearFilterCompare();
+        measure_.clipEnabled = false;
+        needUpload_ = true;
+        return;
+    }
+
+    if (!snap.mask.empty()) {
+        filledCloud_.mask = snap.mask;
+    } else if (filledCloud_.mask.size() != filledCloud_.points.size()) {
+        filledCloud_.ResetMask();
+    }
+    needUploadFilled_ = true;
 }
 
 void Application::Undo() {
-    if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
-    std::string label;
-    if (!history_.Undo(cloud_.mask, label)) {
-        measure_.status = u8"没有可撤销的操作";
+    CloudSnapshot restore;
+    if (!history_.PopUndo(restore)) {
+        SetStatus(u8"没有可撤销的操作");
         return;
     }
-    measure_.clipEnabled = false;
-    needUpload_ = true;
-    measure_.status = std::string(u8"已撤销: ") + label;
+
+    if (restore.target == HistoryCloudTarget::Main) {
+        if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
+    } else if (filledCloud_.mask.size() != filledCloud_.points.size()) {
+        filledCloud_.ResetMask();
+    }
+
+    CloudSnapshot redoSnap = CaptureCloudSnapshot(
+        restore.target, restore.label, !restore.points.empty());
+    history_.PushRedo(std::move(redoSnap));
+    ApplyCloudSnapshot(restore, true);
+    SetStatus(std::string(u8"已撤销: ") + restore.label);
 }
 
 void Application::Redo() {
-    if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
-    std::string label;
-    if (!history_.Redo(cloud_.mask, label)) {
-        measure_.status = u8"没有可重做的操作";
+    CloudSnapshot restore;
+    if (!history_.PopRedo(restore)) {
+        SetStatus(u8"没有可重做的操作");
         return;
     }
-    measure_.clipEnabled = false;
-    needUpload_ = true;
-    measure_.status = std::string(u8"已重做");
+
+    if (restore.target == HistoryCloudTarget::Main) {
+        if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
+    } else if (filledCloud_.mask.size() != filledCloud_.points.size()) {
+        filledCloud_.ResetMask();
+    }
+
+    CloudSnapshot undoSnap =
+        CaptureCloudSnapshot(restore.target, restore.label, !restore.points.empty());
+    history_.PushUndo(std::move(undoSnap));
+    ApplyCloudSnapshot(restore, true);
+    SetStatus(std::string(u8"已重做: ") + restore.label);
 }
 
 void Application::RefreshGpu() {
@@ -593,6 +852,7 @@ void Application::RefreshGpu() {
     const bool showRoi =
         !measure_.roiIndices.empty() &&
         (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
+         measure_.mode == ToolMode::PlaneAlign ||
          measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::SphereBodyFit ||
          measure_.mode == ToolMode::CircleFit ||
          measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
@@ -700,7 +960,7 @@ void Application::RunFilterPreview(int type, AlgorithmBackend backend) {
     (void)backend;
     const AlgorithmBackend active = EffectiveAlgoBackend();
     if (cloud_.points.empty()) {
-        measure_.status = u8"请先加载点云再滤波";
+        SetStatus(u8"请先加载点云再滤波");
         return;
     }
     if (cloud_.mask.size() != cloud_.points.size()) cloud_.ResetMask();
@@ -727,7 +987,7 @@ void Application::RunFilterPreview(int type, AlgorithmBackend backend) {
                                                       filterKeepMask_, error, &kept);
     }
     if (!ok) {
-        measure_.status = error;
+        SetStatus(error);
         return;
     }
 
@@ -741,7 +1001,7 @@ void Application::RunFilterPreview(int type, AlgorithmBackend backend) {
     char buf[192];
     std::snprintf(buf, sizeof(buf), u8"%s 滤波预览：保留 %d，滤除 %d（青绿=保留，红=滤除）",
                   AlgorithmBackendLabel(active), filterLastKept_, filterLastRemoved_);
-    measure_.status = buf;
+    SetStatus(buf);
 }
 
 bool Application::FitPlaneWithBackend(const std::vector<std::size_t>& indices, PlaneModel& plane,
@@ -999,6 +1259,7 @@ void Application::BuildFilledPaneDisplayCloud(PointCloud& out) {
     }
 
     for (std::size_t i = 0; i < filledCloud_.points.size(); ++i) {
+        if (!filledCloud_.mask.empty() && !filledCloud_.mask[i]) continue;
         out.points.push_back(filledCloud_.points[i]);
         if (filledInliers.count(i)) {
             out.colors.push_back({1.0f, 0.55f, 0.15f});
@@ -1061,6 +1322,7 @@ bool Application::RunRoiProjectFill(std::string& error) {
     PointCloud filled;
     PlaneModel plane;
     float gridStep = 0.f;
+    PushMainCloudHistory(u8"执行填充");
     const bool ok = PclTools::RoiProjectFill(cloud_, measure_.roiIndices, 2, measure_.roiFillGridStep,
                                              clipCircle, clipCenter, clipRadius, filled, plane,
                                              gridStep, error);
@@ -1068,6 +1330,7 @@ bool Application::RunRoiProjectFill(std::string& error) {
 
     filledCloud_ = std::move(filled);
     filledCloud_.colors.clear();
+    if (filledCloud_.mask.size() != filledCloud_.points.size()) filledCloud_.ResetMask();
     dualCloudView_ = true;
     activeCloudPane_ = 1;
     measure_.circle.reset();
@@ -1084,13 +1347,13 @@ bool Application::RunRoiProjectFill(std::string& error) {
                   u8"已生成填充视图：灰=原始参考，青=填充 (%zu 点，网格 %.4f mm)\n"
                   u8"原始点仅叠加显示，框选与拟合只作用于青色填充点",
                   filledCloud_.points.size(), gridStep);
-    measure_.status = buf;
+    SetStatus(buf);
     return true;
 }
 
 void Application::ApplyProjectionToAxis(int axis) {
     if (cloud_.points.empty()) {
-        measure_.status = u8"请先加载点云";
+        SetStatus(u8"请先加载点云");
         return;
     }
     Vec3 dir{0, 0, 1};
@@ -1104,11 +1367,11 @@ void Application::ApplyProjectionToAxis(int axis) {
         planeName = "XZ";
     }
     const Vec3 origin = cloud_.bounds.Valid() ? cloud_.bounds.Center() : Vec3{0, 0, 0};
-    PushHistory(u8"平面投影");
+    PushMainCloudHistory(u8"平面投影", true);
     std::string error;
     const bool ok = PclTools::ProjectOntoAxis(cloud_, origin, dir, error);
     if (!ok) {
-        measure_.status = error;
+        SetStatus(error);
         return;
     }
     cloud_.colors.clear();
@@ -1117,7 +1380,64 @@ void Application::ApplyProjectionToAxis(int axis) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), u8"已投影到 %s 平面（法向 %s）", planeName,
                   axis == 0 ? "X" : (axis == 1 ? "Y" : "Z"));
-    measure_.status = buf;
+    SetStatus(buf);
+}
+
+void Application::AlignCloudToReferencePlane(const std::vector<std::size_t>* roiIndices,
+                                             const PlaneModel* existingPlane) {
+    if (cloud_.points.empty()) {
+        SetStatus(u8"请先加载点云");
+        return;
+    }
+
+    PlaneModel plane;
+    if (existingPlane) {
+        plane = *existingPlane;
+    } else {
+        if (!roiIndices || roiIndices->empty()) {
+            SetStatus(u8"请先在 3D 视区框选基准平面区域");
+            return;
+        }
+        std::string fitErr;
+        if (!FitPlaneWithBackend(*roiIndices, plane, fitErr, EffectiveAlgoBackend())) {
+            SetStatus(fitErr);
+            return;
+        }
+    }
+
+    Vec3 target{0.f, 0.f, 1.f};
+    const char* targetName = u8"+Z（XY 水平面）";
+    if (planeAlignTarget_ == 1) {
+        target = {0.f, 1.f, 0.f};
+        targetName = u8"+Y";
+    } else if (planeAlignTarget_ == 2) {
+        target = {1.f, 0.f, 0.f};
+        targetName = u8"+X";
+    }
+
+    PushMainCloudHistory(u8"平面摆正", true);
+    PlaneModel alignedPlane;
+    std::string error;
+    const bool ok = PclTools::AlignCloudToPlaneNormal(cloud_, plane, target, alignedPlane, error);
+    if (!ok) {
+        SetStatus(error);
+        return;
+    }
+
+    if (DualCloudViewActive()) CloseDualCloudView();
+    measure_.plane = alignedPlane;
+    cloud_.colors.clear();
+    FitCameraToCloud();
+    needUpload_ = true;
+    UpdateOverlays();
+
+    const float tiltDeg =
+        std::acos(std::clamp(plane.normal.Normalized().Dot(target), -1.f, 1.f)) * 57.2957795f;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  u8"已以基准平面摆正点云：原倾斜约 %.2f°，法向现对齐 %s（RMS=%.4f mm）", tiltDeg,
+                  targetName, plane.rms);
+    SetStatus(buf);
 }
 
 std::optional<std::size_t> Application::PickNearestWithBackend(
@@ -1157,16 +1477,16 @@ void Application::RestoreAllPointsWithBackend() {
 
 void Application::ApplyFilterResult() {
     if (!filterCompareActive_ || filterKeepMask_.size() != cloud_.points.size()) {
-        measure_.status = u8"没有可应用的滤波结果";
+        SetStatus(u8"没有可应用的滤波结果");
         return;
     }
-    PushHistory(u8"滤波");
+    PushMainCloudHistory(u8"滤波");
     cloud_.mask = filterKeepMask_;
     filterCompareActive_ = false;
     filterKeepMask_.clear();
     filterBackupMask_.clear();
     needUpload_ = true;
-    measure_.status = std::string(u8"已应用滤波，可见 ") + std::to_string(cloud_.VisibleCount());
+    SetStatus(std::string(u8"已应用滤波，可见 ") + std::to_string(cloud_.VisibleCount()));
 }
 
 void Application::ClearFilterCompare() {
@@ -1177,7 +1497,7 @@ void Application::ClearFilterCompare() {
     filterKeepMask_.clear();
     filterBackupMask_.clear();
     needUpload_ = true;
-    measure_.status = u8"已取消滤波预览";
+    SetStatus(u8"已取消滤波预览");
 }
 
 AlgoToolsHost Application::BuildAlgoToolsHost(AlgorithmBackend backend) {
@@ -1281,9 +1601,9 @@ AlgoToolsHost Application::BuildAlgoToolsHost(AlgorithmBackend backend) {
     host.clearPlane = [this]() {
         measure_.plane.reset();
         UpdateOverlays();
-        measure_.status = u8"已清除拟合平面";
+        SetStatus(u8"已清除拟合平面");
     };
-    host.setStatus = [this](const std::string& s) { measure_.status = s; };
+    host.setStatus = [this](const std::string& s) { SetStatus(s); };
     host.requestRefreshGpu = [this]() { needUpload_ = true; };
     return host;
 }
@@ -1307,7 +1627,7 @@ void Application::UpdateOverlays() {
         activeR.SetPlaneOverlay(measure_.flatness.plane);
     } else if (measure_.mode == ToolMode::StepGap && measure_.stepGap.hasPlane) {
         activeR.SetPlaneOverlay(measure_.stepGap.planeA);
-    } else if (measure_.mode == ToolMode::PlaneFit) {
+    } else if (measure_.mode == ToolMode::PlaneFit || measure_.mode == ToolMode::PlaneAlign) {
         activeR.SetPlaneOverlay(measure_.plane);
     } else {
         activeR.SetPlaneOverlay(std::nullopt);
@@ -1358,7 +1678,7 @@ void Application::BeginSectionDrag(float mouseX, float mouseY) {
     lastSectionMouseX_ = mouseX;
     lastSectionMouseY_ = mouseY;
     SyncSectionCutPlane();
-    measure_.status = u8"拖拽截面中…松开鼠标后自动生成 2D 轮廓";
+    SetStatus(u8"拖拽截面中…松开鼠标后自动生成 2D 轮廓", false);
 }
 
 void Application::UpdateSectionDrag(float mouseX, float mouseY) {
@@ -1408,7 +1728,7 @@ void Application::UpdateSectionDrag(float mouseX, float mouseY) {
 
     char buf[96];
     std::snprintf(buf, sizeof(buf), u8"截面位置 = %.4f（拖拽中）", measure_.section.position);
-    measure_.status = buf;
+    SetStatus(buf, false);
 }
 
 void Application::EndSectionDrag() {
@@ -1447,8 +1767,9 @@ void Application::RefreshWorldRoiAt(float mouseX, float mouseY) {
                          measure_.roiWorldHeight * 0.5f, measure_.roiWorldCenter, nullptr,
                          nullptr);
 
-    measure_.status = std::string(u8"世界尺寸框选预览 ") +
-                      std::to_string(measure_.roiIndices.size()) + u8" 点（松开确认）";
+    SetStatus(std::string(u8"世界尺寸框选预览 ") + std::to_string(measure_.roiIndices.size()) +
+              u8" 点（松开确认）",
+              false);
     if (activeCloudPane_ == 1 && DualCloudViewActive()) {
         needUploadFilled_ = true;
     } else {
@@ -1489,8 +1810,7 @@ void Application::RunRoiSelection() {
             sg.hasDistances = false;
             sg.signedDistB.clear();
             sg.phase = StepGapPhase::SelectB;
-            measure_.status = std::string(u8"段差区域 B：") +
-                              std::to_string(sg.regionB.size()) + u8" 点，请计算段差";
+            SetStatus(std::string(u8"段差区域 B：") + std::to_string(sg.regionB.size()) + u8" 点，请计算段差");
         } else {
             sg.regionA = measure_.roiIndices;
             sg.hasPlane = false;
@@ -1498,16 +1818,13 @@ void Application::RunRoiSelection() {
             sg.regionB.clear();
             sg.signedDistB.clear();
             sg.phase = StepGapPhase::SelectA;
-            measure_.status = std::string(u8"段差区域 A：") +
-                              std::to_string(sg.regionA.size()) + u8" 点，请拟合平面";
+            SetStatus(std::string(u8"段差区域 A：") + std::to_string(sg.regionA.size()) + u8" 点，请拟合平面");
         }
     } else if (measure_.mode == ToolMode::Flatness) {
         measure_.flatness = {};
-        measure_.status = std::string(u8"平面度框选 ") +
-                          std::to_string(measure_.roiIndices.size()) + u8" 个点";
+        SetStatus(std::string(u8"平面度框选 ") + std::to_string(measure_.roiIndices.size()) + u8" 个点");
     } else {
-        measure_.status = std::string(u8"已框选 ") + std::to_string(measure_.roiIndices.size()) +
-                          u8" 个点";
+        SetStatus(std::string(u8"已框选 ") + std::to_string(measure_.roiIndices.size()) + u8" 个点");
     }
 
     measure_.roiX0 = measure_.roiX1 = 0.f;
@@ -1521,7 +1838,7 @@ void Application::RunRoiSelection() {
 
 void Application::FinishRoiPolygon() {
     if (measure_.roiPolyX.size() < 3) {
-        measure_.status = u8"自由多边形至少需要 3 个顶点";
+        SetStatus(u8"自由多边形至少需要 3 个顶点");
         return;
     }
     int vx = 0, vy = 0, vw = 0, vh = 0;
@@ -1530,8 +1847,7 @@ void Application::FinishRoiPolygon() {
                          false, 0.f, 0.f, 0.f, measure_.roiWorldCenter, &measure_.roiPolyX,
                          &measure_.roiPolyY);
     measure_.roiPolyBuilding = false;
-    measure_.status = std::string(u8"多边形框选 ") +
-                      std::to_string(measure_.roiIndices.size()) + u8" 个点";
+    SetStatus(std::string(u8"多边形框选 ") + std::to_string(measure_.roiIndices.size()) + u8" 个点");
     if (activeCloudPane_ == 1 && DualCloudViewActive()) {
         needUploadFilled_ = true;
     } else {
@@ -1550,7 +1866,7 @@ void Application::GenerateSection() {
     if (!ExtractSectionWithBackend(measure_.section.cutAlongX, measure_.section.position,
                                    measure_.section.thickness, measure_.section, error,
                                    algoBackend_)) {
-        measure_.status = error;
+        SetStatus(error);
         SyncSectionCutPlane();
         return;
     }
@@ -1559,10 +1875,11 @@ void Application::GenerateSection() {
     measure_.section.lineDistance = 0.f;
     measure_.section.zDistance = 0.f;
     SyncSectionCutPlane();
+    showSectionPanel_ = true;
     char buf[160];
     std::snprintf(buf, sizeof(buf), u8"截面生成成功：%zu 个轮廓点（位置=%.4f）",
                   measure_.section.points.size(), measure_.section.position);
-    measure_.status = buf;
+    SetStatus(buf);
 }
 
 void Application::UpdateSectionDistances() {
@@ -1580,7 +1897,7 @@ void Application::UpdateSectionDistances() {
     char buf[160];
     std::snprintf(buf, sizeof(buf), u8"垂线间距=%.6f，Z向距离=%.6f", sec.lineDistance,
                   sec.zDistance);
-    measure_.status = buf;
+    SetStatus(buf);
 }
 
 std::optional<std::size_t> Application::FindNearestSectionPoint(float plotX, float plotY,
@@ -1640,19 +1957,19 @@ void Application::OnSectionPlotClick(float plotX, float plotY, float plotW, floa
     // Prefer grabbing existing markers for drag.
     if (HitSectionPickMarker(plotX, plotY, plotW, plotH, true)) {
         sectionPlotDragTarget_ = 1;
-        measure_.status = u8"拖动点1中…";
+        SetStatus(u8"拖动点1中…", false);
         return;
     }
     if (HitSectionPickMarker(plotX, plotY, plotW, plotH, false)) {
         sectionPlotDragTarget_ = 2;
-        measure_.status = u8"拖动点2中…";
+        SetStatus(u8"拖动点2中…", false);
         return;
     }
 
     float distPx = 0.f;
     const auto best = FindNearestSectionPoint(plotX, plotY, plotW, plotH, &distPx);
     if (!best || distPx > 12.f) {
-        measure_.status = u8"截面图上未点到轮廓点";
+        SetStatus(u8"截面图上未点到轮廓点");
         return;
     }
 
@@ -1662,12 +1979,12 @@ void Application::OnSectionPlotClick(float plotX, float plotY, float plotW, floa
         sec.lineDistance = 0.f;
         sec.zDistance = 0.f;
         sectionPlotDragTarget_ = 1;
-        measure_.status = u8"已选点1，可拖动调整；再点选点2";
+        SetStatus(u8"已选点1，可拖动调整；再点选点2");
     } else {
         sec.pickB = *best;
         sectionPlotDragTarget_ = 2;
         UpdateSectionDistances();
-        measure_.status = std::string(measure_.status) + u8"（可拖动点1/点2实时调整）";
+        SetStatus(std::string(measure_.status) + u8"（可拖动点1/点2实时调整）", false);
     }
 }
 
@@ -1675,6 +1992,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
     if (cloud_.points.empty()) return;
     if (measure_.mode == ToolMode::Navigate) return;
     if (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
+        measure_.mode == ToolMode::PlaneAlign ||
         IsSphereFitMode(measure_.mode) || measure_.mode == ToolMode::CircleFit ||
         measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
         measure_.mode == ToolMode::StepGap)
@@ -1690,7 +2008,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
     const auto idx = PickNearestWithBackend(
         vw, vh, mouseX - static_cast<float>(vx), mouseY - static_cast<float>(vy), 12.f, disp);
     if (!idx) {
-        measure_.status = u8"光标附近没有点";
+        SetStatus(u8"光标附近没有点");
         return;
     }
     const Vec3 pLocal = EditableCloud().points[*idx];
@@ -1703,20 +2021,20 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
         char buf[160];
         std::snprintf(buf, sizeof(buf), u8"选中点 [#%zu]  X=%.4f  Y=%.4f  Z=%.4f", *idx, p.x, p.y,
                       p.z);
-        measure_.status = buf;
+        SetStatus(buf);
         UpdateOverlays();
     } else if (measure_.mode == ToolMode::Distance) {
         measure_.picked.reset();
         if (!measure_.distA || measure_.distB) {
             measure_.distA = pLocal;
             measure_.distB.reset();
-            measure_.status = u8"测距: 已标记第 1 点（黄），请再点第 2 点";
+            SetStatus(u8"测距: 已标记第 1 点（黄），请再点第 2 点");
         } else {
             measure_.distB = pLocal;
             measure_.distance = (*measure_.distB - *measure_.distA).Length();
             char buf[128];
             std::snprintf(buf, sizeof(buf), u8"距离 = %.6f", measure_.distance);
-            measure_.status = buf;
+            SetStatus(buf);
         }
         UpdateOverlays();
     } else if (measure_.mode == ToolMode::ClipPlane) {
@@ -1728,7 +2046,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
         PushHistory(u8"剖切平面");
         ApplyClipMaskWithBackend(measure_.clipNormal, measure_.clipD, true);
         needUpload_ = true;
-        measure_.status = u8"已通过该点设置剖切平面";
+        SetStatus(u8"已通过该点设置剖切平面");
     } else if (measure_.mode == ToolMode::StepHeight) {
         measure_.picked.reset();
         measure_.distA.reset();
@@ -1737,7 +2055,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
             measure_.stepA = pLocal;
             measure_.stepB.reset();
             measure_.stepDeltaZ = 0.f;
-            measure_.status = u8"台阶: 已选基准点A，请再选测量点B";
+            SetStatus(u8"台阶: 已选基准点A，请再选测量点B");
         } else {
             measure_.stepB = pLocal;
             measure_.stepDeltaZ = measure_.stepB->z - measure_.stepA->z;
@@ -1747,7 +2065,7 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
             std::snprintf(buf, sizeof(buf),
                           u8"台阶高度 ΔZ = %.4f mm  (A.Z=%.4f, B.Z=%.4f)", measure_.stepDeltaZ,
                           wa.z, wb.z);
-            measure_.status = buf;
+            SetStatus(buf);
         }
         UpdateOverlays();
     }
@@ -1755,6 +2073,18 @@ void Application::OnLeftClick(float mouseX, float mouseY) {
 
 void Application::UpdateView3dLayout(float contentTop, float contentH, float sidebarW) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
+    view3dY_ = contentTop;
+    view3dH_ = std::max(contentH, 1.f);
+    if (view2DMode_) {
+        view3dX_ = vp->Pos.x + sidebarW;
+        view3dW_ = 0.f;
+        view3dPane0X_ = view3dX_;
+        view3dPane0W_ = 0.f;
+        view3dPane1X_ = view3dX_;
+        view3dPane1W_ = 0.f;
+        return;
+    }
+
     const float imageW = ImagePanelWidth();
     const float totalW = std::max(vp->Size.x - sidebarW - imageW, 1.f);
     view3dX_ = vp->Pos.x + sidebarW;
@@ -1925,6 +2255,16 @@ void Application::HandleInput() {
     // 算法编辑器打开时不处理点云视区交互
     if (algoEditor_.IsVisible()) return;
 
+    if (view2DMode_) {
+        const bool ctrl = glfwGetKey(window_, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                          glfwGetKey(window_, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+        static bool zWas2d = false;
+        const bool zDown = glfwGetKey(window_, GLFW_KEY_Z) == GLFW_PRESS;
+        if (ctrl && zDown && !zWas2d) Undo2DOrCloud();
+        zWas2d = zDown;
+        return;
+    }
+
     // HandleInput 在 DrawUi 之前执行，此处同步点云视区范围
     {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1958,6 +2298,7 @@ void Application::HandleInput() {
     static bool leftWasDown = false;
     const bool roiStyle =
         (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
+         measure_.mode == ToolMode::PlaneAlign ||
          measure_.mode == ToolMode::SphereFit || measure_.mode == ToolMode::SphereBodyFit ||
          measure_.mode == ToolMode::CircleFit ||
          measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness ||
@@ -1991,11 +2332,11 @@ void Application::HandleInput() {
             char buf[160];
             std::snprintf(buf, sizeof(buf), u8"旋转中心已设为点 #%zu  (%.4f, %.4f, %.4f)", *idx, w.x,
                           w.y, w.z);
-            measure_.status = buf;
+            SetStatus(buf);
             rotating_ = false;
             panning_ = false;
         } else {
-            measure_.status = u8"双击附近没有点，无法设置旋转中心";
+            SetStatus(u8"双击附近没有点，无法设置旋转中心");
         }
     }
 
@@ -2047,9 +2388,7 @@ void Application::HandleInput() {
                         measure_.roiPolyX.push_back(mouseX - static_cast<float>(vx));
                         measure_.roiPolyY.push_back(mouseY - static_cast<float>(vy));
                         measure_.roiPolyBuilding = true;
-                        measure_.status = std::string(u8"多边形顶点 #") +
-                                          std::to_string(measure_.roiPolyX.size()) +
-                                          u8"，点击「完成多边形」闭合";
+                        SetStatus(std::string(u8"多边形顶点 #") + std::to_string(measure_.roiPolyX.size()) + u8"，点击「完成多边形」闭合");
                     }
                 } else {
                     if (left && !leftWasDown && !shift) BeginRoiDrag(mouseX, mouseY);
@@ -2117,7 +2456,7 @@ void Application::HandleInput() {
     const bool yDown = glfwGetKey(window_, GLFW_KEY_Y) == GLFW_PRESS;
     const bool sDown = glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS;
     const bool oDown = glfwGetKey(window_, GLFW_KEY_O) == GLFW_PRESS;
-    if (ctrl && zDown && !zWas) Undo();
+    if (ctrl && zDown && !zWas) Undo2DOrCloud();
     if (ctrl && yDown && !yWas) Redo();
     if (ctrl && sDown && !sWas) SaveCloud();
     if (ctrl && oDown && !oWas) {
@@ -2153,6 +2492,7 @@ void Application::DrawOverlays() {
         (measure_.roiX0 != measure_.roiX1 || measure_.roiY0 != measure_.roiY1);
 
     if (measure_.mode == ToolMode::Roi || measure_.mode == ToolMode::PlaneFit ||
+        measure_.mode == ToolMode::PlaneAlign ||
         IsSphereFitMode(measure_.mode) || measure_.mode == ToolMode::CircleFit ||
         measure_.mode == ToolMode::CylinderFit || measure_.mode == ToolMode::Flatness) {
         if (roiDraggingNow) {
@@ -2221,6 +2561,7 @@ void Application::DrawOverlays() {
         } else if (!measure_.roiIndices.empty()) {
             const char* label = u8"框选区域";
             if (measure_.mode == ToolMode::PlaneFit) label = u8"平面拟合区域";
+            if (measure_.mode == ToolMode::PlaneAlign) label = u8"平面校准区域";
             if (measure_.mode == ToolMode::SphereFit) label = u8"球面拟合区域";
             if (measure_.mode == ToolMode::SphereBodyFit) label = u8"球体拟合区域";
             if (measure_.mode == ToolMode::CircleFit) label = u8"圆拟合区域";
@@ -2545,7 +2886,10 @@ void Application::DrawSectionPanel() {
         ImVec2(vp->WorkPos.x + vp->WorkSize.x - panelW - 12.f, vp->WorkPos.y + 12.f),
         ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_FirstUseEver);
-    ImGui::Begin(u8"截面 2D 轮廓", nullptr);
+    if (!ImGui::Begin(u8"截面 2D 轮廓", &showSectionPanel_, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
 
     if (sec.points.empty()) {
         ImGui::TextDisabled(u8"尚未生成截面。可在 3D 中左键拖拽橙色切面，或点“生成截面”。");
@@ -2566,6 +2910,10 @@ void Application::DrawSectionPanel() {
         sec.lineDistance = 0.f;
         sec.zDistance = 0.f;
         sectionPlotDragTarget_ = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"关闭")) {
+        showSectionPanel_ = false;
     }
 
     ImVec2 canvasPos = ImGui::GetCursorScreenPos();
@@ -2678,7 +3026,7 @@ void Application::DrawSectionPanel() {
             if (sec.pickA && sec.pickB) {
                 UpdateSectionDistances();
             } else if (sectionPlotDragTarget_ == 1) {
-                measure_.status = u8"拖动点1中…再单击选择点2";
+                SetStatus(u8"拖动点1中…再单击选择点2", false);
             }
         }
     }
@@ -2710,6 +3058,8 @@ const char* ToolModeLabel(ToolMode mode) {
             return u8"测距";
         case ToolMode::PlaneFit:
             return u8"平面拟合";
+        case ToolMode::PlaneAlign:
+            return u8"平面校准";
         case ToolMode::SphereFit:
             return u8"球面拟合";
         case ToolMode::SphereBodyFit:
@@ -2761,8 +3111,9 @@ void Application::ClearToolVisuals(bool resetStatus) {
     measure_.section.zDistance = 0.f;
     sectionDragging_ = false;
     sectionPlotDragTarget_ = 0;
+    ClearAllMeasuredLines();
     if (resetStatus) {
-        measure_.status = u8"已清空当前工具显示";
+        SetStatus(u8"已清空当前工具显示");
     }
     needUpload_ = true;
     UpdateOverlays();
@@ -2774,51 +3125,54 @@ void Application::SetToolMode(ToolMode mode) {
     ClearToolVisuals(false);
     measure_.mode = mode;
 
-    if (mode == ToolMode::PlaneFit || mode == ToolMode::SphereFit || mode == ToolMode::SphereBodyFit ||
-        mode == ToolMode::CircleFit || mode == ToolMode::CylinderFit || mode == ToolMode::Flatness ||
-        mode == ToolMode::StepGap) {
+    if (mode == ToolMode::PlaneFit || mode == ToolMode::PlaneAlign || mode == ToolMode::SphereFit ||
+        mode == ToolMode::SphereBodyFit || mode == ToolMode::CircleFit ||
+        mode == ToolMode::CylinderFit || mode == ToolMode::Flatness || mode == ToolMode::StepGap) {
         ResetFitRoiSelection();
     }
 
     if (mode == ToolMode::Flatness) {
-        measure_.status = u8"平面度：框选区域后点击计算";
+        SetStatus(u8"平面度：框选区域后点击计算");
     } else if (mode == ToolMode::StepGap) {
         measure_.stepGap.phase = StepGapPhase::SelectA;
-        measure_.status = u8"段差：先框选基准区域 A";
+        SetStatus(u8"段差：先框选基准区域 A");
     } else if (mode == ToolMode::Roi) {
         measure_.roiPolyX.clear();
         measure_.roiPolyY.clear();
         measure_.roiPolyBuilding = false;
-        measure_.status = u8"ROI：矩形/圆形拖拽框选，或自由多边形逐点点击";
+        SetStatus(u8"ROI：矩形/圆形拖拽框选，或自由多边形逐点点击");
     } else if (mode == ToolMode::PlaneFit) {
-        measure_.status = u8"平面拟合：框选可见表面后拟合";
+        SetStatus(u8"平面拟合：框选可见表面后拟合");
+    } else if (mode == ToolMode::PlaneAlign) {
+        SetStatus(u8"平面校准：框选基准面后摆正点云（线扫倾斜校正）");
     } else if (mode == ToolMode::SphereFit) {
-        measure_.status = u8"球面拟合：框选可见表面后拟合";
+        SetStatus(u8"球面拟合：框选可见表面后拟合");
     } else if (mode == ToolMode::SphereBodyFit) {
-        measure_.status = u8"球体拟合：框选可见表面后拟合球体";
+        SetStatus(u8"球体拟合：框选可见表面后拟合球体");
     } else if (mode == ToolMode::CircleFit) {
-        measure_.status = u8"圆拟合：框选可见表面后拟合";
+        SetStatus(u8"圆拟合：框选可见表面后拟合");
     } else if (mode == ToolMode::CylinderFit) {
-        measure_.status = u8"圆柱拟合：框选可见表面后拟合";
+        SetStatus(u8"圆柱拟合：框选可见表面后拟合");
     } else if (mode == ToolMode::Section) {
+        showSectionPanel_ = true;
         if (cloud_.bounds.Valid()) {
             measure_.section.position = measure_.section.cutAlongX ? cloud_.bounds.Center().x
                                                                   : cloud_.bounds.Center().y;
         }
         SyncSectionCutPlane();
-        measure_.status = u8"截面：拖拽橙色切面或生成截面";
+        SetStatus(u8"截面：拖拽橙色切面或生成截面");
     } else if (mode == ToolMode::Navigate) {
-        measure_.status = u8"漫游模式";
+        SetStatus(u8"漫游模式");
     } else if (mode == ToolMode::Pick) {
-        measure_.status = u8"点选：单击读取坐标";
+        SetStatus(u8"点选：单击读取坐标");
     } else if (mode == ToolMode::Distance) {
-        measure_.status = u8"测距：依次点击两点";
+        SetStatus(u8"测距：依次点击两点");
     } else if (mode == ToolMode::StepHeight) {
-        measure_.status = u8"台阶高度：依次点击 A、B";
+        SetStatus(u8"台阶高度：依次点击 A、B");
     } else if (mode == ToolMode::ClipPlane) {
-        measure_.status = u8"剖切：点击一点设置剖切面";
+        SetStatus(u8"剖切：点击一点设置剖切面");
     } else {
-        measure_.status = ToolModeLabel(mode);
+        SetStatus(ToolModeLabel(mode));
     }
 
     needUpload_ = true;
@@ -2827,9 +3181,19 @@ void Application::SetToolMode(ToolMode mode) {
 }
 
 float Application::DrawMenuBar() {
+    const UiPalette& pal = GetUiPalette();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     float menuBottom = vp->Pos.y;
     if (!ImGui::BeginMainMenuBar()) return menuBottom;
+
+    ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+    ImGui::TextUnformatted(u8"  点云查看器");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("v%s", kAppVersion);
+    ImGui::SameLine(0.f, 18.f);
+    ImGui::TextDisabled("|");
+    ImGui::SameLine(0.f, 18.f);
 
     if (ImGui::BeginMenu(u8"文件")) {
         if (ImGui::MenuItem(u8"打开点云…", "Ctrl+O")) {
@@ -2863,7 +3227,8 @@ float Application::DrawMenuBar() {
     if (ImGui::BeginMenu(u8"编辑")) {
         const bool canUndo = history_.CanUndo();
         const bool canRedo = history_.CanRedo();
-        if (ImGui::MenuItem(u8"撤销", "Ctrl+Z", false, canUndo)) Undo();
+        if (ImGui::MenuItem(u8"撤销", "Ctrl+Z", false, CanUndoMeasuredLine() || history_.CanUndo()))
+            Undo2DOrCloud();
         if (ImGui::MenuItem(u8"重做", "Ctrl+Y", false, canRedo)) Redo();
         ImGui::Separator();
         if (ImGui::MenuItem(u8"清空显示")) ClearToolVisuals(true);
@@ -2881,6 +3246,7 @@ float Application::DrawMenuBar() {
         toolItem(ToolMode::Pick);
         toolItem(ToolMode::Distance);
         toolItem(ToolMode::Roi);
+        toolItem(ToolMode::PlaneAlign);
         toolItem(ToolMode::ClipPlane);
         toolItem(ToolMode::Section);
         toolItem(ToolMode::StepHeight);
@@ -2916,20 +3282,25 @@ float Application::DrawMenuBar() {
         ImGui::EndMenu();
     }
 
+    if (ImGui::BeginMenu(u8"2D算子")) {
+        Draw2DOperatorMenuItems();
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu(u8"设置")) {
         const bool nativeActive =
             algoBackend_ == AlgorithmBackend::Native && nativeAlgoUnlocked_;
         if (ImGui::MenuItem(u8"自研算法", nullptr, nativeActive)) {
             if (nativeAlgoUnlocked_) {
                 algoBackend_ = AlgorithmBackend::Native;
-                measure_.status = u8"已切换为自研算法";
+                SetStatus(u8"已切换为自研算法");
             } else {
                 showNativeAlgoPassword_ = true;
             }
         }
         if (ImGui::MenuItem(u8"PCL 算法", nullptr, algoBackend_ == AlgorithmBackend::PCL)) {
             algoBackend_ = AlgorithmBackend::PCL;
-            measure_.status = u8"已切换为 PCL 算法";
+            SetStatus(u8"已切换为 PCL 算法");
         }
         if (!nativeAlgoUnlocked_) {
             ImGui::TextDisabled(u8"自研算法需输入密码启用");
@@ -2970,6 +3341,12 @@ float Application::DrawMenuBar() {
     }
 
     if (ImGui::BeginMenu(u8"窗口")) {
+        if (ImGui::MenuItem(u8"2D 模式", nullptr, view2DMode_)) {
+            view2DMode_ = !view2DMode_;
+            showImagePanel_ = true;
+            SetStatus(view2DMode_ ? u8"2D 模式：已隐藏点云视区" : u8"已退出 2D 模式");
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem(u8"算法编辑器", nullptr, algoEditor_.IsVisible())) {
             algoEditor_.ToggleVisible();
         }
@@ -3002,7 +3379,8 @@ void Application::DrawAboutPopup() {
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(360.f, 0.f), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal(u8"关于点云查看器", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.85f, 0.90f, 1.f));
+        const UiPalette& pal = GetUiPalette();
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.sectionTitle);
         ImGui::Text(u8"点云查看器");
         ImGui::PopStyleColor();
         ImGui::Spacing();
@@ -3043,11 +3421,11 @@ void Application::DrawNativeAlgoPasswordPopup() {
             if (std::strcmp(nativeAlgoPasswordBuf_, "111") == 0) {
                 nativeAlgoUnlocked_ = true;
                 algoBackend_ = AlgorithmBackend::Native;
-                measure_.status = u8"自研算法已启用";
+                SetStatus(u8"自研算法已启用");
                 std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
                 ImGui::CloseCurrentPopup();
             } else {
-                measure_.status = u8"密码错误，仍使用 PCL 算法";
+                SetStatus(u8"密码错误，仍使用 PCL 算法");
                 std::memset(nativeAlgoPasswordBuf_, 0, sizeof(nativeAlgoPasswordBuf_));
             }
         }
@@ -3141,6 +3519,13 @@ void Application::DrawImageWithSyncMarker(ImageView& view, const char* label) {
     }
     ImGui::SameLine();
     ImGui::TextDisabled(u8"  缩放 %.0f%%", image2dZoom_ * 100.f);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(u8"复位视图")) {
+        ResetImage2dView();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(u8"将图像缩放与平移恢复为初始状态（等同双击图像）");
+    }
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float imgAspect =
@@ -3163,9 +3548,10 @@ void Application::DrawImageWithSyncMarker(ImageView& view, const char* label) {
         image2dZoom_ = std::clamp(image2dZoom_ * factor, 0.1f, 32.f);
     }
     if (ImGui::IsWindowHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        image2dZoom_ = 1.f;
+        ResetImage2dView();
     }
 
+    ImGui::SetCursorPos(ImVec2(image2dPanX_, image2dPanY_));
     const ImVec2 cursor = ImGui::GetCursorScreenPos();
     ImGui::Image((ImTextureID)(intptr_t)view.texId, ImVec2(drawW, drawH));
     const bool hovered = ImGui::IsItemHovered();
@@ -3185,14 +3571,403 @@ void Application::DrawImageWithSyncMarker(ImageView& view, const char* label) {
         dl->AddCircleFilled(ImVec2(x, y), 2.5f, IM_COL32(255, 255, 255, 255));
     }
 
-    if ((hovered || clicked) && view.width > 0 && view.height > 0) {
+    if (showLineMeasureOverlay_) {
+        DrawLineMeasureOverlay(ImGui::GetWindowDrawList(), view, cursor.x, cursor.y, drawW, drawH);
+    }
+
+    const bool lineCaliperActive = image2DTool_ == Image2DTool::CaliperLine;
+    const bool arcCaliperActive = image2DTool_ == Image2DTool::CaliperArc;
+    const bool circleFitActive = image2DTool_ == Image2DTool::CircleFit;
+    const bool ellipseFitActive = image2DTool_ == Image2DTool::EllipseFit;
+    const bool arcRoiActive = arcCaliperActive || circleFitActive || ellipseFitActive;
+    const bool lineDistActive = image2DTool_ == Image2DTool::LineDistance;
+    const bool arcDistActive = image2DTool_ == Image2DTool::ArcDistance;
+    const bool pointDistActive = image2DTool_ == Image2DTool::PointDistance;
+    const bool lineAngleActive = image2DTool_ == Image2DTool::LineAngle;
+    const bool circleGapActive = image2DTool_ == Image2DTool::CircleGap;
+    const bool pointLineActive = image2DTool_ == Image2DTool::PointLineDistance;
+    const bool caliperPointActive = image2DTool_ == Image2DTool::CaliperPoint;
+    const bool circleCaliperActive = image2DTool_ == Image2DTool::CaliperCircle;
+    const bool arcLengthActive = image2DTool_ == Image2DTool::ArcLength;
+    const bool threePointActive = image2DTool_ == Image2DTool::ThreePointCircle;
+    const bool parallelDistActive = image2DTool_ == Image2DTool::ParallelLineDistance;
+    const bool rectCaliperActive = image2DTool_ == Image2DTool::RectCaliper;
+    const bool profileWidthActive = image2DTool_ == Image2DTool::ProfileWidth;
+    const bool pointProjActive = image2DTool_ == Image2DTool::PointProjection;
+    const bool concentricityActive = image2DTool_ == Image2DTool::Concentricity;
+    const bool roundnessActive = image2DTool_ == Image2DTool::Roundness;
+    const bool regionBlobActive = image2DTool_ == Image2DTool::RegionBlob;
+    const bool depthHeightActive = image2DTool_ == Image2DTool::DepthHeightDiff;
+    const bool depthProfileActive = image2DTool_ == Image2DTool::DepthProfile;
+    const bool caliperActive = lineCaliperActive || arcRoiActive || caliperPointActive ||
+                               circleCaliperActive || rectCaliperActive || profileWidthActive ||
+                               regionBlobActive || depthProfileActive;
+    if (view.width > 0 && view.height > 0) {
         const ImVec2 mp = ImGui::GetMousePos();
         const float u = (mp.x - cursor.x) / drawW;
         const float vv = (mp.y - cursor.y) / drawH;
-        if (u >= 0.f && u < 1.f && vv >= 0.f && vv < 1.f) {
-            const int col = std::clamp(static_cast<int>(u * view.width), 0, view.width - 1);
-            const int row = std::clamp(static_cast<int>(vv * view.height), 0, view.height - 1);
-            if (clicked && imageSyncEnabled_) {
+        const bool inImage = u >= 0.f && u < 1.f && vv >= 0.f && vv < 1.f;
+        const float px = u * static_cast<float>(view.width);
+        const float py = vv * static_cast<float>(view.height);
+        const int src = ImageSourceOf(view);
+
+        if (hovered && io.KeyShift && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            image2dPanX_ += io.MouseDelta.x;
+            image2dPanY_ += io.MouseDelta.y;
+        }
+
+        if (lineCaliperActive && hovered && inImage && !io.KeyShift) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                lineMeasureDragging_ = true;
+                lineMeasureDragSource_ = src;
+                lineMeasureRoiX0_ = px;
+                lineMeasureRoiY0_ = py;
+                lineMeasureRoiX1_ = px;
+                lineMeasureRoiY1_ = py;
+            }
+            if (lineMeasureDragging_ && lineMeasureDragSource_ == src &&
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                lineMeasureRoiX1_ = px;
+                lineMeasureRoiY1_ = py;
+            }
+            if (lineMeasureDragging_ && lineMeasureDragSource_ == src &&
+                ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                lineMeasureDragging_ = false;
+                lineMeasureRoiX1_ = px;
+                lineMeasureRoiY1_ = py;
+                PreviewLineMeasure(view);
+            }
+        }
+
+        if (arcRoiActive && hovered && inImage && !io.KeyShift) {
+            bool skipRoiClick = false;
+            if (circleFitActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                const int arcIdx = FindClosestMeasuredArc(src, px, py, 18.f);
+                if (arcIdx >= 0) {
+                    PreviewCircleFitFromMeasuredArc(arcIdx);
+                    skipRoiClick = true;
+                }
+            }
+            if (ellipseFitActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                const int arcIdx = FindClosestMeasuredArc(src, px, py, 18.f);
+                if (arcIdx >= 0) {
+                    PreviewEllipseFitFromMeasuredArc(arcIdx);
+                    skipRoiClick = true;
+                }
+            }
+            if (!skipRoiClick) {
+            if (arcMeasurePhase_ == ArcMeasurePhase::PickA) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    arcMeasureSource_ = src;
+                    arcRoiP0X_ = px;
+                    arcRoiP0Y_ = py;
+                    arcMeasurePhase_ = ArcMeasurePhase::PickB;
+                    SetStatus(u8"已设置 A 点，请点击 B 点");
+                }
+            } else if (arcMeasurePhase_ == ArcMeasurePhase::PickB && arcMeasureSource_ == src) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    const float dx = px - arcRoiP0X_;
+                    const float dy = py - arcRoiP0Y_;
+                    if (dx * dx + dy * dy < 16.f) {
+                        SetStatus(u8"B 点须与 A 点保持距离");
+                    } else {
+                        arcRoiP1X_ = px;
+                        arcRoiP1Y_ = py;
+                        ProjectBulgePoint(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, px, py,
+                                          arcRoiP2X_, arcRoiP2Y_);
+                        arcMeasurePhase_ = ArcMeasurePhase::DragBulge;
+                        SetStatus(u8"请拖拽拱高线段调节弧线形状，松开后预览");
+                    }
+                }
+            } else if (arcMeasurePhase_ == ArcMeasurePhase::DragBulge &&
+                       arcMeasureSource_ == src) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    arcBulgeDragging_ = true;
+                    ProjectBulgePoint(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, px, py,
+                                      arcRoiP2X_, arcRoiP2Y_);
+                }
+                if (arcBulgeDragging_ && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    ProjectBulgePoint(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, px, py,
+                                      arcRoiP2X_, arcRoiP2Y_);
+                } else if (!arcBulgeDragging_) {
+                    ProjectBulgePoint(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, px, py,
+                                      arcRoiP2X_, arcRoiP2Y_);
+                }
+                if (arcBulgeDragging_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    arcBulgeDragging_ = false;
+                    ProjectBulgePoint(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, px, py,
+                                      arcRoiP2X_, arcRoiP2Y_);
+                    if (ArcChordBulgePx(arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+                                        arcRoiP2X_, arcRoiP2Y_) >= 3.f) {
+                        if (circleFitActive) {
+                            PreviewCircleFitFromRoi(view);
+                        } else if (ellipseFitActive) {
+                            PreviewEllipseFitFromRoi(view);
+                        } else {
+                            PreviewArcMeasure(view);
+                        }
+                    } else {
+                        SetStatus(u8"拱高过小，请继续拖拽调节线段");
+                    }
+                }
+            }
+            }
+        }
+
+        if (lineDistActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredLine(src, px, py, 18.f);
+            if (idx >= 0) {
+                PickLineForDistance(idx);
+            } else {
+                SetStatus(u8"未点中线段，请点击图像上已显示的线段");
+            }
+        }
+
+        if (arcDistActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredArc(src, px, py, 18.f);
+            if (idx >= 0) {
+                PickArcForDistance(idx);
+            } else {
+                SetStatus(u8"未点中圆弧，请点击图像上已显示的圆弧");
+            }
+        }
+
+        if (pointDistActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (pointDistPhase_ == PointPickPhase::PickA) {
+                pointDistSource_ = src;
+                pointDistAx_ = px;
+                pointDistAy_ = py;
+                pointDistPhase_ = PointPickPhase::PickB;
+                SetStatus(u8"已设置 A 点，请点击 B 点");
+            } else if (pointDistSource_ == src) {
+                AddPointDistance(pointDistAx_, pointDistAy_, px, py, src);
+                pointDistPhase_ = PointPickPhase::PickA;
+            }
+        }
+
+        if (lineAngleActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredLine(src, px, py, 18.f);
+            if (idx >= 0) {
+                PickLineForAngle(idx);
+            } else {
+                SetStatus(u8"未点中线段，请点击图像上已显示的线段");
+            }
+        }
+
+        if (circleGapActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredCircleFit(src, px, py, 18.f);
+            if (idx >= 0) {
+                PickCircleForGap(idx);
+            } else {
+                SetStatus(u8"未点中圆，请点击图像上已显示的拟合圆");
+            }
+        }
+
+        if (pointLineActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (pointLinePhase_ == PointPickPhase::PickA) {
+                PickPointForPointLine(px, py, src);
+            } else {
+                const int idx = FindClosestMeasuredLine(src, px, py, 18.f);
+                if (idx >= 0) {
+                    PickLineForPointLine(idx);
+                } else {
+                    SetStatus(u8"未点中线段，请点击图像上已显示的线段");
+                }
+            }
+        }
+
+        if (caliperPointActive && hovered && inImage && !io.KeyShift) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                caliperPointDragging_ = true;
+                caliperPointDragSource_ = src;
+                caliperPointRoiX0_ = px;
+                caliperPointRoiY0_ = py;
+                caliperPointRoiX1_ = px;
+                caliperPointRoiY1_ = py;
+            }
+            if (caliperPointDragging_ && caliperPointDragSource_ == src &&
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                caliperPointRoiX1_ = px;
+                caliperPointRoiY1_ = py;
+            }
+            if (caliperPointDragging_ && caliperPointDragSource_ == src &&
+                ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                caliperPointDragging_ = false;
+                caliperPointRoiX1_ = px;
+                caliperPointRoiY1_ = py;
+                PreviewCaliperPoint(view);
+            }
+        }
+
+        if (circleCaliperActive && hovered && inImage && !io.KeyShift) {
+            if (circleCaliperPhase_ == CircleCaliperPhase::PickCenter) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    circleCaliperSource_ = src;
+                    circleCaliperCx_ = px;
+                    circleCaliperCy_ = py;
+                    circleCaliperR_ = 0.f;
+                    circleCaliperPhase_ = CircleCaliperPhase::DragRadius;
+                    SetStatus(u8"已设置圆心，拖拽设置半径后松开");
+                }
+            } else if (circleCaliperSource_ == src) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    circleCaliperDragging_ = true;
+                }
+                if (circleCaliperDragging_ && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    circleCaliperR_ = std::hypot(px - circleCaliperCx_, py - circleCaliperCy_);
+                }
+                if (circleCaliperDragging_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    circleCaliperDragging_ = false;
+                    circleCaliperR_ = std::hypot(px - circleCaliperCx_, py - circleCaliperCy_);
+                    if (circleCaliperR_ >= 3.f) {
+                        PreviewCircleCaliper(view);
+                    } else {
+                        SetStatus(u8"半径过小，请重新拖拽");
+                    }
+                } else if (!circleCaliperDragging_) {
+                    circleCaliperR_ = std::hypot(px - circleCaliperCx_, py - circleCaliperCy_);
+                }
+            }
+        }
+
+        if (arcLengthActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredArc(src, px, py, 18.f);
+            if (idx >= 0) {
+                PickArcForLength(idx);
+            } else {
+                SetStatus(u8"未点中圆弧，请点击图像上已显示的圆弧");
+            }
+        }
+
+        if (threePointActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = static_cast<int>(threePointPhase_);
+            threePointSource_ = src;
+            threePointX_[idx] = px;
+            threePointY_[idx] = py;
+            if (threePointPhase_ == ThreePointPhase::Pick0) {
+                threePointPhase_ = ThreePointPhase::Pick1;
+                SetStatus(u8"已设置点1，请点击点2");
+            } else if (threePointPhase_ == ThreePointPhase::Pick1) {
+                threePointPhase_ = ThreePointPhase::Pick2;
+                SetStatus(u8"已设置点2，请点击点3");
+            } else {
+                threePointPhase_ = ThreePointPhase::Pick0;
+                ConfirmThreePointCircle();
+            }
+        }
+
+        if (parallelDistActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredLine(src, px, py, 18.f);
+            if (idx >= 0)
+                PickLineForParallelDist(idx);
+            else
+                SetStatus(u8"未点中线段");
+        }
+
+        if (pointProjActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (pointProjPhase_ == PointPickPhase::PickA) {
+                PickPointForProjection(px, py, src);
+            } else {
+                const int idx = FindClosestMeasuredLine(src, px, py, 18.f);
+                if (idx >= 0)
+                    PickLineForProjection(idx);
+                else
+                    SetStatus(u8"未点中线段");
+            }
+        }
+
+        if (concentricityActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const int idx = FindClosestMeasuredCircleFit(src, px, py, 18.f);
+            if (idx >= 0)
+                PickCircleForConcentricity(idx);
+            else
+                SetStatus(u8"未点中拟合圆");
+        }
+
+        if (roundnessActive && hovered && inImage && !io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            int idx = FindClosestMeasuredCircleFit(src, px, py, 18.f);
+            if (idx >= 0) {
+                roundnessCircleSource_ = 0;
+                PickCircleForRoundness(idx);
+            } else {
+                idx = FindClosestMeasuredCircleCaliper(src, px, py, 18.f);
+                if (idx >= 0) {
+                    roundnessCircleSource_ = 1;
+                    PickCircleForRoundness(idx);
+                } else {
+                    SetStatus(u8"未点中圆");
+                }
+            }
+        }
+
+        auto handleRectDrag = [&](bool& dragging, int& dragSource, float& x0, float& y0, float& x1,
+                                  float& y1, auto&& onRelease) {
+            if (!hovered || !inImage || io.KeyShift) return;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                dragging = true;
+                dragSource = src;
+                x0 = x1 = px;
+                y0 = y1 = py;
+            }
+            if (dragging && dragSource == src && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                x1 = px;
+                y1 = py;
+            }
+            if (dragging && dragSource == src && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                dragging = false;
+                x1 = px;
+                y1 = py;
+                onRelease();
+            }
+        };
+
+        if (rectCaliperActive) {
+            handleRectDrag(rectCaliperDragging_, rectCaliperDragSource_, rectCaliperRoiX0_,
+                           rectCaliperRoiY0_, rectCaliperRoiX1_, rectCaliperRoiY1_,
+                           [&]() { PreviewRectCaliper(view); });
+        }
+        if (profileWidthActive) {
+            handleRectDrag(profileWidthDragging_, profileWidthDragSource_, profileWidthRoiX0_,
+                           profileWidthRoiY0_, profileWidthRoiX1_, profileWidthRoiY1_,
+                           [&]() { PreviewProfileWidth(view); });
+        }
+        if (regionBlobActive) {
+            handleRectDrag(regionBlobDragging_, regionBlobDragSource_, regionBlobRoiX0_,
+                           regionBlobRoiY0_, regionBlobRoiX1_, regionBlobRoiY1_,
+                           [&]() { PreviewRegionBlob(view); });
+        }
+
+        if (depthHeightActive && hovered && inImage && !io.KeyShift && src == 0 &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            AddDepthHeightSample(px, py, src);
+        }
+
+        if (depthProfileActive && src == 0 && !view.gray.empty()) {
+            handleRectDrag(depthProfileDragging_, depthProfileDragSource_, depthProfileRoiX0_,
+                           depthProfileRoiY0_, depthProfileRoiX1_, depthProfileRoiY1_,
+                           [&]() { PreviewDepthProfile(view); });
+        }
+
+        if ((hovered || clicked) && inImage) {
+            const int col = std::clamp(static_cast<int>(px), 0, view.width - 1);
+            const int row = std::clamp(static_cast<int>(py), 0, view.height - 1);
+            if (clicked && imageSyncEnabled_ && !caliperActive && !lineDistActive &&
+                !arcDistActive && !pointDistActive && !lineAngleActive && !circleGapActive &&
+                !pointLineActive && !arcLengthActive && !threePointActive && !parallelDistActive &&
+                !pointProjActive && !concentricityActive && !roundnessActive &&
+                !depthHeightActive) {
                 SetImageSyncPixel(col, row);
             }
             if (hovered) {
@@ -3213,8 +3988,31 @@ void Application::DrawImageWithSyncMarker(ImageView& view, const char* label) {
                                     view.rgb[bi + 2]);
                     }
                 }
-                if (imageSyncEnabled_) ImGui::TextDisabled(u8"单击同步到另一张图");
-                ImGui::TextDisabled(u8"Shift+滚轮缩放，双击复位");
+                if (lineCaliperActive) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.7f, 1.f),
+                                       u8"卡尺提线：拖拽绘制测量方向线");
+                    ImGui::TextDisabled(u8"Shift+左键拖拽平移图像");
+                } else if (arcCaliperActive) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.7f, 1.f), "%s",
+                                       ArcMeasurePhaseHint(arcMeasurePhase_));
+                    ImGui::TextDisabled(u8"Shift+左键拖拽平移图像");
+                } else if (circleFitActive) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.7f, 1.f), "%s",
+                                       ArcMeasurePhaseHint(arcMeasurePhase_));
+                    ImGui::TextDisabled(u8"点击已有圆弧拟合，或设置 A/B 后拖拽拱高提取");
+                    ImGui::TextDisabled(u8"Shift+左键拖拽平移图像");
+                } else if (lineDistActive) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.7f, 1.f),
+                                       u8"线线距离：点击图像上的线段选 A / B");
+                    ImGui::TextDisabled(u8"Shift+左键拖拽平移图像");
+                } else if (arcDistActive) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.7f, 1.f),
+                                       u8"圆弧距离：点击图像上的圆弧选 A / B");
+                    ImGui::TextDisabled(u8"Shift+左键拖拽平移图像");
+                } else if (imageSyncEnabled_) {
+                    ImGui::TextDisabled(u8"单击同步到另一张图");
+                }
+                ImGui::TextDisabled(u8"Shift+滚轮缩放，Shift+左键平移，双击或「复位视图」恢复");
                 ImGui::EndTooltip();
             }
         }
@@ -3269,68 +4067,82 @@ void Application::DrawImagePanel() {
     if (!HasImagePanel()) return;
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float maxW = std::max(vp->Size.x - 600.f, 240.f);
-    imagePanelPreferredW_ = std::clamp(imagePanelPreferredW_, 240.f, maxW);
-    const float imageW = imagePanelPreferredW_;
-    const float panelX = vp->Pos.x + vp->Size.x - imageW;
+    const float sidebarW = SidebarWidth();
     const float panelY = view3dY_;
     const float panelH = view3dH_;
 
-    // 左边缘分割条：吸附右端，仅左右拖拽调宽
-    constexpr float kSplitHit = 8.f;
-    ImGui::SetNextWindowPos(ImVec2(panelX - kSplitHit * 0.5f, panelY));
-    ImGui::SetNextWindowSize(ImVec2(kSplitHit, panelH));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.f));
-    ImGui::Begin(u8"##2d图像分割条", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
-                     ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImGui::InvisibleButton(u8"##split", ImVec2(kSplitHit, panelH));
-    const bool splitHover = ImGui::IsItemHovered();
-    const bool splitDrag = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
-    if (splitDrag) {
-        const float mx = ImGui::GetIO().MousePos.x;
-        imagePanelPreferredW_ = std::clamp(vp->Pos.x + vp->Size.x - mx, 240.f, maxW);
-    }
-    if (splitHover || splitDrag) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-    }
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    float panelX = 0.f;
+    float imageW = 0.f;
+    bool splitHover = false;
+    bool splitDrag = false;
+    if (view2DMode_) {
+        panelX = vp->Pos.x + sidebarW;
+        imageW = std::max(vp->Size.x - sidebarW, 1.f);
+    } else {
+        const float maxW = std::max(vp->Size.x - 600.f, 240.f);
+        imagePanelPreferredW_ = std::clamp(imagePanelPreferredW_, 240.f, maxW);
+        imageW = imagePanelPreferredW_;
+        panelX = vp->Pos.x + vp->Size.x - imageW;
 
-    // 与左侧栏相同：贴边停靠，不可拖移，高度铺满内容区
+        constexpr float kSplitHit = 8.f;
+        ImGui::SetNextWindowPos(ImVec2(panelX - kSplitHit * 0.5f, panelY));
+        ImGui::SetNextWindowSize(ImVec2(kSplitHit, panelH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+        ImGui::Begin(u8"##2d图像分割条", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::InvisibleButton(u8"##split", ImVec2(kSplitHit, panelH));
+        splitHover = ImGui::IsItemHovered();
+        splitDrag = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (splitDrag) {
+            const float mx = ImGui::GetIO().MousePos.x;
+            imagePanelPreferredW_ = std::clamp(vp->Pos.x + vp->Size.x - mx, 240.f, maxW);
+        }
+        if (splitHover || splitDrag) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+    }
+
     ImGui::SetNextWindowPos(ImVec2(panelX, panelY));
     ImGui::SetNextWindowSize(ImVec2(imageW, panelH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 8.f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.09f, 0.10f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, GetUiPalette().bgDeep);
 
     ImGui::Begin(u8"##2D图像停靠栏", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
                      ImGuiWindowFlags_NoScrollbar);
 
-    // 顶栏：标题 + 关闭（替代系统标题栏，保持停靠外观）
     {
-        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.90f, 1.f), u8"2D 图像");
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 28.f);
-        if (ImGui::SmallButton(u8"×")) {
-            showImagePanel_ = false;
+        const UiPalette& pal = GetUiPalette();
+        UiSectionHeader(u8"2D 图像", nullptr, &pal.tool3D, true);
+        if (!view2DMode_) {
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 28.f);
+            if (ImGui::SmallButton(u8"×")) {
+                showImagePanel_ = false;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"关闭面板（可在「窗口」菜单再打开）");
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"关闭面板（可在「窗口」菜单再打开）");
     }
 
-    // 左侧分割高亮线
-    {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImU32 col = (splitHover || splitDrag) ? IM_COL32(90, 180, 200, 220)
-                                                   : IM_COL32(50, 70, 80, 200);
-        dl->AddLine(ImVec2(panelX, panelY), ImVec2(panelX, panelY + panelH), col,
-                    (splitHover || splitDrag) ? 2.5f : 1.5f);
+    if (view2DMode_) {
+        ImGui::TextColored(GetUiPalette().tool2D, u8"2D 模式");
+    }
+
+    if (!view2DMode_) {
+        ImDrawList* edgeDl = ImGui::GetWindowDrawList();
+        const ImU32 edgeCol = (splitHover || splitDrag) ? IM_COL32(90, 180, 200, 220)
+                                                        : IM_COL32(50, 70, 80, 200);
+        edgeDl->AddLine(ImVec2(panelX, panelY), ImVec2(panelX, panelY + panelH), edgeCol,
+                        (splitHover || splitDrag) ? 2.5f : 1.5f);
     }
 
     const bool canSync = depthImage_.valid() && brightnessImage_.valid();
@@ -3340,7 +4152,7 @@ void Application::DrawImagePanel() {
         if (imageSyncEnabled_) {
             imageSyncEnabled_ = false;
             ClearImageSyncPick();
-            measure_.status = u8"已关闭深度/亮度联动";
+            SetStatus(u8"已关闭深度/亮度联动");
         } else {
             TryEnableImageSync();
         }
@@ -3395,7 +4207,7 @@ void Application::DrawImagePanel() {
             DrawImageWithSyncMarker(*view, imagePanelTab_ == 0 ? u8"深度图" : u8"亮度图");
             if (imagePanelTab_ == 0) DrawDepthRenderControls();
         } else {
-            ImGui::TextDisabled(u8"当前无图像");
+            ImGui::TextDisabled(view2DMode_ ? u8"请从「文件」打开深度图或亮度图" : u8"当前无图像");
         }
     }
 
@@ -3405,67 +4217,3317 @@ void Application::DrawImagePanel() {
 }
 
 void Application::DrawToolbar(float y, float height) {
+    const UiPalette& pal = GetUiPalette();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, y));
     ImGui::SetNextWindowSize(ImVec2(vp->Size.x, height));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 6.f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.12f, 0.14f, 1.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 6.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.bgBar);
     ImGui::Begin(u8"##工具栏", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse |
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    const float btnH = height - 14.f;
-    const bool canUndo = history_.CanUndo();
+    const float btnH = height - 12.f;
+    const bool canUndo2D = CanUndoMeasuredLine();
+    const bool canUndoCloud = history_.CanUndo();
+    const bool canUndo = canUndo2D || canUndoCloud;
     const bool canRedo = history_.CanRedo();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
     if (!canUndo) ImGui::BeginDisabled();
-    if (ImGui::Button(u8"撤销", ImVec2(0.f, btnH))) Undo();
+    if (ImGui::Button(u8"撤销", ImVec2(52.f, btnH))) Undo2DOrCloud();
     if (!canUndo) ImGui::EndDisabled();
     ImGui::SameLine();
     if (!canRedo) ImGui::BeginDisabled();
-    if (ImGui::Button(u8"重做", ImVec2(0.f, btnH))) Redo();
+    if (ImGui::Button(u8"重做", ImVec2(52.f, btnH))) Redo();
     if (!canRedo) ImGui::EndDisabled();
+    ImGui::PopStyleVar();
 
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 14.f);
     ImGui::TextDisabled("|");
+    ImGui::SameLine(0.f, 14.f);
+    ImGui::TextDisabled(u8"工具");
     ImGui::SameLine();
-    ImGui::TextDisabled(u8"当前工具");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.90f, 1.f), "%s", ToolModeLabel(measure_.mode));
-    ImGui::SameLine();
-    ImGui::TextDisabled(u8"（菜单「工具」中切换）");
-    ImGui::SameLine(0.f, 16.f);
+    if (image2DTool_ != Image2DTool::None) {
+        UiStatusBadge(Image2DToolLabel(image2DTool_), pal.tool2D, btnH);
+        ImGui::SameLine();
+        ImGui::TextDisabled(u8"2D");
+    } else if (view2DMode_) {
+        UiStatusBadge(u8"2D 模式", pal.tool2D, btnH);
+    } else {
+        UiStatusBadge(ToolModeLabel(measure_.mode), pal.tool3D, btnH);
+    }
+
+    ImGui::SameLine(0.f, 18.f);
     ImGui::TextDisabled("|");
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 18.f);
     ImGui::TextDisabled(u8"算法");
     ImGui::SameLine();
-    ImGui::TextColored(EffectiveAlgoBackend() == AlgorithmBackend::PCL
-                           ? ImVec4(0.55f, 0.90f, 0.65f, 1.f)
-                           : ImVec4(0.75f, 0.75f, 0.80f, 1.f),
-                       "%s", AlgorithmBackendLabel(EffectiveAlgoBackend()));
-    ImGui::SameLine(0.f, 16.f);
+    const bool isPcl = EffectiveAlgoBackend() == AlgorithmBackend::PCL;
+    UiStatusBadge(AlgorithmBackendLabel(EffectiveAlgoBackend()), isPcl ? pal.success : pal.native,
+                  btnH);
+
+    ImGui::SameLine(0.f, 18.f);
     ImGui::TextDisabled("|");
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, 18.f);
     if (ImGui::Button(u8"清空显示", ImVec2(0.f, btnH))) {
         ClearToolVisuals(true);
     }
 
     if (filterCompareActive_) {
-        ImGui::SameLine(0.f, 24.f);
+        ImGui::SameLine(0.f, 20.f);
         ImGui::TextDisabled("|");
+        ImGui::SameLine(0.f, 20.f);
+        UiStatusBadge(u8"滤波对比中", pal.warning, btnH);
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.35f, 1.f), u8"滤波对比中");
+        if (ImGui::Button(u8"应用", ImVec2(52.f, btnH))) ApplyFilterResult();
         ImGui::SameLine();
-        if (ImGui::Button(u8"应用滤波", ImVec2(0.f, btnH))) ApplyFilterResult();
-        ImGui::SameLine();
-        if (ImGui::Button(u8"取消预览", ImVec2(0.f, btnH))) ClearFilterCompare();
+        if (ImGui::Button(u8"取消", ImVec2(52.f, btnH))) ClearFilterCompare();
+    }
+
+    // 底部强调线
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 wmin = ImGui::GetWindowPos();
+        const ImVec2 wmax = ImVec2(wmin.x + ImGui::GetWindowWidth(), wmin.y + ImGui::GetWindowHeight());
+        dl->AddLine(ImVec2(wmin.x, wmax.y - 1.f), ImVec2(wmax.x, wmax.y - 1.f),
+                    ImGui::ColorConvertFloat4ToU32(pal.border), 1.f);
+        dl->AddLine(ImVec2(wmin.x, wmax.y), ImVec2(wmin.x + 120.f, wmax.y),
+                    ImGui::ColorConvertFloat4ToU32(pal.accent), 2.f);
     }
 
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(3);
+}
+
+void Application::ClearLineMeasure() {
+    lineMeasureDragging_ = false;
+    lineMeasureDragSource_ = -1;
+}
+
+void Application::ClearArcMeasure() {
+    arcMeasurePhase_ = ArcMeasurePhase::PickA;
+    arcMeasureSource_ = -1;
+    arcBulgeDragging_ = false;
+    arcRoiP0X_ = 0.f;
+    arcRoiP0Y_ = 0.f;
+    arcRoiP1X_ = 0.f;
+    arcRoiP1Y_ = 0.f;
+    arcRoiP2X_ = 0.f;
+    arcRoiP2Y_ = 0.f;
+}
+
+void Application::ResetArcMeasurePick() {
+    arcMeasurePhase_ = ArcMeasurePhase::PickA;
+    arcMeasureSource_ = -1;
+    arcBulgeDragging_ = false;
+    arcRoiP0X_ = 0.f;
+    arcRoiP0Y_ = 0.f;
+    arcRoiP1X_ = 0.f;
+    arcRoiP1Y_ = 0.f;
+    arcRoiP2X_ = 0.f;
+    arcRoiP2Y_ = 0.f;
+}
+
+void Application::CancelCaliperPending() {
+    lineMeasurePending_ = false;
+    lineMeasurePendingSource_ = -1;
+    lineMeasurePendingResult_ = {};
+    arcMeasurePending_ = false;
+    arcMeasurePendingSource_ = -1;
+    arcMeasurePendingResult_ = {};
+}
+
+void Application::ClearMeasuredLinesOnly() {
+    ClearLineMeasure();
+    lineMeasurePending_ = false;
+    lineMeasurePendingSource_ = -1;
+    lineMeasurePendingResult_ = {};
+    measuredLines_.clear();
+    nextMeasuredLineId_ = 1;
+    ClearLineDistance();
+    ClearLineAngle();
+    ClearParallelLineDistance();
+    ClearPointLineDistance();
+    ClearPointProjection();
+}
+
+void Application::ClearMeasuredArcsOnly() {
+    ClearArcMeasure();
+    arcMeasurePending_ = false;
+    arcMeasurePendingSource_ = -1;
+    arcMeasurePendingResult_ = {};
+    measuredArcs_.clear();
+    nextMeasuredArcId_ = 1;
+    ClearArcDistance();
+    ClearArcLength();
+    measuredCircleFits_.clear();
+    nextCircleFitId_ = 1;
+    CancelCircleFitPending();
+    measuredEllipseFits_.clear();
+    nextEllipseFitId_ = 1;
+    CancelEllipseFitPending();
+    ClearCircleGap();
+    ClearConcentricity();
+    ClearRoundness();
+}
+
+void Application::ClearAllMeasuredLines() {
+    ClearMeasuredLinesOnly();
+    ClearMeasuredArcsOnly();
+    CancelCaliperPending();
+    measuredPointDists_.clear();
+    nextPointDistId_ = 1;
+    pointDistPhase_ = PointPickPhase::PickA;
+    measuredCaliperPoints_.clear();
+    nextCaliperPointId_ = 1;
+    CancelCaliperPointPending();
+    measuredCircleCalipers_.clear();
+    nextCircleCaliperId_ = 1;
+    CancelCircleCaliperPending();
+    circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+    measuredThreePointCircles_.clear();
+    nextThreePointCircleId_ = 1;
+    ClearThreePointCircle();
+    measuredRectCalipers_.clear();
+    nextRectCaliperId_ = 1;
+    CancelRectCaliperPending();
+    measuredProfileWidths_.clear();
+    nextProfileWidthId_ = 1;
+    CancelProfileWidthPending();
+    measuredRegionBlobs_.clear();
+    nextRegionBlobId_ = 1;
+    CancelRegionBlobPending();
+    ClearDepthHeightDiff();
+    ClearDepthProfile();
+}
+
+bool Application::CanUndoMeasuredLine() const {
+    if (image2DTool_ == Image2DTool::None) return false;
+    if (image2DTool_ == Image2DTool::LineDistance) return false;
+    if (image2DTool_ == Image2DTool::ArcDistance) return false;
+    if (image2DTool_ == Image2DTool::LineAngle) return false;
+    if (image2DTool_ == Image2DTool::CircleGap) return false;
+    if (image2DTool_ == Image2DTool::PointLineDistance) return false;
+    if (image2DTool_ == Image2DTool::ArcLength) return false;
+    if (image2DTool_ == Image2DTool::ParallelLineDistance) return false;
+    if (image2DTool_ == Image2DTool::PointProjection) return false;
+    if (image2DTool_ == Image2DTool::Concentricity) return false;
+    if (image2DTool_ == Image2DTool::Roundness) return false;
+    if (image2DTool_ == Image2DTool::DepthHeightDiff) return false;
+    if (image2DTool_ == Image2DTool::DepthProfile) return false;
+    if (image2DTool_ == Image2DTool::ThreePointCircle) return !measuredThreePointCircles_.empty();
+    if (image2DTool_ == Image2DTool::RectCaliper) {
+        return rectCaliperPending_ || !measuredRectCalipers_.empty();
+    }
+    if (image2DTool_ == Image2DTool::EllipseFit) {
+        return ellipseFitPending_ || !measuredEllipseFits_.empty();
+    }
+    if (image2DTool_ == Image2DTool::ProfileWidth) {
+        return profileWidthPending_ || !measuredProfileWidths_.empty();
+    }
+    if (image2DTool_ == Image2DTool::RegionBlob) {
+        return regionBlobPending_ || !measuredRegionBlobs_.empty();
+    }
+    if (image2DTool_ == Image2DTool::PointDistance) return !measuredPointDists_.empty();
+    if (image2DTool_ == Image2DTool::CaliperPoint) {
+        return caliperPointPending_ || !measuredCaliperPoints_.empty();
+    }
+    if (image2DTool_ == Image2DTool::CaliperCircle) {
+        return circleCaliperPending_ || !measuredCircleCalipers_.empty();
+    }
+    if (image2DTool_ == Image2DTool::CircleFit) {
+        return circleFitPending_ || !measuredCircleFits_.empty();
+    }
+    if (image2DTool_ == Image2DTool::CaliperArc) {
+        return arcMeasurePending_ || !measuredArcs_.empty();
+    }
+    return lineMeasurePending_ || !measuredLines_.empty();
+}
+
+void Application::UndoLastMeasuredLine() {
+    if (image2DTool_ == Image2DTool::ThreePointCircle) {
+        if (measuredThreePointCircles_.empty()) return;
+        measuredThreePointCircles_.pop_back();
+        SetStatus(u8"已撤回三点圆");
+        return;
+    }
+    if (image2DTool_ == Image2DTool::RectCaliper) {
+        if (rectCaliperPending_) {
+            CancelRectCaliperPending();
+            SetStatus(u8"已撤回矩形卡尺预览");
+            return;
+        }
+        if (measuredRectCalipers_.empty()) return;
+        measuredRectCalipers_.pop_back();
+        SetStatus(u8"已撤回矩形卡尺");
+        return;
+    }
+    if (image2DTool_ == Image2DTool::EllipseFit) {
+        if (ellipseFitPending_) {
+            CancelEllipseFitPending();
+            arcMeasurePhase_ = ArcMeasurePhase::DragBulge;
+            SetStatus(u8"已撤回椭圆拟合预览");
+            return;
+        }
+        if (measuredEllipseFits_.empty()) return;
+        measuredEllipseFits_.pop_back();
+        SetStatus(u8"已撤回椭圆拟合");
+        return;
+    }
+    if (image2DTool_ == Image2DTool::ProfileWidth) {
+        if (profileWidthPending_) {
+            CancelProfileWidthPending();
+            SetStatus(u8"已撤回测宽预览");
+            return;
+        }
+        if (measuredProfileWidths_.empty()) return;
+        measuredProfileWidths_.pop_back();
+        SetStatus(u8"已撤回测宽结果");
+        return;
+    }
+    if (image2DTool_ == Image2DTool::RegionBlob) {
+        if (regionBlobPending_) {
+            CancelRegionBlobPending();
+            SetStatus(u8"已撤回区域预览");
+            return;
+        }
+        if (measuredRegionBlobs_.empty()) return;
+        measuredRegionBlobs_.pop_back();
+        SetStatus(u8"已撤回区域结果");
+        return;
+    }
+    if (image2DTool_ == Image2DTool::PointDistance) {
+        if (measuredPointDists_.empty()) return;
+        const int removedId = measuredPointDists_.back().id;
+        measuredPointDists_.pop_back();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"已撤回测距%d", removedId);
+        SetStatus(buf);
+        return;
+    }
+    if (image2DTool_ == Image2DTool::CaliperPoint) {
+        if (caliperPointPending_) {
+            CancelCaliperPointPending();
+            SetStatus(u8"已撤回待确认边缘点");
+            return;
+        }
+        if (measuredCaliperPoints_.empty()) return;
+        const int removedId = measuredCaliperPoints_.back().id;
+        measuredCaliperPoints_.pop_back();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"已撤回边缘点%d", removedId);
+        SetStatus(buf);
+        return;
+    }
+    if (image2DTool_ == Image2DTool::CaliperCircle) {
+        if (circleCaliperPending_) {
+            CancelCircleCaliperPending();
+            circleCaliperPhase_ = CircleCaliperPhase::DragRadius;
+            SetStatus(u8"已撤回待确认圆卡尺");
+            return;
+        }
+        if (measuredCircleCalipers_.empty()) return;
+        const int removedId = measuredCircleCalipers_.back().id;
+        measuredCircleCalipers_.pop_back();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"已撤回圆卡尺%d", removedId);
+        SetStatus(buf);
+        return;
+    }
+    if (image2DTool_ == Image2DTool::CircleFit) {
+        if (circleFitPending_) {
+            CancelCircleFitPending();
+            arcMeasurePhase_ = ArcMeasurePhase::DragBulge;
+            SetStatus(u8"已撤回待确认圆拟合，可继续调节");
+            return;
+        }
+        if (measuredCircleFits_.empty()) return;
+        const int removedId = measuredCircleFits_.back().id;
+        measuredCircleFits_.pop_back();
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), u8"已撤回圆拟合%d", removedId);
+        SetStatus(buf);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::CaliperArc) {
+        if (arcMeasurePending_) {
+            arcMeasurePending_ = false;
+            arcMeasurePendingSource_ = -1;
+            arcMeasurePendingResult_ = {};
+            arcMeasurePhase_ = ArcMeasurePhase::DragBulge;
+            SetStatus(u8"已撤回待确认圆弧卡尺，可继续调节拱高");
+            return;
+        }
+        if (measuredArcs_.empty()) return;
+        const int removedId = measuredArcs_.back().id;
+        measuredArcs_.pop_back();
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), u8"已撤回圆弧%d", removedId);
+        SetStatus(buf);
+        return;
+    }
+
+    if (lineMeasurePending_) {
+        lineMeasurePending_ = false;
+        lineMeasurePendingSource_ = -1;
+        lineMeasurePendingResult_ = {};
+        SetStatus(u8"已撤回待确认卡尺");
+        return;
+    }
+    if (measuredLines_.empty()) return;
+
+    const int removedId = measuredLines_.back().id;
+    measuredLines_.pop_back();
+    if (lineDistPickA_ >= static_cast<int>(measuredLines_.size())) lineDistPickA_ = -1;
+    if (lineDistPickB_ >= static_cast<int>(measuredLines_.size())) lineDistPickB_ = -1;
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), u8"已撤回线段%d", removedId);
+    SetStatus(buf);
+}
+
+void Application::Undo2DOrCloud() {
+    if (CanUndoMeasuredLine()) {
+        UndoLastMeasuredLine();
+        return;
+    }
+    Undo();
+}
+
+int Application::ImageSourceOf(const ImageView& view) const {
+    return (&view == &brightnessImage_) ? 1 : 0;
+}
+
+Application::ImageView* Application::ImageViewFromSource(int source) {
+    return source == 1 ? &brightnessImage_ : &depthImage_;
+}
+
+const Application::ImageView* Application::ImageViewFromSource(int source) const {
+    return source == 1 ? &brightnessImage_ : &depthImage_;
+}
+
+void Application::PreviewLineMeasure(ImageView& view) {
+    if (!view.valid()) return;
+
+    lineMeasureParams_.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_
+                                                                                    : false;
+    OpenCv2D::CaliperLineResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureLineWithCalipers(
+            view.gray, view.width, view.height, lineMeasureRoiX0_, lineMeasureRoiY0_,
+            lineMeasureRoiX1_, lineMeasureRoiY1_, lineMeasureParams_, result, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureLineWithCalipersRgb(
+            view.rgb, view.width, view.height, lineMeasureRoiX0_, lineMeasureRoiY0_,
+            lineMeasureRoiX1_, lineMeasureRoiY1_, lineMeasureParams_, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+
+    if (!ok) {
+        lineMeasurePending_ = false;
+        lineMeasurePendingSource_ = -1;
+        lineMeasurePendingResult_ = {};
+        SetStatus(error);
+        return;
+    }
+
+    lineMeasurePending_ = true;
+    lineMeasurePendingSource_ = ImageSourceOf(view);
+    lineMeasurePendingResult_ = std::move(result);
+    SetStatus(u8"卡尺预览完成，请在左侧点击「确认」添加线段");
+}
+
+void Application::ConfirmLineMeasure() {
+    if (!lineMeasurePending_ || !lineMeasurePendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的卡尺结果");
+        return;
+    }
+
+    MeasuredImageLine entry;
+    entry.id = nextMeasuredLineId_++;
+    entry.imageSource = lineMeasurePendingSource_;
+    entry.result = std::move(lineMeasurePendingResult_);
+    measuredLines_.push_back(std::move(entry));
+    lineMeasurePending_ = false;
+    lineMeasurePendingSource_ = -1;
+    lineMeasurePendingResult_ = {};
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), u8"线段%d 已确认：%d 个有效点，RMS %.3f px",
+                  measuredLines_.back().id, measuredLines_.back().result.validCount,
+                  measuredLines_.back().result.fitRms);
+    SetStatus(buf);
+}
+
+void Application::PreviewArcMeasure(ImageView& view) {
+    if (!view.valid()) return;
+
+    lineMeasureParams_.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_
+                                                                                    : false;
+    OpenCv2D::CaliperArcResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipers(
+            view.gray, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, result, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipersRgb(
+            view.rgb, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+
+    if (!ok) {
+        arcMeasurePending_ = false;
+        arcMeasurePendingSource_ = -1;
+        arcMeasurePendingResult_ = {};
+        SetStatus(error);
+        return;
+    }
+
+    arcMeasurePending_ = true;
+    arcMeasurePendingSource_ = ImageSourceOf(view);
+    arcMeasurePendingResult_ = std::move(result);
+    SetStatus(u8"圆弧卡尺预览完成，请在左侧点击「确认」添加圆弧");
+}
+
+void Application::ConfirmArcMeasure() {
+    if (!arcMeasurePending_ || !arcMeasurePendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的圆弧卡尺结果");
+        return;
+    }
+
+    MeasuredImageArc entry;
+    entry.id = nextMeasuredArcId_++;
+    entry.imageSource = arcMeasurePendingSource_;
+    entry.result = std::move(arcMeasurePendingResult_);
+    measuredArcs_.push_back(std::move(entry));
+    arcMeasurePending_ = false;
+    arcMeasurePendingSource_ = -1;
+    arcMeasurePendingResult_ = {};
+    ResetArcMeasurePick();
+
+    char buf[224];
+    std::snprintf(buf, sizeof(buf), u8"圆弧%d 已确认：半径 %.3f px，%d 个有效点，RMS %.3f px",
+                  measuredArcs_.back().id, measuredArcs_.back().result.fitRadius,
+                  measuredArcs_.back().result.validCount, measuredArcs_.back().result.fitRms);
+    SetStatus(buf);
+}
+
+void Application::CancelCircleFitPending() {
+    circleFitPending_ = false;
+    circleFitPendingSource_ = -1;
+    circleFitPendingFromArcId_ = -1;
+    circleFitPendingResult_ = {};
+    circleFitPendingEdgePoints_.clear();
+}
+
+void Application::PreviewCircleFitFromRoi(ImageView& view) {
+    if (!view.valid()) return;
+
+    lineMeasureParams_.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_
+                                                                                    : false;
+    OpenCv2D::CaliperArcResult arcResult;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipers(
+            view.gray, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, arcResult, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipersRgb(
+            view.rgb, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, arcResult, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+
+    if (!ok || !arcResult.ok) {
+        CancelCircleFitPending();
+        SetStatus(error.empty() ? u8"圆弧边缘提取失败" : error);
+        return;
+    }
+
+    OpenCv2D::CircleFitResult fit;
+    if (!OpenCv2D::FitCircleFromEdgePoints(arcResult.edgePoints, fit)) {
+        CancelCircleFitPending();
+        SetStatus(u8"圆拟合失败，有效边缘点不足");
+        return;
+    }
+
+    circleFitPending_ = true;
+    circleFitPendingSource_ = ImageSourceOf(view);
+    circleFitPendingFromArcId_ = -1;
+    circleFitPendingResult_ = fit;
+    circleFitPendingEdgePoints_ = arcResult.edgePoints;
+    SetStatus(u8"圆拟合预览完成，请在左侧确认（半径已计算）");
+}
+
+void Application::PreviewCircleFitFromMeasuredArc(int arcIndex) {
+    if (arcIndex < 0 || arcIndex >= static_cast<int>(measuredArcs_.size())) return;
+
+    const MeasuredImageArc& arc = measuredArcs_[static_cast<std::size_t>(arcIndex)];
+    if (!arc.result.ok) {
+        SetStatus(u8"所选圆弧无效");
+        return;
+    }
+
+    OpenCv2D::CircleFitResult fit;
+    if (!OpenCv2D::FitCircleFromEdgePoints(arc.result.edgePoints, fit)) {
+        SetStatus(u8"圆拟合失败，该圆弧有效边缘点不足");
+        return;
+    }
+
+    circleFitPending_ = true;
+    circleFitPendingSource_ = arc.imageSource;
+    circleFitPendingFromArcId_ = arc.id;
+    circleFitPendingResult_ = fit;
+    circleFitPendingEdgePoints_ = arc.result.edgePoints;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"圆弧%d 圆拟合预览：半径 %.3f px，%d 点，RMS %.3f px", arc.id,
+                  fit.radius, fit.pointCount, fit.rms);
+    SetStatus(buf);
+}
+
+void Application::ConfirmCircleFit() {
+    if (!circleFitPending_ || !circleFitPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的圆拟合结果");
+        return;
+    }
+
+    MeasuredCircleFit entry;
+    entry.id = nextCircleFitId_++;
+    entry.imageSource = circleFitPendingSource_;
+    entry.sourceArcId = circleFitPendingFromArcId_;
+    entry.result = circleFitPendingResult_;
+    entry.edgePoints = circleFitPendingEdgePoints_;
+    measuredCircleFits_.push_back(std::move(entry));
+    CancelCircleFitPending();
+    ResetArcMeasurePick();
+
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), u8"圆拟合%d 已确认：半径 = %.4f px（圆心 %.1f, %.1f）",
+                  measuredCircleFits_.back().id, measuredCircleFits_.back().result.radius,
+                  measuredCircleFits_.back().result.centerX, measuredCircleFits_.back().result.centerY);
+    SetStatus(buf);
+}
+
+void Application::ComputeSelectedLineDistance() {
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+    if (lineDistPickA_ < 0 || lineDistPickB_ < 0 ||
+        lineDistPickA_ >= static_cast<int>(measuredLines_.size()) ||
+        lineDistPickB_ >= static_cast<int>(measuredLines_.size()) ||
+        lineDistPickA_ == lineDistPickB_) {
+        SetStatus(u8"请选择两条不同的线段");
+        return;
+    }
+
+    const MeasuredImageLine& la = measuredLines_[static_cast<std::size_t>(lineDistPickA_)];
+    const MeasuredImageLine& lb = measuredLines_[static_cast<std::size_t>(lineDistPickB_)];
+    if (la.imageSource != lb.imageSource) {
+        SetStatus(u8"两条线段须在同一张图像上");
+        return;
+    }
+    if (!la.result.ok || !lb.result.ok) {
+        SetStatus(u8"所选线段无效");
+        return;
+    }
+
+    OpenCv2D::AverageGapResult gap;
+    if (!OpenCv2D::AverageGapDistance(
+            la.result.fitX1, la.result.fitY1, la.result.fitX2, la.result.fitY2, lb.result.fitX1,
+            lb.result.fitY1, lb.result.fitX2, lb.result.fitY2, lineDistSampleCount_, gap)) {
+        SetStatus(u8"垂线与线段 B 无有效交点，请调整选线或采样数");
+        return;
+    }
+
+    lineDistPx_ = gap.average;
+    lineDistMinPx_ = gap.minDist;
+    lineDistMaxPx_ = gap.maxDist;
+    lineDistSamples_ = gap.samples;
+    lineDistValid_ = true;
+
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  u8"线段%d(A) → 线段%d(B) 平均间隙 = %.3f px（%d/%d 点有效）", la.id, lb.id,
+                  lineDistPx_, gap.validCount, gap.totalSamples);
+    SetStatus(buf);
+}
+
+void Application::ClearLineDistance() {
+    lineDistPickA_ = -1;
+    lineDistPickB_ = -1;
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+}
+
+void Application::ResetImage2dView() {
+    image2dZoom_ = 1.f;
+    image2dPanX_ = 0.f;
+    image2dPanY_ = 0.f;
+}
+
+void Application::ComputeSelectedArcDistance() {
+    arcDistValid_ = false;
+    arcDistSamples_.clear();
+    if (arcDistPickA_ < 0 || arcDistPickB_ < 0 ||
+        arcDistPickA_ >= static_cast<int>(measuredArcs_.size()) ||
+        arcDistPickB_ >= static_cast<int>(measuredArcs_.size()) ||
+        arcDistPickA_ == arcDistPickB_) {
+        SetStatus(u8"请选择两条不同的圆弧");
+        return;
+    }
+
+    const MeasuredImageArc& aa = measuredArcs_[static_cast<std::size_t>(arcDistPickA_)];
+    const MeasuredImageArc& ab = measuredArcs_[static_cast<std::size_t>(arcDistPickB_)];
+    if (aa.imageSource != ab.imageSource) {
+        SetStatus(u8"两条圆弧须在同一张图像上");
+        return;
+    }
+    if (!aa.result.ok || !ab.result.ok) {
+        SetStatus(u8"所选圆弧无效");
+        return;
+    }
+
+    OpenCv2D::AverageGapResult gap;
+    if (!OpenCv2D::AverageArcGapDistance(
+            aa.result.fitCenterX, aa.result.fitCenterY, aa.result.fitRadius,
+            aa.result.fitStartAngle, aa.result.fitEndAngle, ab.result.fitCenterX,
+            ab.result.fitCenterY, ab.result.fitRadius, ab.result.fitStartAngle,
+            ab.result.fitEndAngle, arcDistSampleCount_, gap)) {
+        SetStatus(u8"法向线与圆弧 B 无有效交点，请调整选弧或采样数");
+        return;
+    }
+
+    arcDistPx_ = gap.average;
+    arcDistMinPx_ = gap.minDist;
+    arcDistMaxPx_ = gap.maxDist;
+    arcDistSamples_ = gap.samples;
+    arcDistValid_ = true;
+
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  u8"圆弧%d(A) → 圆弧%d(B) 平均间隙 = %.3f px（%d/%d 点有效）", aa.id, ab.id,
+                  arcDistPx_, gap.validCount, gap.totalSamples);
+    SetStatus(buf);
+}
+
+void Application::ClearArcDistance() {
+    arcDistPickA_ = -1;
+    arcDistPickB_ = -1;
+    arcDistValid_ = false;
+    arcDistSamples_.clear();
+}
+
+int Application::FindClosestMeasuredCircleFit(int imageSource, float px, float py,
+                                              float maxDistPx) const {
+    int bestIdx = -1;
+    float bestDist = maxDistPx;
+    for (std::size_t i = 0; i < measuredCircleFits_.size(); ++i) {
+        const MeasuredCircleFit& fit = measuredCircleFits_[i];
+        if (fit.imageSource != imageSource || !fit.result.ok) continue;
+        const float d = std::fabs(
+            std::hypot(px - fit.result.centerX, py - fit.result.centerY) - fit.result.radius);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+void Application::AddPointDistance(float ax, float ay, float bx, float by, int imageSource) {
+    MeasuredPointDist entry;
+    entry.id = nextPointDistId_++;
+    entry.imageSource = imageSource;
+    entry.ax = ax;
+    entry.ay = ay;
+    entry.bx = bx;
+    entry.by = by;
+    entry.distance = OpenCv2D::PointPointDistance(ax, ay, bx, by, &entry.dx, &entry.dy);
+    measuredPointDists_.push_back(entry);
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"测距%d：距离 %.3f px（ΔX %.3f  ΔY %.3f）", entry.id,
+                  entry.distance, entry.dx, entry.dy);
+    SetStatus(buf);
+}
+
+void Application::PickLineForAngle(int lineIndex) {
+    if (lineIndex < 0 || lineIndex >= static_cast<int>(measuredLines_.size())) return;
+    lineAngleValid_ = false;
+    const int lineId = measuredLines_[static_cast<std::size_t>(lineIndex)].id;
+    if (lineAnglePickA_ < 0) {
+        lineAnglePickA_ = lineIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"线段%d 已选为 A", lineId);
+        SetStatus(buf);
+        return;
+    }
+    if (lineAnglePickB_ < 0 && lineIndex != lineAnglePickA_) {
+        lineAnglePickB_ = lineIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"线段%d 已选为 B", lineId);
+        SetStatus(buf);
+        return;
+    }
+    lineAnglePickA_ = lineIndex;
+    lineAnglePickB_ = -1;
+    lineAngleValid_ = false;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"线段%d 已重选为 A", lineId);
+    SetStatus(buf);
+}
+
+void Application::ComputeSelectedLineAngle() {
+    lineAngleValid_ = false;
+    if (lineAnglePickA_ < 0 || lineAnglePickB_ < 0 ||
+        lineAnglePickA_ >= static_cast<int>(measuredLines_.size()) ||
+        lineAnglePickB_ >= static_cast<int>(measuredLines_.size()) ||
+        lineAnglePickA_ == lineAnglePickB_) {
+        SetStatus(u8"请选择两条不同的线段");
+        return;
+    }
+    const MeasuredImageLine& la = measuredLines_[static_cast<std::size_t>(lineAnglePickA_)];
+    const MeasuredImageLine& lb = measuredLines_[static_cast<std::size_t>(lineAnglePickB_)];
+    if (la.imageSource != lb.imageSource || !la.result.ok || !lb.result.ok) {
+        SetStatus(u8"所选线段无效或不在同一张图");
+        return;
+    }
+    lineAngleDeg_ = OpenCv2D::AngleBetweenSegments(
+        la.result.fitX1, la.result.fitY1, la.result.fitX2, la.result.fitY2, lb.result.fitX1,
+        lb.result.fitY1, lb.result.fitX2, lb.result.fitY2, true);
+    lineAngleValid_ = true;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"线段%d 与 线段%d 夹角 = %.3f°", la.id, lb.id,
+                  lineAngleDeg_);
+    SetStatus(buf);
+}
+
+void Application::ClearLineAngle() {
+    lineAnglePickA_ = -1;
+    lineAnglePickB_ = -1;
+    lineAngleValid_ = false;
+    lineAngleDeg_ = 0.f;
+}
+
+void Application::PickCircleForGap(int circleIndex) {
+    if (circleIndex < 0 || circleIndex >= static_cast<int>(measuredCircleFits_.size())) return;
+    circleGapValid_ = false;
+    const int circleId = measuredCircleFits_[static_cast<std::size_t>(circleIndex)].id;
+    if (circleGapPickA_ < 0) {
+        circleGapPickA_ = circleIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"圆%d 已选为 A", circleId);
+        SetStatus(buf);
+        return;
+    }
+    if (circleGapPickB_ < 0 && circleIndex != circleGapPickA_) {
+        circleGapPickB_ = circleIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"圆%d 已选为 B", circleId);
+        SetStatus(buf);
+        return;
+    }
+    circleGapPickA_ = circleIndex;
+    circleGapPickB_ = -1;
+    circleGapValid_ = false;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"圆%d 已重选为 A", circleId);
+    SetStatus(buf);
+}
+
+void Application::ComputeSelectedCircleGap() {
+    circleGapValid_ = false;
+    if (circleGapPickA_ < 0 || circleGapPickB_ < 0 ||
+        circleGapPickA_ >= static_cast<int>(measuredCircleFits_.size()) ||
+        circleGapPickB_ >= static_cast<int>(measuredCircleFits_.size()) ||
+        circleGapPickA_ == circleGapPickB_) {
+        SetStatus(u8"请选择两个不同的圆");
+        return;
+    }
+    const MeasuredCircleFit& ca = measuredCircleFits_[static_cast<std::size_t>(circleGapPickA_)];
+    const MeasuredCircleFit& cb = measuredCircleFits_[static_cast<std::size_t>(circleGapPickB_)];
+    if (ca.imageSource != cb.imageSource || !ca.result.ok || !cb.result.ok) {
+        SetStatus(u8"所选圆无效或不在同一张图");
+        return;
+    }
+    OpenCv2D::CircleGapResult gap;
+    if (!OpenCv2D::ComputeCircleGap(ca.result.centerX, ca.result.centerY, ca.result.radius,
+                                    cb.result.centerX, cb.result.centerY, cb.result.radius,
+                                    gap)) {
+        SetStatus(u8"圆间隙计算失败");
+        return;
+    }
+    circleGapCenterDist_ = gap.centerDistance;
+    circleGapSurfaceGap_ = gap.surfaceGap;
+    circleGapValid_ = true;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), u8"圆%d 与 圆%d：圆心距 %.3f px，表面间隙 %.3f px", ca.id,
+                  cb.id, circleGapCenterDist_, circleGapSurfaceGap_);
+    SetStatus(buf);
+}
+
+void Application::ClearCircleGap() {
+    circleGapPickA_ = -1;
+    circleGapPickB_ = -1;
+    circleGapValid_ = false;
+    circleGapCenterDist_ = 0.f;
+    circleGapSurfaceGap_ = 0.f;
+}
+
+void Application::PickPointForPointLine(float px, float py, int imageSource) {
+    pointLinePx_ = px;
+    pointLinePy_ = py;
+    pointLineSource_ = imageSource;
+    pointLinePhase_ = PointPickPhase::PickB;
+    pointLineValid_ = false;
+    SetStatus(u8"已选点，请点击一条线段");
+}
+
+void Application::PickLineForPointLine(int lineIndex) {
+    if (lineIndex < 0 || lineIndex >= static_cast<int>(measuredLines_.size())) return;
+    pointLinePick_ = lineIndex;
+    pointLineValid_ = false;
+    const int lineId = measuredLines_[static_cast<std::size_t>(lineIndex)].id;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"线段%d 已选中", lineId);
+    SetStatus(buf);
+}
+
+void Application::ComputePointLineDistance() {
+    pointLineValid_ = false;
+    if (pointLinePhase_ != PointPickPhase::PickB || pointLinePick_ < 0 ||
+        pointLinePick_ >= static_cast<int>(measuredLines_.size())) {
+        SetStatus(u8"请先选点，再选线段");
+        return;
+    }
+    const MeasuredImageLine& line = measuredLines_[static_cast<std::size_t>(pointLinePick_)];
+    if (line.imageSource != pointLineSource_ || !line.result.ok) {
+        SetStatus(u8"点与线段须在同一张图");
+        return;
+    }
+    if (!OpenCv2D::PointToSegmentDistance(pointLinePx_, pointLinePy_, line.result.fitX1,
+                                            line.result.fitY1, line.result.fitX2,
+                                            line.result.fitY2, pointLineDistPx_, pointLineFootX_,
+                                            pointLineFootY_)) {
+        SetStatus(u8"点线距离计算失败");
+        return;
+    }
+    pointLineValid_ = true;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"点到线段%d 垂直距离 = %.3f px", line.id,
+                  pointLineDistPx_);
+    SetStatus(buf);
+}
+
+void Application::ClearPointLineDistance() {
+    pointLinePhase_ = PointPickPhase::PickA;
+    pointLineSource_ = -1;
+    pointLinePick_ = -1;
+    pointLineValid_ = false;
+    pointLineDistPx_ = 0.f;
+}
+
+void Application::PreviewCaliperPoint(ImageView& view) {
+    if (!view.valid()) return;
+    OpenCv2D::CaliperLineParams params = lineMeasureParams_;
+    params.numCalipers = 1;
+    params.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_ : false;
+    OpenCv2D::CaliperLineResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureLineWithCalipers(
+            view.gray, view.width, view.height, caliperPointRoiX0_, caliperPointRoiY0_,
+            caliperPointRoiX1_, caliperPointRoiY1_, params, result, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureLineWithCalipersRgb(
+            view.rgb, view.width, view.height, caliperPointRoiX0_, caliperPointRoiY0_,
+            caliperPointRoiX1_, caliperPointRoiY1_, params, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+    if (!ok || result.validCount < 1) {
+        caliperPointPending_ = false;
+        SetStatus(error.empty() ? u8"未检测到边缘" : error);
+        return;
+    }
+    for (const OpenCv2D::CaliperEdgePoint& ep : result.edgePoints) {
+        if (ep.valid) {
+            caliperPointPendingEdge_ = ep;
+            caliperPointPending_ = true;
+            caliperPointPendingSource_ = ImageSourceOf(view);
+            SetStatus(u8"单点卡尺预览完成，请在左侧确认");
+            return;
+        }
+    }
+    caliperPointPending_ = false;
+    SetStatus(u8"未检测到有效边缘点");
+}
+
+void Application::ConfirmCaliperPoint() {
+    if (!caliperPointPending_ || !caliperPointPendingEdge_.valid) {
+        SetStatus(u8"当前没有待确认的单点卡尺");
+        return;
+    }
+    MeasuredCaliperPoint entry;
+    entry.id = nextCaliperPointId_++;
+    entry.imageSource = caliperPointPendingSource_;
+    entry.x = caliperPointPendingEdge_.x;
+    entry.y = caliperPointPendingEdge_.y;
+    entry.roiX0 = caliperPointRoiX0_;
+    entry.roiY0 = caliperPointRoiY0_;
+    entry.roiX1 = caliperPointRoiX1_;
+    entry.roiY1 = caliperPointRoiY1_;
+    measuredCaliperPoints_.push_back(entry);
+    caliperPointPending_ = false;
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), u8"边缘点%d 已确认 (%.2f, %.2f)", entry.id, entry.x, entry.y);
+    SetStatus(buf);
+}
+
+void Application::CancelCaliperPointPending() {
+    caliperPointPending_ = false;
+    caliperPointPendingSource_ = -1;
+    caliperPointPendingEdge_ = {};
+}
+
+void Application::PreviewCircleCaliper(ImageView& view) {
+    if (!view.valid()) return;
+    OpenCv2D::CaliperCircleParams params = lineMeasureParams_;
+    params.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_ : false;
+    OpenCv2D::CaliperCircleResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureCircleWithCalipers(view.gray, view.width, view.height, circleCaliperCx_,
+                                                 circleCaliperCy_, circleCaliperR_, params, result,
+                                                 error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureCircleWithCalipersRgb(
+            view.rgb, view.width, view.height, circleCaliperCx_, circleCaliperCy_, circleCaliperR_,
+            params, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+    if (!ok) {
+        circleCaliperPending_ = false;
+        SetStatus(error);
+        return;
+    }
+    circleCaliperPending_ = true;
+    circleCaliperPendingSource_ = ImageSourceOf(view);
+    circleCaliperPendingResult_ = std::move(result);
+    SetStatus(u8"圆卡尺预览完成，请在左侧点击「确认」");
+}
+
+void Application::ConfirmCircleCaliper() {
+    if (!circleCaliperPending_ || !circleCaliperPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的圆卡尺");
+        return;
+    }
+    MeasuredCircleCaliper entry;
+    entry.id = nextCircleCaliperId_++;
+    entry.imageSource = circleCaliperPendingSource_;
+    entry.result = std::move(circleCaliperPendingResult_);
+    measuredCircleCalipers_.push_back(std::move(entry));
+    circleCaliperPending_ = false;
+    circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"圆卡尺%d 已确认：半径 %.3f px，RMS %.3f",
+                  measuredCircleCalipers_.back().id, measuredCircleCalipers_.back().result.fitRadius,
+                  measuredCircleCalipers_.back().result.fitRms);
+    SetStatus(buf);
+}
+
+void Application::CancelCircleCaliperPending() {
+    circleCaliperPending_ = false;
+    circleCaliperPendingSource_ = -1;
+    circleCaliperPendingResult_ = {};
+}
+
+void Application::PickArcForLength(int arcIndex) {
+    if (arcIndex < 0 || arcIndex >= static_cast<int>(measuredArcs_.size())) return;
+    arcLengthPick_ = arcIndex;
+    arcLengthValid_ = false;
+    const int arcId = measuredArcs_[static_cast<std::size_t>(arcIndex)].id;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"圆弧%d 已选中", arcId);
+    SetStatus(buf);
+}
+
+void Application::ComputeSelectedArcLength() {
+    arcLengthValid_ = false;
+    if (arcLengthPick_ < 0 || arcLengthPick_ >= static_cast<int>(measuredArcs_.size())) {
+        SetStatus(u8"请先选择一条圆弧");
+        return;
+    }
+    const MeasuredImageArc& arc = measuredArcs_[static_cast<std::size_t>(arcLengthPick_)];
+    if (!arc.result.ok) {
+        SetStatus(u8"所选圆弧无效");
+        return;
+    }
+    if (!OpenCv2D::ComputeArcMetrics(arc.result.fitCenterX, arc.result.fitCenterY,
+                                     arc.result.fitRadius, arc.result.fitStartAngle,
+                                     arc.result.fitEndAngle, arcLengthMetrics_)) {
+        SetStatus(u8"弧长计算失败");
+        return;
+    }
+    arcLengthValid_ = true;
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  u8"圆弧%d：弧长 %.3f px，弦长 %.3f px，弓高 %.3f px", arc.id,
+                  arcLengthMetrics_.arcLength, arcLengthMetrics_.chordLength,
+                  arcLengthMetrics_.sagitta);
+    SetStatus(buf);
+}
+
+void Application::ClearArcLength() {
+    arcLengthPick_ = -1;
+    arcLengthValid_ = false;
+    arcLengthMetrics_ = {};
+}
+
+void Application::ConfirmThreePointCircle() {
+    float cx = 0.f;
+    float cy = 0.f;
+    float r = 0.f;
+    if (!OpenCv2D::CircleFromThreePoints(threePointX_[0], threePointY_[0], threePointX_[1],
+                                         threePointY_[1], threePointX_[2], threePointY_[2], cx, cy,
+                                         r)) {
+        SetStatus(u8"三点近乎共线，无法定圆");
+        return;
+    }
+    MeasuredThreePointCircle entry;
+    entry.id = nextThreePointCircleId_++;
+    entry.imageSource = threePointSource_;
+    entry.centerX = cx;
+    entry.centerY = cy;
+    entry.radius = r;
+    measuredThreePointCircles_.push_back(entry);
+    threePointPhase_ = ThreePointPhase::Pick0;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"三点圆%d：半径 %.3f px（圆心 %.1f, %.1f）", entry.id, r, cx,
+                  cy);
+    SetStatus(buf);
+}
+
+void Application::ClearThreePointCircle() {
+    threePointPhase_ = ThreePointPhase::Pick0;
+    threePointSource_ = -1;
+}
+
+void Application::PickLineForParallelDist(int lineIndex) {
+    if (lineIndex < 0 || lineIndex >= static_cast<int>(measuredLines_.size())) return;
+    parallelDistValid_ = false;
+    const int lineId = measuredLines_[static_cast<std::size_t>(lineIndex)].id;
+    if (parallelDistPickA_ < 0) {
+        parallelDistPickA_ = lineIndex;
+        SetStatus((std::string(u8"线段") + std::to_string(lineId) + u8" 已选为 A").c_str());
+        return;
+    }
+    if (parallelDistPickB_ < 0 && lineIndex != parallelDistPickA_) {
+        parallelDistPickB_ = lineIndex;
+        SetStatus((std::string(u8"线段") + std::to_string(lineId) + u8" 已选为 B").c_str());
+        return;
+    }
+    parallelDistPickA_ = lineIndex;
+    parallelDistPickB_ = -1;
+    parallelDistValid_ = false;
+}
+
+void Application::ComputeParallelLineDistance() {
+    parallelDistValid_ = false;
+    if (parallelDistPickA_ < 0 || parallelDistPickB_ < 0) {
+        SetStatus(u8"请选择两条线段");
+        return;
+    }
+    const MeasuredImageLine& la = measuredLines_[static_cast<std::size_t>(parallelDistPickA_)];
+    const MeasuredImageLine& lb = measuredLines_[static_cast<std::size_t>(parallelDistPickB_)];
+    if (la.imageSource != lb.imageSource || !la.result.ok || !lb.result.ok) {
+        SetStatus(u8"线段无效或不在同一张图");
+        return;
+    }
+    parallelDistPx_ = OpenCv2D::ParallelLineDistance(
+        la.result.fitX1, la.result.fitY1, la.result.fitX2, la.result.fitY2, lb.result.fitX1,
+        lb.result.fitY1, lb.result.fitX2, lb.result.fitY2);
+    parallelDistValid_ = true;
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), u8"平行线间距 = %.4f px", parallelDistPx_);
+    SetStatus(buf);
+}
+
+void Application::ClearParallelLineDistance() {
+    parallelDistPickA_ = -1;
+    parallelDistPickB_ = -1;
+    parallelDistValid_ = false;
+}
+
+void Application::PreviewRectCaliper(ImageView& view) {
+    if (!view.valid()) return;
+    OpenCv2D::CaliperLineParams params = lineMeasureParams_;
+    params.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_ : false;
+    OpenCv2D::CaliperRectResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureRectWithCalipers(view.gray, view.width, view.height, rectCaliperRoiX0_,
+                                               rectCaliperRoiY0_, rectCaliperRoiX1_,
+                                               rectCaliperRoiY1_, params, result, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureRectWithCalipersRgb(
+            view.rgb, view.width, view.height, rectCaliperRoiX0_, rectCaliperRoiY0_,
+            rectCaliperRoiX1_, rectCaliperRoiY1_, params, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+    if (!ok) {
+        rectCaliperPending_ = false;
+        SetStatus(error);
+        return;
+    }
+    rectCaliperPending_ = true;
+    rectCaliperPendingSource_ = ImageSourceOf(view);
+    rectCaliperPendingResult_ = std::move(result);
+    SetStatus(u8"矩形卡尺预览完成，请在左侧确认");
+}
+
+void Application::ConfirmRectCaliper() {
+    if (!rectCaliperPending_ || !rectCaliperPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的矩形卡尺");
+        return;
+    }
+    MeasuredRectCaliper entry;
+    entry.id = nextRectCaliperId_++;
+    entry.imageSource = rectCaliperPendingSource_;
+    entry.result = std::move(rectCaliperPendingResult_);
+    measuredRectCalipers_.push_back(std::move(entry));
+    rectCaliperPending_ = false;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"矩形%d：%.1f×%.1f px，角度 %.1f°",
+                  measuredRectCalipers_.back().id, measuredRectCalipers_.back().result.width,
+                  measuredRectCalipers_.back().result.height,
+                  measuredRectCalipers_.back().result.angleDeg);
+    SetStatus(buf);
+}
+
+void Application::CancelRectCaliperPending() {
+    rectCaliperPending_ = false;
+    rectCaliperPendingSource_ = -1;
+    rectCaliperPendingResult_ = {};
+}
+
+void Application::PreviewEllipseFitFromRoi(ImageView& view) {
+    if (!view.valid()) return;
+    lineMeasureParams_.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_
+                                                                                    : false;
+    OpenCv2D::CaliperArcResult arcResult;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipers(
+            view.gray, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, arcResult, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureArcWithCalipersRgb(
+            view.rgb, view.width, view.height, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_,
+            arcRoiP2X_, arcRoiP2Y_, lineMeasureParams_, arcResult, error);
+    }
+    if (!ok) {
+        CancelEllipseFitPending();
+        SetStatus(error);
+        return;
+    }
+    OpenCv2D::EllipseFitResult fit;
+    if (!OpenCv2D::FitEllipseFromEdgePoints(arcResult.edgePoints, fit)) {
+        CancelEllipseFitPending();
+        SetStatus(u8"椭圆拟合需要至少 5 个有效边缘点");
+        return;
+    }
+    ellipseFitPending_ = true;
+    ellipseFitPendingSource_ = ImageSourceOf(view);
+    ellipseFitPendingFromArcId_ = -1;
+    ellipseFitPendingResult_ = fit;
+    ellipseFitPendingEdgePoints_ = arcResult.edgePoints;
+    SetStatus(u8"椭圆拟合预览完成，请在左侧确认");
+}
+
+void Application::PreviewEllipseFitFromMeasuredArc(int arcIndex) {
+    if (arcIndex < 0 || arcIndex >= static_cast<int>(measuredArcs_.size())) return;
+    const MeasuredImageArc& arc = measuredArcs_[static_cast<std::size_t>(arcIndex)];
+    OpenCv2D::EllipseFitResult fit;
+    if (!OpenCv2D::FitEllipseFromEdgePoints(arc.result.edgePoints, fit)) {
+        SetStatus(u8"椭圆拟合失败（边缘点不足）");
+        return;
+    }
+    ellipseFitPending_ = true;
+    ellipseFitPendingSource_ = arc.imageSource;
+    ellipseFitPendingFromArcId_ = arc.id;
+    ellipseFitPendingResult_ = fit;
+    ellipseFitPendingEdgePoints_ = arc.result.edgePoints;
+    SetStatus(u8"椭圆拟合预览完成，请在左侧确认");
+}
+
+void Application::ConfirmEllipseFit() {
+    if (!ellipseFitPending_ || !ellipseFitPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的椭圆拟合");
+        return;
+    }
+    MeasuredEllipseFit entry;
+    entry.id = nextEllipseFitId_++;
+    entry.imageSource = ellipseFitPendingSource_;
+    entry.sourceArcId = ellipseFitPendingFromArcId_;
+    entry.result = ellipseFitPendingResult_;
+    entry.edgePoints = ellipseFitPendingEdgePoints_;
+    measuredEllipseFits_.push_back(std::move(entry));
+    CancelEllipseFitPending();
+    ResetArcMeasurePick();
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"椭圆%d：长轴 %.2f  短轴 %.2f px",
+                  measuredEllipseFits_.back().id, measuredEllipseFits_.back().result.axisA * 2.f,
+                  measuredEllipseFits_.back().result.axisB * 2.f);
+    SetStatus(buf);
+}
+
+void Application::CancelEllipseFitPending() {
+    ellipseFitPending_ = false;
+    ellipseFitPendingSource_ = -1;
+    ellipseFitPendingFromArcId_ = -1;
+    ellipseFitPendingResult_ = {};
+    ellipseFitPendingEdgePoints_.clear();
+}
+
+void Application::PreviewProfileWidth(ImageView& view) {
+    if (!view.valid()) return;
+    OpenCv2D::CaliperLineParams params = lineMeasureParams_;
+    params.skipZero = (!view.gray.empty() && ImageSourceOf(view) == 0) ? depthSkipZero_ : false;
+    OpenCv2D::ProfileWidthResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::MeasureProfileWidth(view.gray, view.width, view.height, profileWidthRoiX0_,
+                                           profileWidthRoiY0_, profileWidthRoiX1_,
+                                           profileWidthRoiY1_, params, result, error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::MeasureProfileWidthRgb(
+            view.rgb, view.width, view.height, profileWidthRoiX0_, profileWidthRoiY0_,
+            profileWidthRoiX1_, profileWidthRoiY1_, params, result, error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+    if (!ok) {
+        profileWidthPending_ = false;
+        SetStatus(error);
+        return;
+    }
+    profileWidthPending_ = true;
+    profileWidthPendingSource_ = ImageSourceOf(view);
+    profileWidthPendingResult_ = std::move(result);
+    SetStatus(u8"剖面测宽预览完成，请在左侧确认");
+}
+
+void Application::ConfirmProfileWidth() {
+    if (!profileWidthPending_ || !profileWidthPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的测宽结果");
+        return;
+    }
+    MeasuredProfileWidth entry;
+    entry.id = nextProfileWidthId_++;
+    entry.imageSource = profileWidthPendingSource_;
+    entry.result = std::move(profileWidthPendingResult_);
+    measuredProfileWidths_.push_back(std::move(entry));
+    profileWidthPending_ = false;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"宽度%d = %.4f px", measuredProfileWidths_.back().id,
+                  measuredProfileWidths_.back().result.width);
+    SetStatus(buf);
+}
+
+void Application::CancelProfileWidthPending() {
+    profileWidthPending_ = false;
+    profileWidthPendingSource_ = -1;
+    profileWidthPendingResult_ = {};
+}
+
+void Application::PickPointForProjection(float px, float py, int imageSource) {
+    pointProjPx_ = px;
+    pointProjPy_ = py;
+    pointProjSource_ = imageSource;
+    pointProjPhase_ = PointPickPhase::PickB;
+    pointProjValid_ = false;
+    SetStatus(u8"已选点，请点击线段");
+}
+
+void Application::PickLineForProjection(int lineIndex) {
+    pointProjLinePick_ = lineIndex;
+    pointProjValid_ = false;
+}
+
+void Application::ComputePointProjection() {
+    pointProjValid_ = false;
+    if (pointProjLinePick_ < 0 || pointProjLinePick_ >= static_cast<int>(measuredLines_.size())) {
+        SetStatus(u8"请先选点再选线段");
+        return;
+    }
+    const MeasuredImageLine& line = measuredLines_[static_cast<std::size_t>(pointProjLinePick_)];
+    if (line.imageSource != pointProjSource_ || !line.result.ok) {
+        SetStatus(u8"点与线段须在同一张图");
+        return;
+    }
+    if (!OpenCv2D::ProjectPointOntoSegment(pointProjPx_, pointProjPy_, line.result.fitX1,
+                                             line.result.fitY1, line.result.fitX2,
+                                             line.result.fitY2, pointProjResult_)) {
+        SetStatus(u8"投影计算失败");
+        return;
+    }
+    pointProjValid_ = true;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), u8"垂足 (%.2f, %.2f)  垂直距 %.3f  参数 t=%.3f",
+                  pointProjResult_.footX, pointProjResult_.footY, pointProjResult_.perpDist,
+                  pointProjResult_.alongT);
+    SetStatus(buf);
+}
+
+void Application::ClearPointProjection() {
+    pointProjPhase_ = PointPickPhase::PickA;
+    pointProjSource_ = -1;
+    pointProjLinePick_ = -1;
+    pointProjValid_ = false;
+}
+
+void Application::PickCircleForConcentricity(int circleIndex) {
+    if (circleIndex < 0 || circleIndex >= static_cast<int>(measuredCircleFits_.size())) return;
+    concentricityValid_ = false;
+    if (concentricityPickA_ < 0) {
+        concentricityPickA_ = circleIndex;
+        return;
+    }
+    if (concentricityPickB_ < 0 && circleIndex != concentricityPickA_) {
+        concentricityPickB_ = circleIndex;
+        return;
+    }
+    concentricityPickA_ = circleIndex;
+    concentricityPickB_ = -1;
+}
+
+void Application::ComputeConcentricity() {
+    concentricityValid_ = false;
+    if (concentricityPickA_ < 0 || concentricityPickB_ < 0) {
+        SetStatus(u8"请选择两个圆");
+        return;
+    }
+    const MeasuredCircleFit& ca = measuredCircleFits_[static_cast<std::size_t>(concentricityPickA_)];
+    const MeasuredCircleFit& cb = measuredCircleFits_[static_cast<std::size_t>(concentricityPickB_)];
+    if (!OpenCv2D::ComputeConcentricity(ca.result.centerX, ca.result.centerY, cb.result.centerX,
+                                        cb.result.centerY, concentricityResult_)) {
+        SetStatus(u8"同心度计算失败");
+        return;
+    }
+    concentricityValid_ = true;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"同心度偏移 ΔX=%.3f ΔY=%.3f  距离=%.3f px",
+                  concentricityResult_.offsetX, concentricityResult_.offsetY,
+                  concentricityResult_.offsetDist);
+    SetStatus(buf);
+}
+
+void Application::ClearConcentricity() {
+    concentricityPickA_ = -1;
+    concentricityPickB_ = -1;
+    concentricityValid_ = false;
+}
+
+int Application::FindClosestMeasuredCircleCaliper(int imageSource, float px, float py,
+                                                float maxDistPx) const {
+    int bestIdx = -1;
+    float bestDist = maxDistPx;
+    for (std::size_t i = 0; i < measuredCircleCalipers_.size(); ++i) {
+        const MeasuredCircleCaliper& cc = measuredCircleCalipers_[i];
+        if (cc.imageSource != imageSource || !cc.result.ok) continue;
+        const float d = std::fabs(std::hypot(px - cc.result.fitCenterX, py - cc.result.fitCenterY) -
+                                  cc.result.fitRadius);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+void Application::PickCircleForRoundness(int circleIndex) {
+    roundnessPick_ = circleIndex;
+    roundnessCircleSource_ = 0;
+    roundnessValid_ = false;
+}
+
+void Application::ComputeRoundness() {
+    roundnessValid_ = false;
+    if (roundnessPick_ < 0) {
+        SetStatus(u8"请先选择圆");
+        return;
+    }
+    if (roundnessCircleSource_ == 0) {
+        if (roundnessPick_ >= static_cast<int>(measuredCircleFits_.size())) return;
+        const MeasuredCircleFit& fit = measuredCircleFits_[static_cast<std::size_t>(roundnessPick_)];
+        if (!OpenCv2D::ComputeRoundness(fit.result.centerX, fit.result.centerY, fit.result.radius,
+                                        fit.edgePoints, roundnessResult_)) {
+            SetStatus(u8"圆度计算失败");
+            return;
+        }
+    } else {
+        if (roundnessPick_ >= static_cast<int>(measuredCircleCalipers_.size())) return;
+        const MeasuredCircleCaliper& cc =
+            measuredCircleCalipers_[static_cast<std::size_t>(roundnessPick_)];
+        if (!OpenCv2D::ComputeRoundness(cc.result.fitCenterX, cc.result.fitCenterY,
+                                        cc.result.fitRadius, cc.result.edgePoints,
+                                        roundnessResult_)) {
+            SetStatus(u8"圆度计算失败");
+            return;
+        }
+    }
+    roundnessValid_ = true;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"圆度 RMS=%.4f  最大偏差=%.4f  最小偏差=%.4f",
+                  roundnessResult_.rms, roundnessResult_.maxDev, roundnessResult_.minDev);
+    SetStatus(buf);
+}
+
+void Application::ClearRoundness() {
+    roundnessPick_ = -1;
+    roundnessValid_ = false;
+}
+
+void Application::PreviewRegionBlob(ImageView& view) {
+    if (!view.valid()) return;
+    OpenCv2D::RegionBlobResult result;
+    std::string error;
+    bool ok = false;
+    if (!view.gray.empty()) {
+        ok = OpenCv2D::ComputeRegionBlob(view.gray, view.width, view.height, regionBlobRoiX0_,
+                                         regionBlobRoiY0_, regionBlobRoiX1_, regionBlobRoiY1_,
+                                         regionBlobThreshold_, regionBlobGreaterThan_, result,
+                                         error);
+    } else if (!view.rgb.empty()) {
+        ok = OpenCv2D::ComputeRegionBlobRgb(
+            view.rgb, view.width, view.height, regionBlobRoiX0_, regionBlobRoiY0_,
+            regionBlobRoiX1_, regionBlobRoiY1_, regionBlobThreshold_, regionBlobGreaterThan_, result,
+            error);
+    } else {
+        SetStatus(u8"当前图像无可用灰度数据");
+        return;
+    }
+    if (!ok) {
+        regionBlobPending_ = false;
+        SetStatus(error);
+        return;
+    }
+    regionBlobPending_ = true;
+    regionBlobPendingSource_ = ImageSourceOf(view);
+    regionBlobPendingResult_ = std::move(result);
+    SetStatus(u8"区域分析预览完成，请在左侧确认");
+}
+
+void Application::ConfirmRegionBlob() {
+    if (!regionBlobPending_ || !regionBlobPendingResult_.ok) {
+        SetStatus(u8"当前没有待确认的区域结果");
+        return;
+    }
+    MeasuredRegionBlob entry;
+    entry.id = nextRegionBlobId_++;
+    entry.imageSource = regionBlobPendingSource_;
+    entry.result = std::move(regionBlobPendingResult_);
+    measuredRegionBlobs_.push_back(std::move(entry));
+    regionBlobPending_ = false;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"区域%d：面积 %d px²  质心 (%.1f, %.1f)",
+                  measuredRegionBlobs_.back().id, measuredRegionBlobs_.back().result.pixelCount,
+                  measuredRegionBlobs_.back().result.centroidX,
+                  measuredRegionBlobs_.back().result.centroidY);
+    SetStatus(buf);
+}
+
+void Application::CancelRegionBlobPending() {
+    regionBlobPending_ = false;
+    regionBlobPendingSource_ = -1;
+    regionBlobPendingResult_ = {};
+}
+
+void Application::AddDepthHeightSample(float px, float py, int imageSource) {
+    if (imageSource != 0) {
+        SetStatus(u8"高度差测量仅支持深度图");
+        return;
+    }
+    const ImageView* view = ImageViewFromSource(0);
+    if (!view || view->gray.empty()) {
+        SetStatus(u8"请先打开深度图");
+        return;
+    }
+    const int col = std::clamp(static_cast<int>(px), 0, view->width - 1);
+    const int row = std::clamp(static_cast<int>(py), 0, view->height - 1);
+    const float z = view->gray[static_cast<std::size_t>(row) * static_cast<std::size_t>(view->width) +
+                               static_cast<std::size_t>(col)];
+    if (depthHeightPhase_ == PointPickPhase::PickA) {
+        depthHeightSource_ = 0;
+        depthHeightAx_ = px;
+        depthHeightAy_ = py;
+        depthHeightAz_ = z;
+        depthHeightPhase_ = PointPickPhase::PickB;
+        depthHeightValid_ = false;
+        SetStatus(u8"已选 A 点，请点击 B 点");
+    } else {
+        depthHeightBz_ = z;
+        depthHeightDelta_ = depthHeightBz_ - depthHeightAz_;
+        depthHeightValid_ = true;
+        depthHeightPhase_ = PointPickPhase::PickA;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), u8"ΔZ = %.6f（A=%.6f  B=%.6f）", depthHeightDelta_,
+                      depthHeightAz_, depthHeightBz_);
+        SetStatus(buf);
+    }
+}
+
+void Application::ClearDepthHeightDiff() {
+    depthHeightPhase_ = PointPickPhase::PickA;
+    depthHeightValid_ = false;
+}
+
+void Application::PreviewDepthProfile(ImageView& view) {
+    if (ImageSourceOf(view) != 0 || view.gray.empty()) {
+        SetStatus(u8"剖面高度仅支持深度图");
+        return;
+    }
+    depthProfileSamples_.clear();
+    if (!OpenCv2D::SampleLineProfile(view.gray, view.width, view.height, depthProfileRoiX0_,
+                                     depthProfileRoiY0_, depthProfileRoiX1_, depthProfileRoiY1_,
+                                     depthProfileSampleCount_, depthProfileSamples_,
+                                     depthSkipZero_)) {
+        SetStatus(u8"剖面采样失败");
+        return;
+    }
+    depthProfileValid_ = true;
+    depthProfileDragSource_ = 0;
+    SetStatus(u8"剖面高度曲线已生成，见左侧面板");
+}
+
+void Application::ClearDepthProfile() {
+    depthProfileValid_ = false;
+    depthProfileSamples_.clear();
+}
+
+namespace {
+
+float DistancePointToSegment(float px, float py, float x1, float y1, float x2, float y2) {
+    const float dx = x2 - x1;
+    const float dy = y2 - y1;
+    const float len2 = dx * dx + dy * dy;
+    if (len2 < 1e-6f) return std::hypot(px - x1, py - y1);
+    float t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = std::clamp(t, 0.f, 1.f);
+    const float cx = x1 + t * dx;
+    const float cy = y1 + t * dy;
+    return std::hypot(px - cx, py - cy);
+}
+
+float ArcNormAnglePos(float a) {
+    constexpr float kTwoPi = 6.283185307179586f;
+    while (a < 0.f) a += kTwoPi;
+    while (a >= kTwoPi) a -= kTwoPi;
+    return a;
+}
+
+bool IsAngleOnArcSpan(float angle, float startAngle, float endAngle) {
+    const float d0 = ArcNormAnglePos(angle - startAngle);
+    const float d01 = ArcNormAnglePos(endAngle - startAngle);
+    return d0 <= d01 + 1e-4f;
+}
+
+float DistancePointToArc(float px, float py, float cx, float cy, float radius, float startAngle,
+                         float endAngle) {
+    const float dx = px - cx;
+    const float dy = py - cy;
+    const float dist = std::hypot(dx, dy);
+    const float ang = std::atan2(dy, dx);
+    if (IsAngleOnArcSpan(ang, startAngle, endAngle)) {
+        return std::fabs(dist - radius);
+    }
+    const float x0 = cx + radius * std::cos(startAngle);
+    const float y0 = cy + radius * std::sin(startAngle);
+    const float x1 = cx + radius * std::cos(endAngle);
+    const float y1 = cy + radius * std::sin(endAngle);
+    return std::min(DistancePointToSegment(px, py, x0, y0, x1, y1),
+                    DistancePointToSegment(px, py, x1, y1, x0, y0));
+}
+
+}  // namespace
+
+int Application::FindClosestMeasuredLine(int imageSource, float px, float py,
+                                         float maxDistPx) const {
+    int bestIdx = -1;
+    float bestDist = maxDistPx;
+    for (std::size_t i = 0; i < measuredLines_.size(); ++i) {
+        const MeasuredImageLine& line = measuredLines_[i];
+        if (line.imageSource != imageSource || !line.result.ok) continue;
+        const float d = DistancePointToSegment(px, py, line.result.fitX1, line.result.fitY1,
+                                               line.result.fitX2, line.result.fitY2);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+void Application::PickLineForDistance(int lineIndex) {
+    if (lineIndex < 0 || lineIndex >= static_cast<int>(measuredLines_.size())) return;
+
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+    const int lineId = measuredLines_[static_cast<std::size_t>(lineIndex)].id;
+
+    if (lineDistPickA_ < 0) {
+        lineDistPickA_ = lineIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"线段%d 已选为 A", lineId);
+        SetStatus(buf);
+        return;
+    }
+    if (lineDistPickB_ < 0 && lineIndex != lineDistPickA_) {
+        lineDistPickB_ = lineIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"线段%d 已选为 B", lineId);
+        SetStatus(buf);
+        return;
+    }
+    if (lineIndex == lineDistPickA_) {
+        lineDistPickA_ = -1;
+        SetStatus(u8"已取消 A 选线");
+        return;
+    }
+    if (lineIndex == lineDistPickB_) {
+        lineDistPickB_ = -1;
+        SetStatus(u8"已取消 B 选线");
+        return;
+    }
+
+    lineDistPickB_ = lineIndex;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"线段%d 已替换为 B", lineId);
+    SetStatus(buf);
+}
+
+int Application::FindClosestMeasuredArc(int imageSource, float px, float py,
+                                        float maxDistPx) const {
+    int bestIdx = -1;
+    float bestDist = maxDistPx;
+    for (std::size_t i = 0; i < measuredArcs_.size(); ++i) {
+        const MeasuredImageArc& arc = measuredArcs_[i];
+        if (arc.imageSource != imageSource || !arc.result.ok) continue;
+        const float d = DistancePointToArc(px, py, arc.result.fitCenterX, arc.result.fitCenterY,
+                                         arc.result.fitRadius, arc.result.fitStartAngle,
+                                         arc.result.fitEndAngle);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+void Application::PickArcForDistance(int arcIndex) {
+    if (arcIndex < 0 || arcIndex >= static_cast<int>(measuredArcs_.size())) return;
+
+    arcDistValid_ = false;
+    arcDistSamples_.clear();
+    const int arcId = measuredArcs_[static_cast<std::size_t>(arcIndex)].id;
+
+    if (arcDistPickA_ < 0) {
+        arcDistPickA_ = arcIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"圆弧%d 已选为 A", arcId);
+        SetStatus(buf);
+        return;
+    }
+    if (arcDistPickB_ < 0 && arcIndex != arcDistPickA_) {
+        arcDistPickB_ = arcIndex;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), u8"圆弧%d 已选为 B", arcId);
+        SetStatus(buf);
+        return;
+    }
+    if (arcIndex == arcDistPickA_) {
+        arcDistPickA_ = -1;
+        SetStatus(u8"已取消 A 选弧");
+        return;
+    }
+    if (arcIndex == arcDistPickB_) {
+        arcDistPickB_ = -1;
+        SetStatus(u8"已取消 B 选弧");
+        return;
+    }
+
+    arcDistPickB_ = arcIndex;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), u8"圆弧%d 已替换为 B", arcId);
+    SetStatus(buf);
+}
+
+namespace {
+
+void DrawCaliperLineParamsPanel(OpenCv2D::CaliperLineParams& params, bool arcMode) {
+    ImGui::TextDisabled(u8"卡尺参数");
+    ImGui::SetNextItemWidth(-1.f);
+    ImGui::DragInt(arcMode ? u8"卡尺数量" : u8"测量线数量", &params.numCalipers, 1,
+                   arcMode ? 3 : 2, 200);
+    if (arcMode) {
+        ImGui::TextDisabled(u8"沿圆弧 ROI 均匀布置的径向卡尺条数；越多采样越密（建议 10~40）");
+    } else {
+        ImGui::TextDisabled(
+            u8"沿 ROI 测量方向均匀布置的垂直卡尺条数；越多边缘采样越密（建议 10~40）");
+    }
+    ImGui::SetNextItemWidth(-1.f);
+    ImGui::DragFloat(arcMode ? u8"卡尺半长(px)" : u8"测量半长(px)", &params.caliperHalfLength, 1.f,
+                     4.f, 500.f, "%.0f");
+    ImGui::TextDisabled(
+        u8"每条卡尺沿搜索方向的半长（像素）；应覆盖边缘到 ROI 的最大偏移，过小会漏检");
+    ImGui::SetNextItemWidth(-1.f);
+    ImGui::DragInt(u8"平均宽度(px)", &params.caliperWidth, 1, 1, 31);
+    ImGui::TextDisabled(u8"沿卡尺方向的灰度平均窗口宽度（奇数）；用于平滑噪声，常用 3~7");
+    ImGui::SetNextItemWidth(-1.f);
+    ImGui::DragFloat(u8"最小对比度", &params.minContrast, 0.1f, 0.f, 100.f, "%.2f");
+    ImGui::TextDisabled(u8"边缘梯度强度阈值；低于此值的候选边缘将被忽略，噪声大时可适当提高");
+    const char* polarityItems[] = {u8"全部（最大梯度）", u8"由暗到亮", u8"由亮到暗"};
+    int polarity = static_cast<int>(params.polarity);
+    ImGui::SetNextItemWidth(-1.f);
+    if (ImGui::Combo(u8"边缘极性", &polarity, polarityItems, 3)) {
+        params.polarity = static_cast<OpenCv2D::EdgePolarity>(polarity);
+    }
+    ImGui::TextDisabled(u8"限定边缘过渡方向：由暗到亮 / 由亮到暗；选「全部」则取最强梯度");
+}
+
+}  // namespace
+
+namespace {
+
+ImU32 LineColorForId(int id) {
+    static const ImU32 palette[] = {
+        IM_COL32(50, 255, 100, 240),  IM_COL32(80, 200, 255, 240), IM_COL32(255, 200, 60, 240),
+        IM_COL32(255, 120, 120, 240), IM_COL32(200, 120, 255, 240)};
+    return palette[(id - 1) % 5];
+}
+
+void DrawLabelTag(ImDrawList* dl, ImVec2 pos, const char* text, ImU32 col) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 p0(pos.x - 4.f, pos.y - 2.f);
+    const ImVec2 p1(pos.x + ts.x + 4.f, pos.y + ts.y + 2.f);
+    dl->AddRectFilled(p0, p1, IM_COL32(10, 12, 14, 210), 3.f);
+    dl->AddRect(p0, p1, col, 3.f);
+    dl->AddText(pos, IM_COL32(255, 255, 255, 255), text);
+}
+
+void DrawCaliperResultDetail(ImDrawList* dl, const OpenCv2D::CaliperLineResult& result,
+                             const std::function<ImVec2(float, float)>& toScreen, ImU32 fitCol,
+                             float fitThickness, bool pending) {
+    if (!result.ok) return;
+    const ImU32 calCol =
+        pending ? IM_COL32(120, 220, 255, 200) : IM_COL32(80, 200, 255, 180);
+    for (const OpenCv2D::LineSegment& c : result.calipers) {
+        dl->AddLine(toScreen(c.x1, c.y1), toScreen(c.x2, c.y2), calCol, 1.f);
+    }
+    for (const OpenCv2D::CaliperEdgePoint& ep : result.edgePoints) {
+        if (!ep.valid) continue;
+        const ImVec2 p = toScreen(ep.x, ep.y);
+        dl->AddCircleFilled(p, 3.5f, IM_COL32(255, 70, 70, 240));
+        dl->AddCircle(p, 4.5f, IM_COL32(255, 255, 255, 200), 0, 1.2f);
+    }
+    dl->AddLine(toScreen(result.fitX1, result.fitY1), toScreen(result.fitX2, result.fitY2),
+                fitCol, fitThickness);
+}
+
+void DrawArcPolyline(ImDrawList* dl, float cx, float cy, float radius, float startAngle,
+                     float endAngle, const std::function<ImVec2(float, float)>& toScreen,
+                     ImU32 col, float thickness) {
+    std::vector<float> ax;
+    std::vector<float> ay;
+    OpenCv2D::SampleArcPolyline(cx, cy, radius, startAngle, endAngle, 48, ax, ay);
+    for (std::size_t i = 1; i < ax.size(); ++i) {
+        dl->AddLine(toScreen(ax[i - 1], ay[i - 1]), toScreen(ax[i], ay[i]), col, thickness);
+    }
+}
+
+void DrawThreePointRoiArc(ImDrawList* dl, float p0x, float p0y, float p1x, float p1y, float p2x,
+                          float p2y, const std::function<ImVec2(float, float)>& toScreen,
+                          ImU32 col, float thickness) {
+    float cx = 0.f;
+    float cy = 0.f;
+    float r = 0.f;
+    float a0 = 0.f;
+    float a1 = 0.f;
+    if (!OpenCv2D::CircleFromThreePoints(p0x, p0y, p1x, p1y, p2x, p2y, cx, cy, r)) return;
+    if (!OpenCv2D::ArcSpanThroughMiddle(cx, cy, p0x, p0y, p1x, p1y, p2x, p2y, a0, a1)) return;
+    DrawArcPolyline(dl, cx, cy, r, a0, a1, toScreen, col, thickness);
+}
+
+void DrawArcPickMarker(ImDrawList* dl, ImVec2 p, const char* label, ImU32 col) {
+    dl->AddCircleFilled(p, 5.f, col);
+    dl->AddCircle(p, 7.f, IM_COL32(255, 255, 255, 220), 0, 1.5f);
+    DrawLabelTag(dl, ImVec2(p.x + 8.f, p.y - 16.f), label, col);
+}
+
+void DrawCaliperArcResultDetail(ImDrawList* dl, const OpenCv2D::CaliperArcResult& result,
+                                const std::function<ImVec2(float, float)>& toScreen, ImU32 fitCol,
+                                float fitThickness, bool pending) {
+    if (!result.ok) return;
+    const ImU32 calCol =
+        pending ? IM_COL32(120, 220, 255, 200) : IM_COL32(80, 200, 255, 180);
+    for (const OpenCv2D::LineSegment& c : result.calipers) {
+        dl->AddLine(toScreen(c.x1, c.y1), toScreen(c.x2, c.y2), calCol, 1.f);
+    }
+    for (const OpenCv2D::CaliperEdgePoint& ep : result.edgePoints) {
+        if (!ep.valid) continue;
+        const ImVec2 p = toScreen(ep.x, ep.y);
+        dl->AddCircleFilled(p, 3.5f, IM_COL32(255, 70, 70, 240));
+        dl->AddCircle(p, 4.5f, IM_COL32(255, 255, 255, 200), 0, 1.2f);
+    }
+    DrawArcPolyline(dl, result.roiCenterX, result.roiCenterY, result.roiRadius,
+                    result.roiStartAngle, result.roiEndAngle, toScreen,
+                    pending ? IM_COL32(255, 220, 60, 160) : IM_COL32(255, 220, 60, 120), 1.5f);
+    DrawArcPolyline(dl, result.fitCenterX, result.fitCenterY, result.fitRadius,
+                    result.fitStartAngle, result.fitEndAngle, toScreen, fitCol, fitThickness);
+    dl->AddCircle(toScreen(result.fitCenterX, result.fitCenterY), 3.f, fitCol, 0, 1.5f);
+}
+
+void DrawCircleFitDetail(ImDrawList* dl, const OpenCv2D::CircleFitResult& result,
+                         const std::vector<OpenCv2D::CaliperEdgePoint>& edgePoints,
+                         const std::function<ImVec2(float, float)>& toScreen, float screenScale,
+                         ImU32 col, bool pending) {
+    if (!result.ok) return;
+    for (const OpenCv2D::CaliperEdgePoint& ep : edgePoints) {
+        if (!ep.valid) continue;
+        const ImVec2 p = toScreen(ep.x, ep.y);
+        dl->AddCircleFilled(p, 3.f, IM_COL32(255, 70, 70, 240));
+        dl->AddCircle(p, 4.f, IM_COL32(255, 255, 255, 200), 0, 1.f);
+    }
+    const ImVec2 center = toScreen(result.centerX, result.centerY);
+    const float rScreen = result.radius * screenScale;
+    dl->AddCircle(center, rScreen, col, 72, pending ? 2.8f : 2.2f);
+    dl->AddCircleFilled(center, 3.5f, col);
+    char label[48];
+    std::snprintf(label, sizeof(label), u8"R=%.3f px", result.radius);
+    DrawLabelTag(dl, ImVec2(center.x + 8.f, center.y - rScreen - 8.f), label, col);
+}
+
+}  // namespace
+
+void Application::DrawLineMeasureOverlay(ImDrawList* dl, const ImageView& view, float cursorX,
+                                         float cursorY, float drawW, float drawH) {
+    if (!dl || view.width <= 0 || view.height <= 0) return;
+    const float sx = drawW / static_cast<float>(view.width);
+    const float sy = drawH / static_cast<float>(view.height);
+    const int src = ImageSourceOf(view);
+    auto toScreen = [&](float x, float y) -> ImVec2 {
+        return ImVec2(cursorX + x * sx, cursorY + y * sy);
+    };
+
+    if (lineMeasureDragging_ && lineMeasureDragSource_ == src) {
+        dl->AddLine(toScreen(lineMeasureRoiX0_, lineMeasureRoiY0_),
+                    toScreen(lineMeasureRoiX1_, lineMeasureRoiY1_), IM_COL32(255, 220, 60, 230),
+                    2.f);
+    }
+
+    if (lineMeasurePending_ && lineMeasurePendingSource_ == src &&
+        lineMeasurePendingResult_.ok) {
+        DrawCaliperResultDetail(dl, lineMeasurePendingResult_, toScreen,
+                                IM_COL32(255, 200, 60, 240), 2.5f, true);
+        const ImVec2 mid(toScreen((lineMeasurePendingResult_.fitX1 +
+                                   lineMeasurePendingResult_.fitX2) *
+                                      0.5f,
+                                  (lineMeasurePendingResult_.fitY1 +
+                                   lineMeasurePendingResult_.fitY2) *
+                                      0.5f));
+        DrawLabelTag(dl, ImVec2(mid.x + 6.f, mid.y - 18.f), u8"待确认",
+                     IM_COL32(255, 200, 60, 255));
+    }
+
+    for (std::size_t i = 0; i < measuredLines_.size(); ++i) {
+        const MeasuredImageLine& line = measuredLines_[i];
+        if (line.imageSource != src || !line.result.ok) continue;
+
+        const bool lineDistActive = image2DTool_ == Image2DTool::LineDistance;
+        const bool isA = lineDistActive && static_cast<int>(i) == lineDistPickA_;
+        const bool isB = lineDistActive && static_cast<int>(i) == lineDistPickB_;
+        const bool lineAngleOn = image2DTool_ == Image2DTool::LineAngle;
+        const bool angleA = lineAngleOn && static_cast<int>(i) == lineAnglePickA_;
+        const bool angleB = lineAngleOn && static_cast<int>(i) == lineAnglePickB_;
+        const bool pointLineOn = image2DTool_ == Image2DTool::PointLineDistance;
+        const bool plLine = pointLineOn && static_cast<int>(i) == pointLinePick_;
+        ImU32 col = LineColorForId(line.id);
+        float thickness = 2.5f;
+        if (isA || angleA) {
+            col = IM_COL32(255, 230, 60, 255);
+            thickness = 3.5f;
+        } else if (isB || angleB) {
+            col = IM_COL32(80, 220, 255, 255);
+            thickness = 3.5f;
+        } else if (plLine) {
+            col = IM_COL32(180, 120, 255, 255);
+            thickness = 3.5f;
+        }
+
+        DrawCaliperResultDetail(dl, line.result, toScreen, col, thickness, false);
+
+        char label[24];
+        std::snprintf(label, sizeof(label), u8"线段%d", line.id);
+        const ImVec2 mid(toScreen((line.result.fitX1 + line.result.fitX2) * 0.5f,
+                                  (line.result.fitY1 + line.result.fitY2) * 0.5f));
+        DrawLabelTag(dl, ImVec2(mid.x + 6.f, mid.y - 18.f), label, col);
+    }
+
+    if ((image2DTool_ == Image2DTool::CaliperArc || image2DTool_ == Image2DTool::CircleFit ||
+         image2DTool_ == Image2DTool::EllipseFit) &&
+        arcMeasureSource_ == src && !arcMeasurePending_ && !circleFitPending_ &&
+        !ellipseFitPending_) {
+        if (arcMeasurePhase_ == ArcMeasurePhase::PickB ||
+            arcMeasurePhase_ == ArcMeasurePhase::DragBulge) {
+            DrawArcPickMarker(dl, toScreen(arcRoiP0X_, arcRoiP0Y_), u8"A",
+                              IM_COL32(255, 230, 60, 255));
+        }
+        if (arcMeasurePhase_ == ArcMeasurePhase::DragBulge) {
+            DrawArcPickMarker(dl, toScreen(arcRoiP1X_, arcRoiP1Y_), u8"B",
+                              IM_COL32(80, 220, 255, 255));
+            dl->AddLine(toScreen(arcRoiP0X_, arcRoiP0Y_), toScreen(arcRoiP1X_, arcRoiP1Y_),
+                        IM_COL32(180, 180, 180, 180), 1.5f);
+            const float mx0 = (arcRoiP0X_ + arcRoiP1X_) * 0.5f;
+            const float my0 = (arcRoiP0Y_ + arcRoiP1Y_) * 0.5f;
+            dl->AddLine(toScreen(mx0, my0), toScreen(arcRoiP2X_, arcRoiP2Y_),
+                        IM_COL32(255, 220, 60, 230), 2.f);
+            DrawArcPickMarker(dl, toScreen(arcRoiP2X_, arcRoiP2Y_), u8"拱高",
+                              IM_COL32(255, 200, 60, 255));
+            DrawThreePointRoiArc(dl, arcRoiP0X_, arcRoiP0Y_, arcRoiP1X_, arcRoiP1Y_, arcRoiP2X_,
+                                 arcRoiP2Y_, toScreen, IM_COL32(255, 220, 60, 200), 2.f);
+        }
+    }
+
+    if (arcMeasurePending_ && arcMeasurePendingSource_ == src && arcMeasurePendingResult_.ok) {
+        DrawCaliperArcResultDetail(dl, arcMeasurePendingResult_, toScreen,
+                                   IM_COL32(255, 200, 60, 240), 2.5f, true);
+        const float midAng =
+            (arcMeasurePendingResult_.fitStartAngle + arcMeasurePendingResult_.fitEndAngle) * 0.5f;
+        const ImVec2 mid(toScreen(
+            arcMeasurePendingResult_.fitCenterX +
+                arcMeasurePendingResult_.fitRadius * std::cos(midAng),
+            arcMeasurePendingResult_.fitCenterY +
+                arcMeasurePendingResult_.fitRadius * std::sin(midAng)));
+        DrawLabelTag(dl, ImVec2(mid.x + 6.f, mid.y - 18.f), u8"待确认",
+                     IM_COL32(255, 200, 60, 255));
+    }
+
+    for (std::size_t i = 0; i < measuredArcs_.size(); ++i) {
+        const MeasuredImageArc& arc = measuredArcs_[i];
+        if (arc.imageSource != src || !arc.result.ok) continue;
+        const bool arcDistActive = image2DTool_ == Image2DTool::ArcDistance;
+        const bool isA = arcDistActive && static_cast<int>(i) == arcDistPickA_;
+        const bool isB = arcDistActive && static_cast<int>(i) == arcDistPickB_;
+        const bool arcLenOn = image2DTool_ == Image2DTool::ArcLength;
+        const bool arcLenPick = arcLenOn && static_cast<int>(i) == arcLengthPick_;
+        ImU32 col = LineColorForId(arc.id);
+        float thickness = 2.5f;
+        if (isA) {
+            col = IM_COL32(255, 230, 60, 255);
+            thickness = 3.5f;
+        } else if (isB) {
+            col = IM_COL32(80, 220, 255, 255);
+            thickness = 3.5f;
+        } else if (arcLenPick) {
+            col = IM_COL32(200, 120, 255, 255);
+            thickness = 3.5f;
+        }
+        DrawCaliperArcResultDetail(dl, arc.result, toScreen, col, thickness, false);
+        char label[24];
+        std::snprintf(label, sizeof(label), u8"圆弧%d", arc.id);
+        const float midAng = (arc.result.fitStartAngle + arc.result.fitEndAngle) * 0.5f;
+        const ImVec2 mid(toScreen(arc.result.fitCenterX + arc.result.fitRadius * std::cos(midAng),
+                                  arc.result.fitCenterY + arc.result.fitRadius * std::sin(midAng)));
+        DrawLabelTag(dl, ImVec2(mid.x + 6.f, mid.y - 18.f), label, col);
+    }
+
+    if (circleFitPending_ && circleFitPendingSource_ == src && circleFitPendingResult_.ok) {
+        DrawCircleFitDetail(dl, circleFitPendingResult_, circleFitPendingEdgePoints_, toScreen, sx,
+                            IM_COL32(255, 200, 60, 255), true);
+        DrawLabelTag(dl,
+                     toScreen(circleFitPendingResult_.centerX, circleFitPendingResult_.centerY),
+                     u8"待确认", IM_COL32(255, 200, 60, 255));
+    }
+
+    for (std::size_t fi = 0; fi < measuredCircleFits_.size(); ++fi) {
+        const MeasuredCircleFit& fit = measuredCircleFits_[fi];
+        if (fit.imageSource != src || !fit.result.ok) continue;
+        const bool circleGapOn = image2DTool_ == Image2DTool::CircleGap;
+        const bool gapA = circleGapOn && static_cast<int>(fi) == circleGapPickA_;
+        const bool gapB = circleGapOn && static_cast<int>(fi) == circleGapPickB_;
+        ImU32 col = LineColorForId(fit.id);
+        if (gapA) col = IM_COL32(255, 230, 60, 255);
+        else if (gapB) col = IM_COL32(80, 220, 255, 255);
+        DrawCircleFitDetail(dl, fit.result, fit.edgePoints, toScreen, sx, col, false);
+        char label[32];
+        std::snprintf(label, sizeof(label), u8"圆%d", fit.id);
+        DrawLabelTag(dl, toScreen(fit.result.centerX, fit.result.centerY), label, col);
+    }
+
+    if (image2DTool_ == Image2DTool::LineDistance && lineDistValid_ && lineDistPickA_ >= 0 &&
+        lineDistPickB_ >= 0) {
+        const MeasuredImageLine& la = measuredLines_[static_cast<std::size_t>(lineDistPickA_)];
+        const MeasuredImageLine& lb = measuredLines_[static_cast<std::size_t>(lineDistPickB_)];
+        if (la.imageSource == src && lb.imageSource == src) {
+            for (const OpenCv2D::GapSample& gs : lineDistSamples_) {
+                const ImVec2 pa = toScreen(gs.ax, gs.ay);
+                const ImVec2 pb = toScreen(gs.bx, gs.by);
+                dl->AddLine(pa, pb, IM_COL32(255, 120, 220, 140), 1.f);
+                dl->AddCircleFilled(pa, 2.f, IM_COL32(255, 120, 220, 200));
+            }
+
+            char distLabel[64];
+            std::snprintf(distLabel, sizeof(distLabel), u8"平均 %.2f px", lineDistPx_);
+            if (!lineDistSamples_.empty()) {
+                const OpenCv2D::GapSample& midS =
+                    lineDistSamples_[lineDistSamples_.size() / 2];
+                const ImVec2 pa = toScreen(midS.ax, midS.ay);
+                const ImVec2 pb = toScreen(midS.bx, midS.by);
+                const ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
+                DrawLabelTag(dl, ImVec2(mid.x + 4.f, mid.y - 20.f), distLabel,
+                             IM_COL32(255, 120, 220, 255));
+            }
+        }
+    }
+
+    if (image2DTool_ == Image2DTool::ArcDistance && arcDistValid_ && arcDistPickA_ >= 0 &&
+        arcDistPickB_ >= 0) {
+        const MeasuredImageArc& aa = measuredArcs_[static_cast<std::size_t>(arcDistPickA_)];
+        const MeasuredImageArc& ab = measuredArcs_[static_cast<std::size_t>(arcDistPickB_)];
+        if (aa.imageSource == src && ab.imageSource == src) {
+            for (const OpenCv2D::GapSample& gs : arcDistSamples_) {
+                const ImVec2 pa = toScreen(gs.ax, gs.ay);
+                const ImVec2 pb = toScreen(gs.bx, gs.by);
+                dl->AddLine(pa, pb, IM_COL32(120, 220, 255, 140), 1.f);
+                dl->AddCircleFilled(pa, 2.f, IM_COL32(120, 220, 255, 200));
+            }
+
+            char distLabel[64];
+            std::snprintf(distLabel, sizeof(distLabel), u8"平均 %.2f px", arcDistPx_);
+            if (!arcDistSamples_.empty()) {
+                const OpenCv2D::GapSample& midS = arcDistSamples_[arcDistSamples_.size() / 2];
+                const ImVec2 pa = toScreen(midS.ax, midS.ay);
+                const ImVec2 pb = toScreen(midS.bx, midS.by);
+                const ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
+                DrawLabelTag(dl, ImVec2(mid.x + 4.f, mid.y - 20.f), distLabel,
+                             IM_COL32(120, 220, 255, 255));
+            }
+        }
+    }
+
+    for (const MeasuredPointDist& pd : measuredPointDists_) {
+        if (pd.imageSource != src) continue;
+        const ImVec2 pa = toScreen(pd.ax, pd.ay);
+        const ImVec2 pb = toScreen(pd.bx, pd.by);
+        dl->AddLine(pa, pb, IM_COL32(255, 180, 80, 230), 2.f);
+        dl->AddCircleFilled(pa, 5.f, IM_COL32(255, 230, 60, 255));
+        dl->AddCircleFilled(pb, 5.f, IM_COL32(80, 220, 255, 255));
+        char label[48];
+        std::snprintf(label, sizeof(label), u8"%.2f px", pd.distance);
+        DrawLabelTag(dl, ImVec2((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f - 18.f), label,
+                     IM_COL32(255, 200, 100, 255));
+    }
+    if (image2DTool_ == Image2DTool::PointDistance && pointDistPhase_ == PointPickPhase::PickB &&
+        pointDistSource_ == src) {
+        const ImVec2 pa = toScreen(pointDistAx_, pointDistAy_);
+        dl->AddCircleFilled(pa, 5.f, IM_COL32(255, 230, 60, 255));
+        DrawLabelTag(dl, ImVec2(pa.x + 8.f, pa.y - 16.f), u8"A", IM_COL32(255, 230, 60, 255));
+    }
+
+    if (image2DTool_ == Image2DTool::PointLineDistance && pointLineSource_ == src) {
+        if (pointLinePhase_ == PointPickPhase::PickB || pointLineValid_) {
+            const ImVec2 pp = toScreen(pointLinePx_, pointLinePy_);
+            dl->AddCircleFilled(pp, 5.f, IM_COL32(200, 120, 255, 255));
+            DrawLabelTag(dl, ImVec2(pp.x + 8.f, pp.y - 16.f), u8"P", IM_COL32(200, 120, 255, 255));
+        }
+        if (pointLineValid_ && pointLinePick_ >= 0 &&
+            pointLinePick_ < static_cast<int>(measuredLines_.size())) {
+            const ImVec2 pf = toScreen(pointLineFootX_, pointLineFootY_);
+            const ImVec2 pp = toScreen(pointLinePx_, pointLinePy_);
+            dl->AddLine(pp, pf, IM_COL32(200, 120, 255, 220), 2.f);
+            dl->AddCircleFilled(pf, 4.f, IM_COL32(255, 255, 255, 220));
+            char label[48];
+            std::snprintf(label, sizeof(label), u8"%.2f px", pointLineDistPx_);
+            DrawLabelTag(dl, ImVec2((pp.x + pf.x) * 0.5f, (pp.y + pf.y) * 0.5f - 16.f), label,
+                         IM_COL32(200, 120, 255, 255));
+        }
+    }
+
+    if (caliperPointDragging_ && caliperPointDragSource_ == src) {
+        dl->AddLine(toScreen(caliperPointRoiX0_, caliperPointRoiY0_),
+                    toScreen(caliperPointRoiX1_, caliperPointRoiY1_), IM_COL32(255, 220, 60, 230),
+                    2.f);
+    }
+    if (caliperPointPending_ && caliperPointPendingSource_ == src &&
+        caliperPointPendingEdge_.valid) {
+        const ImVec2 p = toScreen(caliperPointPendingEdge_.x, caliperPointPendingEdge_.y);
+        dl->AddCircleFilled(p, 6.f, IM_COL32(255, 200, 60, 255));
+        DrawLabelTag(dl, ImVec2(p.x + 8.f, p.y - 16.f), u8"待确认", IM_COL32(255, 200, 60, 255));
+    }
+    for (const MeasuredCaliperPoint& cp : measuredCaliperPoints_) {
+        if (cp.imageSource != src) continue;
+        const ImVec2 p = toScreen(cp.x, cp.y);
+        dl->AddLine(toScreen(cp.roiX0, cp.roiY0), toScreen(cp.roiX1, cp.roiY1),
+                    IM_COL32(120, 200, 255, 160), 1.5f);
+        dl->AddCircleFilled(p, 5.f, IM_COL32(255, 100, 100, 255));
+        char label[24];
+        std::snprintf(label, sizeof(label), u8"E%d", cp.id);
+        DrawLabelTag(dl, ImVec2(p.x + 8.f, p.y - 16.f), label, IM_COL32(255, 100, 100, 255));
+    }
+
+    if (image2DTool_ == Image2DTool::CaliperCircle && circleCaliperSource_ == src &&
+        circleCaliperPhase_ == CircleCaliperPhase::DragRadius && circleCaliperR_ > 1.f) {
+        const ImVec2 center = toScreen(circleCaliperCx_, circleCaliperCy_);
+        dl->AddCircle(center, circleCaliperR_ * sx, IM_COL32(255, 220, 60, 200), 64, 2.f);
+        dl->AddCircleFilled(center, 4.f, IM_COL32(255, 230, 60, 255));
+    }
+    if (circleCaliperPending_ && circleCaliperPendingSource_ == src &&
+        circleCaliperPendingResult_.ok) {
+        const auto& r = circleCaliperPendingResult_;
+        OpenCv2D::CircleFitResult fit;
+        fit.centerX = r.fitCenterX;
+        fit.centerY = r.fitCenterY;
+        fit.radius = r.fitRadius;
+        fit.ok = true;
+        DrawCircleFitDetail(dl, fit, r.edgePoints, toScreen, sx, IM_COL32(255, 200, 60, 255), true);
+        DrawLabelTag(dl, toScreen(r.fitCenterX, r.fitCenterY), u8"待确认",
+                     IM_COL32(255, 200, 60, 255));
+    }
+    for (const MeasuredCircleCaliper& cc : measuredCircleCalipers_) {
+        if (cc.imageSource != src || !cc.result.ok) continue;
+        OpenCv2D::CircleFitResult fit;
+        fit.centerX = cc.result.fitCenterX;
+        fit.centerY = cc.result.fitCenterY;
+        fit.radius = cc.result.fitRadius;
+        fit.ok = true;
+        DrawCircleFitDetail(dl, fit, cc.result.edgePoints, toScreen, sx, LineColorForId(cc.id),
+                            false);
+        char label[32];
+        std::snprintf(label, sizeof(label), u8"圆卡%d R=%.2f", cc.id, cc.result.fitRadius);
+        DrawLabelTag(dl, toScreen(cc.result.fitCenterX, cc.result.fitCenterY), label,
+                     LineColorForId(cc.id));
+    }
+
+    if (image2DTool_ == Image2DTool::CircleGap && circleGapValid_ && circleGapPickA_ >= 0 &&
+        circleGapPickB_ >= 0) {
+        const MeasuredCircleFit& ca = measuredCircleFits_[static_cast<std::size_t>(circleGapPickA_)];
+        const MeasuredCircleFit& cb = measuredCircleFits_[static_cast<std::size_t>(circleGapPickB_)];
+        if (ca.imageSource == src && cb.imageSource == src) {
+            const ImVec2 c1 = toScreen(ca.result.centerX, ca.result.centerY);
+            const ImVec2 c2 = toScreen(cb.result.centerX, cb.result.centerY);
+            dl->AddLine(c1, c2, IM_COL32(255, 200, 80, 220), 2.f);
+            char label[64];
+            std::snprintf(label, sizeof(label), u8"圆心距 %.2f", circleGapCenterDist_);
+            DrawLabelTag(dl, ImVec2((c1.x + c2.x) * 0.5f, (c1.y + c2.y) * 0.5f - 16.f), label,
+                         IM_COL32(255, 200, 80, 255));
+        }
+    }
+
+    if (image2DTool_ == Image2DTool::ArcLength && arcLengthValid_ && arcLengthPick_ >= 0 &&
+        arcLengthPick_ < static_cast<int>(measuredArcs_.size())) {
+        const MeasuredImageArc& arc = measuredArcs_[static_cast<std::size_t>(arcLengthPick_)];
+        if (arc.imageSource == src && arc.result.ok) {
+            const float x0 = arc.result.fitCenterX +
+                             arc.result.fitRadius * std::cos(arc.result.fitStartAngle);
+            const float y0 = arc.result.fitCenterY +
+                             arc.result.fitRadius * std::sin(arc.result.fitStartAngle);
+            const float x1 = arc.result.fitCenterX +
+                             arc.result.fitRadius * std::cos(arc.result.fitEndAngle);
+            const float y1 = arc.result.fitCenterY +
+                             arc.result.fitRadius * std::sin(arc.result.fitEndAngle);
+            dl->AddLine(toScreen(x0, y0), toScreen(x1, y1), IM_COL32(200, 120, 255, 220), 2.f);
+            char label[80];
+            std::snprintf(label, sizeof(label), u8"弧长%.1f 弦长%.1f", arcLengthMetrics_.arcLength,
+                          arcLengthMetrics_.chordLength);
+            const float midAng =
+                (arc.result.fitStartAngle + arc.result.fitEndAngle) * 0.5f;
+            const ImVec2 mid(toScreen(
+                arc.result.fitCenterX + arc.result.fitRadius * std::cos(midAng),
+                arc.result.fitCenterY + arc.result.fitRadius * std::sin(midAng)));
+            DrawLabelTag(dl, ImVec2(mid.x + 6.f, mid.y - 20.f), label, IM_COL32(200, 120, 255, 255));
+        }
+    }
+
+    for (const MeasuredThreePointCircle& tc : measuredThreePointCircles_) {
+        if (tc.imageSource != src) continue;
+        const ImVec2 c = toScreen(tc.centerX, tc.centerY);
+        dl->AddCircle(c, tc.radius * sx, IM_COL32(100, 220, 180, 220), 64, 2.f);
+        dl->AddCircleFilled(c, 3.f, IM_COL32(100, 220, 180, 255));
+        char label[32];
+        std::snprintf(label, sizeof(label), u8"三点圆%d", tc.id);
+        DrawLabelTag(dl, ImVec2(c.x + 8.f, c.y - tc.radius * sx - 8.f), label,
+                     IM_COL32(100, 220, 180, 255));
+    }
+    if (image2DTool_ == Image2DTool::ThreePointCircle && threePointSource_ == src) {
+        const int n = static_cast<int>(threePointPhase_);
+        for (int i = 0; i < n; ++i) {
+            dl->AddCircleFilled(toScreen(threePointX_[i], threePointY_[i]), 5.f,
+                                IM_COL32(255, 230, 60, 255));
+        }
+    }
+
+    auto drawDragRect = [&](bool dragging, int dragSource, float x0, float y0, float x1, float y1,
+                            ImU32 col) {
+        if (!dragging || dragSource != src) return;
+        const float l = std::min(x0, x1);
+        const float r = std::max(x0, x1);
+        const float t = std::min(y0, y1);
+        const float b = std::max(y0, y1);
+        dl->AddRect(toScreen(l, t), toScreen(r, b), col, 0.f, 0, 2.f);
+    };
+    drawDragRect(rectCaliperDragging_, rectCaliperDragSource_, rectCaliperRoiX0_,
+                 rectCaliperRoiY0_, rectCaliperRoiX1_, rectCaliperRoiY1_,
+                 IM_COL32(80, 200, 255, 220));
+    drawDragRect(regionBlobDragging_, regionBlobDragSource_, regionBlobRoiX0_, regionBlobRoiY0_,
+                 regionBlobRoiX1_, regionBlobRoiY1_, IM_COL32(120, 255, 160, 220));
+
+    auto drawDragLine = [&](bool dragging, int dragSource, float x0, float y0, float x1, float y1,
+                            ImU32 col) {
+        if (!dragging || dragSource != src) return;
+        dl->AddLine(toScreen(x0, y0), toScreen(x1, y1), col, 2.f);
+    };
+    drawDragLine(profileWidthDragging_, profileWidthDragSource_, profileWidthRoiX0_,
+                 profileWidthRoiY0_, profileWidthRoiX1_, profileWidthRoiY1_,
+                 IM_COL32(255, 180, 80, 230));
+    drawDragLine(depthProfileDragging_, depthProfileDragSource_, depthProfileRoiX0_,
+                 depthProfileRoiY0_, depthProfileRoiX1_, depthProfileRoiY1_,
+                 IM_COL32(80, 220, 255, 230));
+
+    if (rectCaliperPending_ && rectCaliperPendingSource_ == src && rectCaliperPendingResult_.ok) {
+        const auto& r = rectCaliperPendingResult_;
+        const float hw = r.width * 0.5f;
+        const float hh = r.height * 0.5f;
+        const float rad = r.angleDeg * 3.14159265f / 180.f;
+        const float cosA = std::cos(rad);
+        const float sinA = std::sin(rad);
+        ImVec2 corners[4];
+        const float lx[4] = {-hw, hw, hw, -hw};
+        const float ly[4] = {-hh, -hh, hh, hh};
+        for (int i = 0; i < 4; ++i) {
+            corners[i] = toScreen(r.centerX + lx[i] * cosA - ly[i] * sinA,
+                                  r.centerY + lx[i] * sinA + ly[i] * cosA);
+        }
+        for (int i = 0; i < 4; ++i) {
+            dl->AddLine(corners[i], corners[(i + 1) % 4], IM_COL32(255, 200, 60, 230), 2.f);
+        }
+    }
+    for (const MeasuredRectCaliper& rc : measuredRectCalipers_) {
+        if (rc.imageSource != src || !rc.result.ok) continue;
+        const auto& r = rc.result;
+        dl->AddRect(toScreen(r.roiX0, r.roiY0), toScreen(r.roiX1, r.roiY1),
+                    LineColorForId(rc.id), 0.f, 0, 1.5f);
+    }
+
+    if (profileWidthPending_ && profileWidthPendingSource_ == src &&
+        profileWidthPendingResult_.ok) {
+        const auto& w = profileWidthPendingResult_;
+        dl->AddLine(toScreen(w.edge1X, w.edge1Y), toScreen(w.edge2X, w.edge2Y),
+                    IM_COL32(255, 200, 60, 230), 2.5f);
+    }
+    for (const MeasuredProfileWidth& pw : measuredProfileWidths_) {
+        if (pw.imageSource != src || !pw.result.ok) continue;
+        dl->AddLine(toScreen(pw.result.edge1X, pw.result.edge1Y),
+                    toScreen(pw.result.edge2X, pw.result.edge2Y), LineColorForId(pw.id), 2.f);
+    }
+
+    if (ellipseFitPending_ && ellipseFitPendingSource_ == src && ellipseFitPendingResult_.ok) {
+        const auto& e = ellipseFitPendingResult_;
+        const ImVec2 c = toScreen(e.centerX, e.centerY);
+        dl->AddEllipse(c, ImVec2(e.axisA * sx, e.axisB * sy), e.angleDeg, IM_COL32(255, 200, 60, 220),
+                       0, 2.f);
+    }
+
+    if (pointProjValid_ && pointProjSource_ == src && pointProjLinePick_ >= 0) {
+        const ImVec2 pp = toScreen(pointProjPx_, pointProjPy_);
+        const ImVec2 pf = toScreen(pointProjResult_.footX, pointProjResult_.footY);
+        dl->AddLine(pp, pf, IM_COL32(180, 140, 255, 230), 2.f);
+        dl->AddCircleFilled(pf, 4.f, IM_COL32(255, 255, 255, 230));
+    }
+
+    if (concentricityValid_ && concentricityPickA_ >= 0 && concentricityPickB_ >= 0) {
+        const auto& ca = measuredCircleFits_[static_cast<std::size_t>(concentricityPickA_)];
+        const auto& cb = measuredCircleFits_[static_cast<std::size_t>(concentricityPickB_)];
+        if (ca.imageSource == src) {
+            dl->AddLine(toScreen(ca.result.centerX, ca.result.centerY),
+                        toScreen(cb.result.centerX, cb.result.centerY), IM_COL32(255, 160, 80, 220),
+                        2.f);
+        }
+    }
+
+    if (regionBlobPending_ && regionBlobPendingSource_ == src && regionBlobPendingResult_.ok) {
+        const auto& b = regionBlobPendingResult_;
+        dl->AddRect(toScreen(b.roiX0, b.roiY0), toScreen(b.roiX1, b.roiY1), IM_COL32(120, 255, 160, 200),
+                    0.f, 0, 2.f);
+        dl->AddCircleFilled(toScreen(b.centroidX, b.centroidY), 5.f, IM_COL32(120, 255, 160, 255));
+    }
+    for (const MeasuredRegionBlob& rb : measuredRegionBlobs_) {
+        if (rb.imageSource != src || !rb.result.ok) continue;
+        dl->AddCircleFilled(toScreen(rb.result.centroidX, rb.result.centroidY), 4.f,
+                            LineColorForId(rb.id));
+    }
+
+    if (depthHeightValid_ && depthHeightSource_ == src) {
+        const ImVec2 pa = toScreen(depthHeightAx_, depthHeightAy_);
+        dl->AddCircleFilled(pa, 5.f, IM_COL32(255, 230, 60, 255));
+        char label[48];
+        std::snprintf(label, sizeof(label), u8"ΔZ=%.4f", depthHeightDelta_);
+        DrawLabelTag(dl, ImVec2(pa.x + 8.f, pa.y - 16.f), label, IM_COL32(80, 220, 255, 255));
+    }
+}
+
+void Application::DrawImage2DToolPanel() {
+    if (image2DTool_ == Image2DTool::CircleFit) {
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           ArcMeasurePhaseHint(arcMeasurePhase_));
+        ImGui::TextWrapped(
+            u8"对圆弧线段进行最小二乘圆拟合，输出半径与圆心。\n"
+            u8"方式一：点击图像上已有圆弧（使用其边缘点拟合）\n"
+            u8"方式二：设置 A/B 点并拖拽拱高，沿弧提取边缘后拟合");
+        if (ImGui::Button(u8"重新选点", ImVec2(-1.f, 0))) {
+            ResetArcMeasurePick();
+            CancelCircleFitPending();
+            SetStatus(u8"已重置，请重新设置 A 点或点击圆弧");
+        }
+        ImGui::Spacing();
+        DrawCaliperLineParamsPanel(lineMeasureParams_, true);
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+
+        if (circleFitPending_ && circleFitPendingResult_.ok) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.f, 0.85f, 0.45f, 1.f), u8"待确认圆拟合");
+            if (circleFitPendingFromArcId_ >= 0) {
+                ImGui::Text(u8"来源圆弧 %d", circleFitPendingFromArcId_);
+            } else {
+                ImGui::TextDisabled(u8"来源：沿弧新提取边缘");
+            }
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"拟合半径 = %.4f px",
+                               circleFitPendingResult_.radius);
+            ImGui::Text(u8"圆心 (%.2f, %.2f)  有效点 %d  RMS %.4f px",
+                        circleFitPendingResult_.centerX, circleFitPendingResult_.centerY,
+                        circleFitPendingResult_.pointCount, circleFitPendingResult_.rms);
+            if (ImGui::Button(u8"确认圆拟合", ImVec2(-1.f, 36.f))) {
+                ConfirmCircleFit();
+            }
+            if (ImGui::Button(u8"取消预览", ImVec2(-1.f, 0))) {
+                CancelCircleFitPending();
+                SetStatus(u8"已取消圆拟合预览");
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (!CanUndoMeasuredLine()) ImGui::BeginDisabled();
+        if (ImGui::Button(u8"撤回圆拟合 / 预览", ImVec2(-1.f, 0))) {
+            UndoLastMeasuredLine();
+        }
+        if (!CanUndoMeasuredLine()) ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"已确认圆拟合 (%zu)", measuredCircleFits_.size());
+        if (measuredCircleFits_.empty()) {
+            ImGui::TextDisabled(u8"暂无结果，请点击圆弧或沿弧提取后确认");
+        } else {
+            for (std::size_t i = 0; i < measuredCircleFits_.size(); ++i) {
+                const MeasuredCircleFit& fit = measuredCircleFits_[i];
+                ImGui::PushID(static_cast<int>(i) + 40000);
+                ImGui::Text(u8"圆%d", fit.id);
+                if (fit.sourceArcId >= 0) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(u8"(圆弧%d)", fit.sourceArcId);
+                }
+                ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"半径 = %.4f px",
+                                   fit.result.radius);
+                ImGui::Text(u8"圆心 (%.2f, %.2f)  RMS %.4f px", fit.result.centerX,
+                            fit.result.centerY, fit.result.rms);
+                if (ImGui::Button(u8"删除")) {
+                    measuredCircleFits_.erase(measuredCircleFits_.begin() +
+                                              static_cast<std::ptrdiff_t>(i));
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        if (ImGui::Button(u8"清除全部圆拟合", ImVec2(-1.f, 0))) {
+            measuredCircleFits_.clear();
+            nextCircleFitId_ = 1;
+            CancelCircleFitPending();
+            SetStatus(u8"已清除全部圆拟合");
+        }
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::CaliperArc) {
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           ArcMeasurePhaseHint(arcMeasurePhase_));
+        ImGui::TextWrapped(
+            u8"① 点击设置圆弧端点 A\n"
+            u8"② 点击设置圆弧端点 B\n"
+            u8"③ 拖拽 AB 中垂线上的拱高线段调节弧线，松开后卡尺预览\n"
+            u8"④ 确认后添加圆弧");
+        if (ImGui::Button(u8"重新选点", ImVec2(-1.f, 0))) {
+            ResetArcMeasurePick();
+            arcMeasurePending_ = false;
+            arcMeasurePendingSource_ = -1;
+            arcMeasurePendingResult_ = {};
+            SetStatus(u8"已重置，请重新设置 A 点");
+        }
+        ImGui::Spacing();
+        DrawCaliperLineParamsPanel(lineMeasureParams_, true);
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+
+        if (arcMeasurePending_ && arcMeasurePendingResult_.ok) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.f, 0.85f, 0.45f, 1.f), u8"待确认圆弧卡尺");
+            ImGui::Text(u8"半径 %.3f px  有效点 %d  RMS %.3f px",
+                        arcMeasurePendingResult_.fitRadius, arcMeasurePendingResult_.validCount,
+                        arcMeasurePendingResult_.fitRms);
+            if (ImGui::Button(u8"确认添加圆弧", ImVec2(-1.f, 36.f))) {
+                ConfirmArcMeasure();
+            }
+            if (ImGui::Button(u8"取消预览", ImVec2(-1.f, 0))) {
+                arcMeasurePending_ = false;
+                arcMeasurePendingSource_ = -1;
+                arcMeasurePendingResult_ = {};
+                arcMeasurePhase_ = ArcMeasurePhase::DragBulge;
+                SetStatus(u8"已取消圆弧卡尺预览，可继续调节拱高");
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (!CanUndoMeasuredLine()) ImGui::BeginDisabled();
+        if (ImGui::Button(u8"撤回圆弧 / 预览", ImVec2(-1.f, 0))) {
+            UndoLastMeasuredLine();
+        }
+        if (!CanUndoMeasuredLine()) ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"已提取圆弧 (%zu)", measuredArcs_.size());
+        if (measuredArcs_.empty()) {
+            ImGui::TextDisabled(u8"暂无圆弧，请先设置 A/B 点并调节拱高");
+        } else {
+            for (std::size_t i = 0; i < measuredArcs_.size(); ++i) {
+                const MeasuredImageArc& arc = measuredArcs_[i];
+                const char* imgName = arc.imageSource == 1 ? u8"亮度" : u8"深度";
+                ImGui::PushID(static_cast<int>(i) + 10000);
+                ImGui::Text(u8"圆弧%d", arc.id);
+                ImGui::SameLine();
+                ImGui::TextDisabled(u8"(%s)", imgName);
+                ImGui::Text(u8"半径 %.3f px  有效点 %d  RMS %.3f px", arc.result.fitRadius,
+                            arc.result.validCount, arc.result.fitRms);
+                if (ImGui::Button(u8"删除")) {
+                    measuredArcs_.erase(measuredArcs_.begin() + static_cast<std::ptrdiff_t>(i));
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        if (ImGui::Button(u8"清除全部圆弧", ImVec2(-1.f, 0))) {
+            ClearArcMeasure();
+            arcMeasurePending_ = false;
+            arcMeasurePendingSource_ = -1;
+            arcMeasurePendingResult_ = {};
+            measuredArcs_.clear();
+            nextMeasuredArcId_ = 1;
+            arcDistPickA_ = -1;
+            arcDistPickB_ = -1;
+            arcDistValid_ = false;
+            arcDistSamples_.clear();
+            SetStatus(u8"已清除全部圆弧");
+        }
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::LineDistance) {
+        ImGui::TextWrapped(
+            u8"在图像上直接点击线段选 A、B（或在下方的列表中选），再计算平均间隙。\n"
+            u8"可选线段为当前已提取并显示在图像上的线段（不限于当前正在使用的算子）。");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"算法说明");
+        ImGui::TextWrapped(
+            u8"选为 A 的线段上均匀采样，过每点作垂直于 A 的直线，与线段 B 求交；"
+            u8"无交点不计入，有效距离取平均。");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::DragInt(u8"采样点数", &lineDistSampleCount_, 1, 4, 200);
+        ImGui::TextDisabled(u8"A 线段上的均匀采样数量；越多统计越稳定，但计算稍慢");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"已提取线段 (%zu)", measuredLines_.size());
+        if (measuredLines_.empty()) {
+            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.45f, 1.f),
+                               u8"当前无已显示线段，请先用卡尺提线提取线段");
+        } else {
+            if (measuredLines_.size() < 2) {
+                ImGui::TextColored(ImVec4(1.f, 0.65f, 0.45f, 1.f),
+                                   u8"至少需要 2 条线段才能测量距离");
+            }
+            for (std::size_t i = 0; i < measuredLines_.size(); ++i) {
+                const MeasuredImageLine& line = measuredLines_[i];
+                const char* imgName = line.imageSource == 1 ? u8"亮度" : u8"深度";
+                ImGui::PushID(static_cast<int>(i) + 20000);
+                ImGui::Text(u8"线段%d", line.id);
+                ImGui::SameLine();
+                ImGui::TextDisabled(u8"(%s)", imgName);
+                const bool pickedA = static_cast<int>(i) == lineDistPickA_;
+                const bool pickedB = static_cast<int>(i) == lineDistPickB_;
+                if (pickedA) ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), u8"  [A]");
+                if (pickedB) ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.f, 1.f), u8"  [B]");
+                if (ImGui::Button(u8"选为 A")) {
+                    lineDistPickA_ = static_cast<int>(i);
+                    lineDistValid_ = false;
+                    lineDistSamples_.clear();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(u8"选为 B")) {
+                    lineDistPickB_ = static_cast<int>(i);
+                    lineDistValid_ = false;
+                    lineDistSamples_.clear();
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        if (lineDistPickA_ >= 0 && lineDistPickA_ < static_cast<int>(measuredLines_.size())) {
+            ImGui::Text(u8"A: 线段%d", measuredLines_[static_cast<std::size_t>(lineDistPickA_)].id);
+        } else {
+            ImGui::TextDisabled(u8"A: 未选择");
+        }
+        if (lineDistPickB_ >= 0 && lineDistPickB_ < static_cast<int>(measuredLines_.size())) {
+            ImGui::Text(u8"B: 线段%d", measuredLines_[static_cast<std::size_t>(lineDistPickB_)].id);
+        } else {
+            ImGui::TextDisabled(u8"B: 未选择");
+        }
+        if (ImGui::Button(u8"计算平均间隙", ImVec2(-1.f, 36.f))) {
+            ComputeSelectedLineDistance();
+        }
+        if (lineDistValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"平均间隙 = %.4f px",
+                               lineDistPx_);
+            ImGui::TextDisabled(u8"有效 %zu 点  最小 %.4f  最大 %.4f", lineDistSamples_.size(),
+                                lineDistMinPx_, lineDistMaxPx_);
+        }
+        if (ImGui::Button(u8"清除选线与结果", ImVec2(-1.f, 0))) {
+            ClearLineDistance();
+            SetStatus(u8"已清除线线距离选线与结果");
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::ArcDistance) {
+        ImGui::TextWrapped(
+            u8"在图像上直接点击圆弧选 A、B（或在下方的列表中选），再计算平均间隙。\n"
+            u8"可选圆弧为当前已提取并显示在图像上的圆弧。");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"算法说明");
+        ImGui::TextWrapped(
+            u8"选为 A 的圆弧上均匀采样，过每点作法向（径向）直线，与圆弧 B 求交；"
+            u8"无交点不计入，有效距离取平均。");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::DragInt(u8"采样点数", &arcDistSampleCount_, 1, 4, 200);
+        ImGui::TextDisabled(u8"A 圆弧上的均匀采样数量；越多统计越稳定，但计算稍慢");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"已提取圆弧 (%zu)", measuredArcs_.size());
+        if (measuredArcs_.empty()) {
+            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.45f, 1.f),
+                               u8"当前无已显示圆弧，请先用卡尺提弧提取圆弧");
+        } else {
+            if (measuredArcs_.size() < 2) {
+                ImGui::TextColored(ImVec4(1.f, 0.65f, 0.45f, 1.f),
+                                   u8"至少需要 2 条圆弧才能测量距离");
+            }
+            for (std::size_t i = 0; i < measuredArcs_.size(); ++i) {
+                const MeasuredImageArc& arc = measuredArcs_[i];
+                const char* imgName = arc.imageSource == 1 ? u8"亮度" : u8"深度";
+                ImGui::PushID(static_cast<int>(i) + 30000);
+                ImGui::Text(u8"圆弧%d", arc.id);
+                ImGui::SameLine();
+                ImGui::TextDisabled(u8"(%s)", imgName);
+                const bool pickedA = static_cast<int>(i) == arcDistPickA_;
+                const bool pickedB = static_cast<int>(i) == arcDistPickB_;
+                if (pickedA) ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), u8"  [A]");
+                if (pickedB) ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.f, 1.f), u8"  [B]");
+                if (ImGui::Button(u8"选为 A")) {
+                    arcDistPickA_ = static_cast<int>(i);
+                    arcDistValid_ = false;
+                    arcDistSamples_.clear();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(u8"选为 B")) {
+                    arcDistPickB_ = static_cast<int>(i);
+                    arcDistValid_ = false;
+                    arcDistSamples_.clear();
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        if (arcDistPickA_ >= 0 && arcDistPickA_ < static_cast<int>(measuredArcs_.size())) {
+            ImGui::Text(u8"A: 圆弧%d", measuredArcs_[static_cast<std::size_t>(arcDistPickA_)].id);
+        } else {
+            ImGui::TextDisabled(u8"A: 未选择");
+        }
+        if (arcDistPickB_ >= 0 && arcDistPickB_ < static_cast<int>(measuredArcs_.size())) {
+            ImGui::Text(u8"B: 圆弧%d", measuredArcs_[static_cast<std::size_t>(arcDistPickB_)].id);
+        } else {
+            ImGui::TextDisabled(u8"B: 未选择");
+        }
+        if (ImGui::Button(u8"计算平均间隙", ImVec2(-1.f, 36.f))) {
+            ComputeSelectedArcDistance();
+        }
+        if (arcDistValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"平均间隙 = %.4f px",
+                               arcDistPx_);
+            ImGui::TextDisabled(u8"有效 %zu 点  最小 %.4f  最大 %.4f", arcDistSamples_.size(),
+                                arcDistMinPx_, arcDistMaxPx_);
+        }
+        if (ImGui::Button(u8"清除选弧与结果", ImVec2(-1.f, 0))) {
+            ClearArcDistance();
+            SetStatus(u8"已清除圆弧距离选弧与结果");
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::PointDistance) {
+        ImGui::TextWrapped(u8"在图像上依次点击 A、B 两点，自动记录距离。");
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           pointDistPhase_ == PointPickPhase::PickA ? u8"① 点击设置 A 点"
+                                                                    : u8"② 点击设置 B 点");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"已测距离 (%zu)", measuredPointDists_.size());
+        for (std::size_t i = 0; i < measuredPointDists_.size(); ++i) {
+            const MeasuredPointDist& pd = measuredPointDists_[i];
+            ImGui::PushID(static_cast<int>(i) + 50000);
+            ImGui::Text(u8"测距%d", pd.id);
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"距离 = %.4f px", pd.distance);
+            ImGui::TextDisabled(u8"ΔX %.3f  ΔY %.3f", pd.dx, pd.dy);
+            if (ImGui::Button(u8"删除")) {
+                measuredPointDists_.erase(measuredPointDists_.begin() +
+                                          static_cast<std::ptrdiff_t>(i));
+                ImGui::PopID();
+                break;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (ImGui::Button(u8"清除全部测距", ImVec2(-1, 0))) {
+            measuredPointDists_.clear();
+            nextPointDistId_ = 1;
+            pointDistPhase_ = PointPickPhase::PickA;
+            SetStatus(u8"已清除全部点点距离");
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::LineAngle) {
+        ImGui::TextWrapped(u8"在图像上点击两条线段（或下方列表选），计算夹角。");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"已提取线段 (%zu)", measuredLines_.size());
+        for (std::size_t i = 0; i < measuredLines_.size(); ++i) {
+            const MeasuredImageLine& line = measuredLines_[i];
+            ImGui::PushID(static_cast<int>(i) + 51000);
+            ImGui::Text(u8"线段%d", line.id);
+            if (static_cast<int>(i) == lineAnglePickA_)
+                ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), u8"  [A]");
+            if (static_cast<int>(i) == lineAnglePickB_)
+                ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.f, 1.f), u8"  [B]");
+            if (ImGui::Button(u8"选为 A")) {
+                lineAnglePickA_ = static_cast<int>(i);
+                lineAngleValid_ = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(u8"选为 B")) {
+                lineAnglePickB_ = static_cast<int>(i);
+                lineAngleValid_ = false;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (ImGui::Button(u8"计算夹角", ImVec2(-1, 36.f))) ComputeSelectedLineAngle();
+        if (lineAngleValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"夹角 = %.3f°", lineAngleDeg_);
+        }
+        if (ImGui::Button(u8"清除选线", ImVec2(-1, 0))) ClearLineAngle();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::CircleGap) {
+        ImGui::TextWrapped(u8"在图像上点击两个拟合圆（或下方列表选），计算圆心距与表面间隙。");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"已拟合圆 (%zu)", measuredCircleFits_.size());
+        for (std::size_t i = 0; i < measuredCircleFits_.size(); ++i) {
+            const MeasuredCircleFit& fit = measuredCircleFits_[i];
+            ImGui::PushID(static_cast<int>(i) + 52000);
+            ImGui::Text(u8"圆%d  R=%.3f", fit.id, fit.result.radius);
+            if (static_cast<int>(i) == circleGapPickA_)
+                ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), u8"  [A]");
+            if (static_cast<int>(i) == circleGapPickB_)
+                ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.f, 1.f), u8"  [B]");
+            if (ImGui::Button(u8"选为 A")) {
+                circleGapPickA_ = static_cast<int>(i);
+                circleGapValid_ = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(u8"选为 B")) {
+                circleGapPickB_ = static_cast<int>(i);
+                circleGapValid_ = false;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (ImGui::Button(u8"计算圆间隙", ImVec2(-1, 36.f))) ComputeSelectedCircleGap();
+        if (circleGapValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"圆心距 = %.4f px",
+                               circleGapCenterDist_);
+            ImGui::Text(u8"表面间隙 = %.4f px", circleGapSurfaceGap_);
+        }
+        if (ImGui::Button(u8"清除选圆", ImVec2(-1, 0))) ClearCircleGap();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::PointLineDistance) {
+        ImGui::TextWrapped(u8"先在图像上点击一点，再点击一条线段，计算垂直距离。");
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           pointLinePhase_ == PointPickPhase::PickA ? u8"① 点击选点"
+                                                                    : u8"② 点击选线段");
+        if (ImGui::Button(u8"重新选点", ImVec2(-1, 0))) ClearPointLineDistance();
+        if (ImGui::Button(u8"计算距离", ImVec2(-1, 36.f))) ComputePointLineDistance();
+        if (pointLineValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"垂直距离 = %.4f px",
+                               pointLineDistPx_);
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::CaliperPoint) {
+        ImGui::TextWrapped(u8"在图像上拖拽一条短测量线（搜索方向），松开后提取单个边缘点。");
+        DrawCaliperLineParamsPanel(lineMeasureParams_, false);
+        if (caliperPointPending_ && caliperPointPendingEdge_.valid) {
+            ImGui::TextColored(ImVec4(1.f, 0.85f, 0.45f, 1.f), u8"待确认边缘点");
+            ImGui::Text(u8"位置 (%.2f, %.2f)", caliperPointPendingEdge_.x,
+                        caliperPointPendingEdge_.y);
+            if (ImGui::Button(u8"确认边缘点", ImVec2(-1, 36.f))) ConfirmCaliperPoint();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelCaliperPointPending();
+        }
+        ImGui::TextDisabled(u8"已确认边缘点 (%zu)", measuredCaliperPoints_.size());
+        for (std::size_t i = 0; i < measuredCaliperPoints_.size(); ++i) {
+            const MeasuredCaliperPoint& cp = measuredCaliperPoints_[i];
+            ImGui::PushID(static_cast<int>(i) + 53000);
+            ImGui::Text(u8"E%d  (%.2f, %.2f)", cp.id, cp.x, cp.y);
+            if (ImGui::Button(u8"删除")) {
+                measuredCaliperPoints_.erase(measuredCaliperPoints_.begin() +
+                                             static_cast<std::ptrdiff_t>(i));
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::CaliperCircle) {
+        ImGui::TextWrapped(u8"① 点击设置圆心  ② 拖拽设置半径  ③ 松开后圆卡尺预览");
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           circleCaliperPhase_ == CircleCaliperPhase::PickCenter
+                               ? u8"① 点击设置圆心"
+                               : u8"② 拖拽设置半径");
+        if (ImGui::Button(u8"重新选圆心", ImVec2(-1, 0))) {
+            circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+            CancelCircleCaliperPending();
+        }
+        DrawCaliperLineParamsPanel(lineMeasureParams_, true);
+        if (circleCaliperPending_ && circleCaliperPendingResult_.ok) {
+            ImGui::TextColored(ImVec4(1.f, 0.85f, 0.45f, 1.f), u8"待确认圆卡尺");
+            ImGui::Text(u8"半径 %.3f px  RMS %.3f", circleCaliperPendingResult_.fitRadius,
+                        circleCaliperPendingResult_.fitRms);
+            if (ImGui::Button(u8"确认圆卡尺", ImVec2(-1, 36.f))) ConfirmCircleCaliper();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelCircleCaliperPending();
+        }
+        ImGui::TextDisabled(u8"已确认圆卡尺 (%zu)", measuredCircleCalipers_.size());
+        for (std::size_t i = 0; i < measuredCircleCalipers_.size(); ++i) {
+            const MeasuredCircleCaliper& cc = measuredCircleCalipers_[i];
+            ImGui::PushID(static_cast<int>(i) + 54000);
+            ImGui::Text(u8"圆卡%d  R=%.3f", cc.id, cc.result.fitRadius);
+            if (ImGui::Button(u8"删除")) {
+                measuredCircleCalipers_.erase(measuredCircleCalipers_.begin() +
+                                              static_cast<std::ptrdiff_t>(i));
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::ArcLength) {
+        ImGui::TextWrapped(u8"在图像上点击一条已提取圆弧，计算弧长、弦长与弓高。");
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"已提取圆弧 (%zu)", measuredArcs_.size());
+        for (std::size_t i = 0; i < measuredArcs_.size(); ++i) {
+            const MeasuredImageArc& arc = measuredArcs_[i];
+            ImGui::PushID(static_cast<int>(i) + 55000);
+            ImGui::Text(u8"圆弧%d  R=%.3f", arc.id, arc.result.fitRadius);
+            if (static_cast<int>(i) == arcLengthPick_)
+                ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.f, 1.f), u8"  [已选]");
+            if (ImGui::Button(u8"选择")) PickArcForLength(static_cast<int>(i));
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (ImGui::Button(u8"计算弧长", ImVec2(-1, 36.f))) ComputeSelectedArcLength();
+        if (arcLengthValid_) {
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"弧长 = %.4f px",
+                               arcLengthMetrics_.arcLength);
+            ImGui::Text(u8"弦长 = %.4f px", arcLengthMetrics_.chordLength);
+            ImGui::Text(u8"弓高 = %.4f px", arcLengthMetrics_.sagitta);
+        }
+        if (ImGui::Button(u8"清除选择", ImVec2(-1, 0))) ClearArcLength();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::EllipseFit) {
+        ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), "%s",
+                           ArcMeasurePhaseHint(arcMeasurePhase_));
+        ImGui::TextWrapped(u8"点击已有圆弧，或设置 A/B/拱高提取边缘后拟合椭圆（至少 5 点）。");
+        if (ImGui::Button(u8"重新选点", ImVec2(-1, 0))) {
+            ResetArcMeasurePick();
+            CancelEllipseFitPending();
+        }
+        DrawCaliperLineParamsPanel(lineMeasureParams_, true);
+        if (ellipseFitPending_ && ellipseFitPendingResult_.ok) {
+            ImGui::Text(u8"长轴 %.2f  短轴 %.2f px", ellipseFitPendingResult_.axisA * 2.f,
+                        ellipseFitPendingResult_.axisB * 2.f);
+            if (ImGui::Button(u8"确认椭圆", ImVec2(-1, 36.f))) ConfirmEllipseFit();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelEllipseFitPending();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::ThreePointCircle) {
+        ImGui::TextWrapped(u8"依次点击三个点定圆。");
+        ImGui::TextDisabled(u8"已测 (%zu)", measuredThreePointCircles_.size());
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) {
+            measuredThreePointCircles_.clear();
+            ClearThreePointCircle();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::ParallelLineDistance) {
+        ImGui::TextWrapped(u8"选两条线段，计算平行线间距。");
+        if (ImGui::Button(u8"计算间距", ImVec2(-1, 36.f))) ComputeParallelLineDistance();
+        if (parallelDistValid_)
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"间距 = %.4f px", parallelDistPx_);
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) ClearParallelLineDistance();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::RectCaliper) {
+        ImGui::TextWrapped(u8"拖拽矩形 ROI，四边卡尺提边并拟合最小外接矩形。");
+        DrawCaliperLineParamsPanel(lineMeasureParams_, false);
+        if (rectCaliperPending_ && rectCaliperPendingResult_.ok) {
+            ImGui::Text(u8"%.1f×%.1f px  角度 %.1f°", rectCaliperPendingResult_.width,
+                        rectCaliperPendingResult_.height, rectCaliperPendingResult_.angleDeg);
+            if (ImGui::Button(u8"确认矩形", ImVec2(-1, 36.f))) ConfirmRectCaliper();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelRectCaliperPending();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::ProfileWidth) {
+        ImGui::TextWrapped(u8"拖拽测量线（过槽中心），自动检测两侧边缘宽度。");
+        DrawCaliperLineParamsPanel(lineMeasureParams_, false);
+        if (profileWidthPending_ && profileWidthPendingResult_.ok) {
+            ImGui::Text(u8"宽度 = %.4f px", profileWidthPendingResult_.width);
+            if (ImGui::Button(u8"确认宽度", ImVec2(-1, 36.f))) ConfirmProfileWidth();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelProfileWidthPending();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::PointProjection) {
+        ImGui::TextWrapped(u8"先点击一点，再点击线段，显示垂足与投影参数。");
+        if (ImGui::Button(u8"计算投影", ImVec2(-1, 36.f))) ComputePointProjection();
+        if (pointProjValid_) {
+            ImGui::Text(u8"垂足 (%.2f, %.2f)", pointProjResult_.footX, pointProjResult_.footY);
+            ImGui::Text(u8"垂直距 %.4f  t=%.3f", pointProjResult_.perpDist, pointProjResult_.alongT);
+        }
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) ClearPointProjection();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::Concentricity) {
+        ImGui::TextWrapped(u8"选两个拟合圆，计算圆心偏移量。");
+        if (ImGui::Button(u8"计算同心度", ImVec2(-1, 36.f))) ComputeConcentricity();
+        if (concentricityValid_) {
+            ImGui::Text(u8"ΔX=%.3f  ΔY=%.3f", concentricityResult_.offsetX,
+                        concentricityResult_.offsetY);
+            ImGui::Text(u8"偏移距离 %.4f px", concentricityResult_.offsetDist);
+        }
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) ClearConcentricity();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::Roundness) {
+        ImGui::TextWrapped(u8"点击拟合圆或圆卡尺，计算圆度（RMS/最大最小偏差）。");
+        if (ImGui::Button(u8"计算圆度", ImVec2(-1, 36.f))) ComputeRoundness();
+        if (roundnessValid_) {
+            ImGui::Text(u8"RMS=%.4f  最大=%.4f  最小=%.4f", roundnessResult_.rms,
+                        roundnessResult_.maxDev, roundnessResult_.minDev);
+        }
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) ClearRoundness();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::RegionBlob) {
+        ImGui::TextWrapped(u8"拖拽矩形区域，按阈值统计面积与质心。");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::DragFloat(u8"阈值", &regionBlobThreshold_, 1.f, 0.f, 10000.f);
+        ImGui::Checkbox(u8"大于阈值", &regionBlobGreaterThan_);
+        if (regionBlobPending_ && regionBlobPendingResult_.ok) {
+            ImGui::Text(u8"面积 %d px²  质心 (%.1f, %.1f)", regionBlobPendingResult_.pixelCount,
+                        regionBlobPendingResult_.centroidX, regionBlobPendingResult_.centroidY);
+            if (ImGui::Button(u8"确认区域", ImVec2(-1, 36.f))) ConfirmRegionBlob();
+            if (ImGui::Button(u8"取消预览", ImVec2(-1, 0))) CancelRegionBlobPending();
+        }
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::DepthHeightDiff) {
+        ImGui::TextWrapped(u8"仅在深度图上：依次点击 A、B 两点，读取高度差 ΔZ。");
+        if (depthHeightValid_)
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.75f, 1.f), u8"ΔZ = %.6f", depthHeightDelta_);
+        if (ImGui::Button(u8"清除", ImVec2(-1, 0))) ClearDepthHeightDiff();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    if (image2DTool_ == Image2DTool::DepthProfile) {
+        ImGui::TextWrapped(u8"在深度图上拖拽剖面线，生成高度曲线。");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::DragInt(u8"采样点数", &depthProfileSampleCount_, 1, 8, 512);
+        if (depthProfileValid_ && !depthProfileSamples_.empty()) {
+            std::vector<float> vals;
+            vals.reserve(depthProfileSamples_.size());
+            for (const OpenCv2D::LineProfileSample& s : depthProfileSamples_) {
+                if (!std::isnan(s.value)) vals.push_back(s.value);
+            }
+            if (!vals.empty()) {
+                ImGui::PlotLines(u8"##depthprof", vals.data(), static_cast<int>(vals.size()), 0,
+                                 nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 120));
+            }
+        }
+        if (ImGui::Button(u8"清除剖面", ImVec2(-1, 0))) ClearDepthProfile();
+        ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+        return;
+    }
+
+    ImGui::TextWrapped(
+        u8"① 在右侧图像上拖拽绘制测量方向线（ROI）\n"
+        u8"② 松开后预览卡尺结果，点击「确认」添加线段");
+    ImGui::Spacing();
+    DrawCaliperLineParamsPanel(lineMeasureParams_, false);
+    ImGui::Checkbox(u8"显示测量叠加", &showLineMeasureOverlay_);
+
+    if (lineMeasurePending_ && lineMeasurePendingResult_.ok) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.45f, 1.f), u8"待确认卡尺");
+        ImGui::Text(u8"有效点 %d  RMS %.3f px", lineMeasurePendingResult_.validCount,
+                    lineMeasurePendingResult_.fitRms);
+        if (ImGui::Button(u8"确认添加线段", ImVec2(-1.f, 36.f))) {
+            ConfirmLineMeasure();
+        }
+        if (ImGui::Button(u8"取消预览", ImVec2(-1.f, 0))) {
+            lineMeasurePending_ = false;
+            lineMeasurePendingSource_ = -1;
+            lineMeasurePendingResult_ = {};
+            SetStatus(u8"已取消卡尺预览");
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (!CanUndoMeasuredLine()) ImGui::BeginDisabled();
+    if (ImGui::Button(u8"撤回线段 / 预览", ImVec2(-1.f, 0))) {
+        UndoLastMeasuredLine();
+    }
+    if (!CanUndoMeasuredLine()) ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled(u8"已提取线段 (%zu)", measuredLines_.size());
+    if (measuredLines_.empty()) {
+        ImGui::TextDisabled(u8"暂无线段，请在图像上拖拽提取");
+    } else {
+        for (std::size_t i = 0; i < measuredLines_.size(); ++i) {
+            const MeasuredImageLine& line = measuredLines_[i];
+            const char* imgName = line.imageSource == 1 ? u8"亮度" : u8"深度";
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Text(u8"线段%d", line.id);
+            ImGui::SameLine();
+            ImGui::TextDisabled(u8"(%s)", imgName);
+            ImGui::Text(u8"有效点 %d  RMS %.3f px", line.result.validCount, line.result.fitRms);
+            if (ImGui::Button(u8"删除")) {
+                measuredLines_.erase(measuredLines_.begin() + static_cast<std::ptrdiff_t>(i));
+                if (lineDistPickA_ == static_cast<int>(i))
+                    lineDistPickA_ = -1;
+                else if (lineDistPickA_ > static_cast<int>(i))
+                    --lineDistPickA_;
+                if (lineDistPickB_ == static_cast<int>(i))
+                    lineDistPickB_ = -1;
+                else if (lineDistPickB_ > static_cast<int>(i))
+                    --lineDistPickB_;
+                lineDistValid_ = false;
+                ImGui::PopID();
+                break;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+    }
+
+    if (ImGui::Button(u8"清除全部线段", ImVec2(-1.f, 0))) {
+        ClearAllMeasuredLines();
+        SetStatus(u8"已清除全部线段");
+    }
+}
+
+void Application::Draw2DOperatorMenuItems() {
+    const bool hasImage = depthImage_.valid() || brightnessImage_.valid();
+    if (!hasImage) {
+        ImGui::TextDisabled(u8"请先打开深度图或亮度图");
+        return;
+    }
+
+    const bool caliperLineOn = image2DTool_ == Image2DTool::CaliperLine;
+    if (ImGui::MenuItem(u8"提取线段（卡尺）", nullptr, caliperLineOn)) {
+        if (caliperLineOn) {
+            image2DTool_ = Image2DTool::None;
+            ClearLineMeasure();
+            SetStatus(u8"已退出卡尺提线");
+        } else {
+            image2DTool_ = Image2DTool::CaliperLine;
+            ClearArcMeasure();
+            arcMeasurePending_ = false;
+            arcMeasurePendingSource_ = -1;
+            arcMeasurePendingResult_ = {};
+            showImagePanel_ = true;
+            SetStatus(u8"卡尺提线：在图像上拖拽绘制测量方向线");
+        }
+    }
+    const bool caliperArcOn = image2DTool_ == Image2DTool::CaliperArc;
+    if (ImGui::MenuItem(u8"提取圆弧（卡尺）", nullptr, caliperArcOn)) {
+        if (caliperArcOn) {
+            image2DTool_ = Image2DTool::None;
+            ClearArcMeasure();
+            SetStatus(u8"已退出卡尺提弧");
+        } else {
+            image2DTool_ = Image2DTool::CaliperArc;
+            ClearLineMeasure();
+            ClearArcMeasure();
+            lineMeasurePending_ = false;
+            lineMeasurePendingSource_ = -1;
+            lineMeasurePendingResult_ = {};
+            showImagePanel_ = true;
+            SetStatus(u8"卡尺提弧：先点击 A、B 点，再拖拽拱高线段");
+        }
+    }
+    const bool lineDistOn = image2DTool_ == Image2DTool::LineDistance;
+    if (ImGui::MenuItem(u8"线线距离（平均间隙）", nullptr, lineDistOn)) {
+        if (lineDistOn) {
+            image2DTool_ = Image2DTool::None;
+            SetStatus(u8"已退出线线距离测量");
+        } else {
+            image2DTool_ = Image2DTool::LineDistance;
+            showImagePanel_ = true;
+            if (measuredLines_.empty()) {
+                SetStatus(u8"线线距离：请先在图像上点击已提取的线段（或左侧列表选线）");
+            } else {
+                SetStatus(u8"线线距离：在图像上点击线段选 A、B，再计算平均间隙");
+            }
+        }
+    }
+    const bool arcDistOn = image2DTool_ == Image2DTool::ArcDistance;
+    if (ImGui::MenuItem(u8"圆弧线线距离（平均间隙）", nullptr, arcDistOn)) {
+        if (arcDistOn) {
+            image2DTool_ = Image2DTool::None;
+            SetStatus(u8"已退出圆弧距离测量");
+        } else {
+            image2DTool_ = Image2DTool::ArcDistance;
+            showImagePanel_ = true;
+            if (measuredArcs_.empty()) {
+                SetStatus(u8"圆弧距离：请先在图像上点击已提取的圆弧（或左侧列表选弧）");
+            } else {
+                SetStatus(u8"圆弧距离：在图像上点击圆弧选 A、B，再计算平均间隙");
+            }
+        }
+    }
+    const bool circleFitOn = image2DTool_ == Image2DTool::CircleFit;
+    if (ImGui::MenuItem(u8"拟合圆", nullptr, circleFitOn)) {
+        if (circleFitOn) {
+            image2DTool_ = Image2DTool::None;
+            SetStatus(u8"已退出拟合圆");
+        } else {
+            image2DTool_ = Image2DTool::CircleFit;
+            ClearArcMeasure();
+            CancelCircleFitPending();
+            showImagePanel_ = true;
+            SetStatus(u8"拟合圆：点击已有圆弧，或设置 A/B 后拖拽拱高提取边缘");
+        }
+    }
+    ImGui::Separator();
+    const bool pointDistOn = image2DTool_ == Image2DTool::PointDistance;
+    if (ImGui::MenuItem(u8"点点距离", nullptr, pointDistOn)) {
+        image2DTool_ = pointDistOn ? Image2DTool::None : Image2DTool::PointDistance;
+        pointDistPhase_ = PointPickPhase::PickA;
+        showImagePanel_ = true;
+        SetStatus(pointDistOn ? u8"已退出点点距离" : u8"点点距离：依次点击 A、B 两点");
+    }
+    const bool lineAngleOn = image2DTool_ == Image2DTool::LineAngle;
+    if (ImGui::MenuItem(u8"两线夹角", nullptr, lineAngleOn)) {
+        image2DTool_ = lineAngleOn ? Image2DTool::None : Image2DTool::LineAngle;
+        showImagePanel_ = true;
+        SetStatus(lineAngleOn ? u8"已退出两线夹角" : u8"两线夹角：点击两条已提取线段");
+    }
+    const bool circleGapOn = image2DTool_ == Image2DTool::CircleGap;
+    if (ImGui::MenuItem(u8"圆心距 / 圆间隙", nullptr, circleGapOn)) {
+        image2DTool_ = circleGapOn ? Image2DTool::None : Image2DTool::CircleGap;
+        showImagePanel_ = true;
+        SetStatus(circleGapOn ? u8"已退出圆间隙" : u8"圆间隙：点击两个已拟合圆");
+    }
+    const bool pointLineOn = image2DTool_ == Image2DTool::PointLineDistance;
+    if (ImGui::MenuItem(u8"点线距离", nullptr, pointLineOn)) {
+        image2DTool_ = pointLineOn ? Image2DTool::None : Image2DTool::PointLineDistance;
+        ClearPointLineDistance();
+        showImagePanel_ = true;
+        SetStatus(pointLineOn ? u8"已退出点线距离" : u8"点线距离：先点击一点，再点击线段");
+    }
+    const bool caliperPointOn = image2DTool_ == Image2DTool::CaliperPoint;
+    if (ImGui::MenuItem(u8"单点卡尺", nullptr, caliperPointOn)) {
+        image2DTool_ = caliperPointOn ? Image2DTool::None : Image2DTool::CaliperPoint;
+        CancelCaliperPointPending();
+        showImagePanel_ = true;
+        SetStatus(caliperPointOn ? u8"已退出单点卡尺" : u8"单点卡尺：拖拽测量方向线提取边缘");
+    }
+    const bool caliperCircleOn = image2DTool_ == Image2DTool::CaliperCircle;
+    if (ImGui::MenuItem(u8"圆卡尺（整圆）", nullptr, caliperCircleOn)) {
+        image2DTool_ = caliperCircleOn ? Image2DTool::None : Image2DTool::CaliperCircle;
+        circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+        CancelCircleCaliperPending();
+        showImagePanel_ = true;
+        SetStatus(caliperCircleOn ? u8"已退出圆卡尺" : u8"圆卡尺：点击圆心后拖拽半径");
+    }
+    const bool arcLengthOn = image2DTool_ == Image2DTool::ArcLength;
+    if (ImGui::MenuItem(u8"弧长 / 弦长", nullptr, arcLengthOn)) {
+        image2DTool_ = arcLengthOn ? Image2DTool::None : Image2DTool::ArcLength;
+        ClearArcLength();
+        showImagePanel_ = true;
+        SetStatus(arcLengthOn ? u8"已退出弧长测量" : u8"弧长：点击一条已提取圆弧");
+    }
+    ImGui::Separator();
+    auto toggleTool = [&](const char* label, Image2DTool tool, const char* onMsg, const char* offMsg) {
+        const bool on = image2DTool_ == tool;
+        if (ImGui::MenuItem(label, nullptr, on)) {
+            image2DTool_ = on ? Image2DTool::None : tool;
+            showImagePanel_ = true;
+            SetStatus(on ? offMsg : onMsg);
+        }
+    };
+    toggleTool(u8"三点定圆", Image2DTool::ThreePointCircle, u8"三点定圆：依次点击三个点",
+               u8"已退出三点定圆");
+    toggleTool(u8"平行线距离", Image2DTool::ParallelLineDistance, u8"平行线距离：点击两条线段",
+               u8"已退出平行线距离");
+    toggleTool(u8"矩形卡尺", Image2DTool::RectCaliper, u8"矩形卡尺：拖拽矩形 ROI",
+               u8"已退出矩形卡尺");
+    toggleTool(u8"拟合椭圆", Image2DTool::EllipseFit, u8"拟合椭圆：点击圆弧或沿弧提取",
+               u8"已退出拟合椭圆");
+    toggleTool(u8"剖面测宽", Image2DTool::ProfileWidth, u8"剖面测宽：拖拽测量线",
+               u8"已退出剖面测宽");
+    toggleTool(u8"投影点 / 垂足", Image2DTool::PointProjection, u8"投影点：先点选再选线段",
+               u8"已退出投影点");
+    toggleTool(u8"同心度", Image2DTool::Concentricity, u8"同心度：点击两个拟合圆", u8"已退出同心度");
+    toggleTool(u8"圆度", Image2DTool::Roundness, u8"圆度：点击圆后计算", u8"已退出圆度");
+    toggleTool(u8"区域面积 / 质心", Image2DTool::RegionBlob, u8"区域分析：拖拽矩形",
+               u8"已退出区域分析");
+    toggleTool(u8"两点高度差", Image2DTool::DepthHeightDiff, u8"高度差：深度图点击两点",
+               u8"已退出高度差");
+    toggleTool(u8"剖面高度曲线", Image2DTool::DepthProfile, u8"深度剖面：拖拽剖面线",
+               u8"已退出深度剖面");
+    if (ImGui::MenuItem(u8"清除全部线段", nullptr, false, !measuredLines_.empty())) {
+        ClearMeasuredLinesOnly();
+        SetStatus(u8"已清除全部线段");
+    }
+    if (ImGui::MenuItem(u8"清除全部圆弧", nullptr, false, !measuredArcs_.empty())) {
+        ClearMeasuredArcsOnly();
+        SetStatus(u8"已清除全部圆弧及关联圆/椭圆拟合");
+    }
+    if (ImGui::MenuItem(u8"清除全部 2D 测量", nullptr, false,
+                        depthImage_.valid() || brightnessImage_.valid())) {
+        ClearAllMeasuredLines();
+        SetStatus(u8"已清除全部 2D 测量叠加");
+    }
+    if (image2DTool_ != Image2DTool::None) {
+        ImGui::Separator();
+        ImGui::TextDisabled(u8"参数与线段列表见左侧工具面板");
+    }
 }
 
 void Application::DrawFilterMenuItems() {
@@ -3594,15 +7656,32 @@ void Application::DrawViewAxisWidget(float contentTop, float contentBottom, floa
 }
 
 void Application::DrawToolPanel() {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.85f, 0.90f, 1.f));
-    ImGui::TextUnformatted(ToolModeLabel(measure_.mode));
-    ImGui::PopStyleColor();
-    ImGui::TextDisabled(u8"当前工具参数与说明");
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    const UiPalette& pal = GetUiPalette();
+    if (image2DTool_ != Image2DTool::None || view2DMode_) {
+        if (image2DTool_ != Image2DTool::None) {
+            UiSectionHeader(Image2DToolLabel(image2DTool_), u8"2D 算子 — 参数与结果", &pal.tool2D);
+        } else {
+            UiSectionHeader(u8"2D 模式", u8"请从「2D算子」启用卡尺提线等工具", &pal.tool2D);
+        }
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, pal.panelRaised);
+        ImGui::PushStyleColor(ImGuiCol_Border, pal.border);
+        ImGui::BeginChild(u8"##toolhelp", ImVec2(0, 0), true);
+        if (image2DTool_ != Image2DTool::None) {
+            DrawImage2DToolPanel();
+        } else {
+            ImGui::TextWrapped(
+                u8"当前为 2D 模式，点云视区已隐藏。\n"
+                u8"请打开深度图/亮度图，并在菜单「2D算子」中启用卡尺提线。");
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        return;
+    }
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.11f, 0.13f, 0.15f, 1.f));
+    UiSectionHeader(ToolModeLabel(measure_.mode), u8"当前工具参数与说明", &pal.tool3D);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, pal.panelRaised);
+    ImGui::PushStyleColor(ImGuiCol_Border, pal.border);
     ImGui::BeginChild(u8"##toolhelp", ImVec2(0, 0), true);
 
     switch (measure_.mode) {
@@ -3634,7 +7713,7 @@ void Application::DrawToolPanel() {
                 measure_.distA.reset();
                 measure_.distB.reset();
                 measure_.distance = 0.f;
-                measure_.status = u8"已清除测距标记";
+                SetStatus(u8"已清除测距标记");
                 UpdateOverlays();
             }
             break;
@@ -3647,17 +7726,17 @@ void Application::DrawToolPanel() {
             ImGui::Spacing();
             if (ImGui::Button(u8"对框选区域拟合平面", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域，或改用“对全部可见点拟合”";
+                    SetStatus(u8"请先框选区域，或改用“对全部可见点拟合”");
                 } else {
                     std::string error;
                     PlaneModel plane;
                     if (FitPlaneWithBackend(measure_.roiIndices, plane, error, algoBackend_)) {
                         measure_.plane = plane;
                         UpdateOverlays();
-                        measure_.status = std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
-                                          u8" 框选拟合完成";
+                        SetStatus(std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
+                                  u8" 框选拟合完成");
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
@@ -3668,14 +7747,59 @@ void Application::DrawToolPanel() {
                 if (FitPlaneWithBackend(empty, plane, error, algoBackend_)) {
                     measure_.plane = plane;
                     UpdateOverlays();
-                    measure_.status =
-                        std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
-                                          u8" 全点云拟合完成";
+                    SetStatus(std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
+                              u8" 全点云拟合完成");
                 } else {
-                    measure_.status = error;
+                    SetStatus(error);
                 }
             }
             if (measure_.plane && ImGui::Button(u8"清除拟合平面显示", ImVec2(-1, 0))) {
+                measure_.plane.reset();
+                UpdateOverlays();
+            }
+            break;
+        case ToolMode::PlaneAlign:
+            ImGui::TextWrapped(
+                u8"线扫倾斜校正：\n"
+                u8"① 在工件平整区域拖拽框选基准面\n"
+                u8"② 选择摆正目标（通常选水平面 +Z）\n"
+                u8"③ 点击执行，整体旋转点云使基准面水平\n"
+                u8"④ 橙色面为拟合预览，可 Ctrl+Z 撤销");
+            ImGui::Text(u8"当前框选: %zu 点", measure_.roiIndices.size());
+            ImGui::Spacing();
+            ImGui::TextDisabled(u8"摆正目标（基准面法向对齐）");
+            if (ImGui::RadioButton(u8"水平面 (+Z)", planeAlignTarget_ == 0)) planeAlignTarget_ = 0;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"+Y", planeAlignTarget_ == 1)) planeAlignTarget_ = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"+X", planeAlignTarget_ == 2)) planeAlignTarget_ = 2;
+            ImGui::Spacing();
+            if (ImGui::Button(u8"执行平面校准", ImVec2(-1, 40.f))) {
+                AlignCloudToReferencePlane(&measure_.roiIndices, nullptr);
+            }
+            if (ImGui::Button(u8"仅预览拟合平面（不旋转）", ImVec2(-1, 0))) {
+                if (measure_.roiIndices.empty()) {
+                    SetStatus(u8"请先框选基准平面区域");
+                } else {
+                    std::string error;
+                    PlaneModel plane;
+                    if (FitPlaneWithBackend(measure_.roiIndices, plane, error, algoBackend_)) {
+                        measure_.plane = plane;
+                        UpdateOverlays();
+                        char buf[160];
+                        std::snprintf(buf, sizeof(buf), u8"基准面预览 RMS=%.4f mm，确认后点「执行平面校准」",
+                                      plane.rms);
+                        SetStatus(buf);
+                    } else {
+                        SetStatus(error);
+                    }
+                }
+            }
+            if (measure_.plane &&
+                ImGui::Button(u8"以当前预览平面执行校准", ImVec2(-1, 0))) {
+                AlignCloudToReferencePlane(nullptr, &*measure_.plane);
+            }
+            if (measure_.plane && ImGui::Button(u8"清除平面预览", ImVec2(-1, 0))) {
                 measure_.plane.reset();
                 UpdateOverlays();
             }
@@ -3696,7 +7820,7 @@ void Application::DrawToolPanel() {
             ImGui::Spacing();
             if (ImGui::Button(u8"对框选区域拟合", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域，或改用“对全部可见点拟合”";
+                    SetStatus(u8"请先框选区域，或改用“对全部可见点拟合”");
                 } else {
                     std::string error;
                     SphereModel sphere;
@@ -3711,9 +7835,9 @@ void Application::DrawToolPanel() {
                                       u8"%s 完成 R=%.6f RMS=%.6f（内点 %zu）",
                                       AlgorithmBackendLabel(EffectiveAlgoBackend()), sphere.radius,
                                       sphere.rms, sphere.inlierIndices.size());
-                        measure_.status = buf;
+                        SetStatus(buf);
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
@@ -3731,9 +7855,9 @@ void Application::DrawToolPanel() {
                     std::snprintf(buf, sizeof(buf), u8"%s 全点云拟合 R=%.6f RMS=%.6f（内点 %zu）",
                                   AlgorithmBackendLabel(EffectiveAlgoBackend()), sphere.radius,
                                   sphere.rms, sphere.inlierIndices.size());
-                    measure_.status = buf;
+                    SetStatus(buf);
                 } else {
-                    measure_.status = error;
+                    SetStatus(error);
                 }
             }
             if (measure_.sphere) {
@@ -3760,7 +7884,7 @@ void Application::DrawToolPanel() {
             ImGui::Spacing();
             if (ImGui::Button(u8"对框选区域拟合圆", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域，或改用“对全部可见点拟合”";
+                    SetStatus(u8"请先框选区域，或改用“对全部可见点拟合”");
                 } else {
                     std::string error;
                     CircleModel circle;
@@ -3779,9 +7903,9 @@ void Application::DrawToolPanel() {
                                       u8"%s 圆拟合 R=%.6f RMS=%.6f（近圆点 %zu）",
                                       AlgorithmBackendLabel(EffectiveAlgoBackend()), circle.radius,
                                       circle.rms, circle.inlierIndices.size());
-                        measure_.status = buf;
+                        SetStatus(buf);
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
@@ -3803,9 +7927,9 @@ void Application::DrawToolPanel() {
                     std::snprintf(buf, sizeof(buf), u8"%s 全点云圆拟合 R=%.6f RMS=%.6f（近圆点 %zu）",
                                   AlgorithmBackendLabel(EffectiveAlgoBackend()), circle.radius,
                                   circle.rms, circle.inlierIndices.size());
-                    measure_.status = buf;
+                    SetStatus(buf);
                 } else {
-                    measure_.status = error;
+                    SetStatus(error);
                 }
             }
             if (measure_.circle) {
@@ -3837,7 +7961,7 @@ void Application::DrawToolPanel() {
             ImGui::Spacing();
             if (ImGui::Button(u8"对框选区域拟合圆柱", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域，或改用“对全部可见点拟合”";
+                    SetStatus(u8"请先框选区域，或改用“对全部可见点拟合”");
                 } else {
                     std::string error;
                     CylinderModel cyl;
@@ -3851,9 +7975,9 @@ void Application::DrawToolPanel() {
                                       u8"%s 圆柱拟合完成 R=%.6f RMS=%.6f（%d 点）",
                                       AlgorithmBackendLabel(EffectiveAlgoBackend()), cyl.radius,
                                       cyl.rms, cyl.pointCount);
-                        measure_.status = buf;
+                        SetStatus(buf);
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
@@ -3870,9 +7994,9 @@ void Application::DrawToolPanel() {
                     std::snprintf(buf, sizeof(buf), u8"%s 全点云圆柱拟合 R=%.6f RMS=%.6f",
                                   AlgorithmBackendLabel(EffectiveAlgoBackend()), cyl.radius,
                                   cyl.rms);
-                    measure_.status = buf;
+                    SetStatus(buf);
                 } else {
-                    measure_.status = error;
+                    SetStatus(error);
                 }
             }
             if (measure_.cylinder) {
@@ -3913,9 +8037,9 @@ void Application::DrawToolPanel() {
                                   AlgorithmBackendLabel(EffectiveAlgoBackend()),
                                   measure_.flatness.peakToValley, measure_.flatness.rms,
                                   measure_.flatness.plane.pointCount);
-                    measure_.status = buf;
+                    SetStatus(buf);
                 } else {
-                    measure_.status = error;
+                    SetStatus(error);
                 }
             }
             if (measure_.flatness.valid) {
@@ -3955,7 +8079,7 @@ void Application::DrawToolPanel() {
 
             if (ImGui::Button(u8"对区域 A 拟合平面", ImVec2(-1, 32.f))) {
                 if (sg.regionA.empty()) {
-                    measure_.status = u8"请先框选区域 A";
+                    SetStatus(u8"请先框选区域 A");
                 } else {
                     std::string error;
                     PlaneModel plane;
@@ -3966,19 +8090,18 @@ void Application::DrawToolPanel() {
                         sg.phase = StepGapPhase::SelectB;
                         measure_.plane = plane;
                         UpdateOverlays();
-                        measure_.status = std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) +
-                                          u8" 区域 A 平面已拟合，请框选区域 B";
+                        SetStatus(std::string(AlgorithmBackendLabel(EffectiveAlgoBackend())) + u8" 区域 A 平面已拟合，请框选区域 B");
                         needUpload_ = true;
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
             if (ImGui::Button(u8"计算段差 ΔZ", ImVec2(-1, 32.f))) {
                 if (sg.regionA.empty()) {
-                    measure_.status = u8"请先框选区域 A";
+                    SetStatus(u8"请先框选区域 A");
                 } else if (sg.regionB.empty()) {
-                    measure_.status = u8"请先框选区域 B";
+                    SetStatus(u8"请先框选区域 B");
                 } else {
                     std::string error;
                     if (ComputeStepGapZHeightWithBackend(sg.regionA, sg.regionB, sg, error,
@@ -3989,9 +8112,9 @@ void Application::DrawToolPanel() {
                         std::snprintf(buf, sizeof(buf),
                                       u8"段差 ΔZ=%.6f（中位 %.6f，B=%zu 点）", sg.mean, sg.median,
                                       sg.regionB.size());
-                        measure_.status = buf;
+                        SetStatus(buf);
                     } else {
-                        measure_.status = error;
+                        SetStatus(error);
                     }
                 }
             }
@@ -4012,7 +8135,7 @@ void Application::DrawToolPanel() {
                 measure_.plane.reset();
                 needUpload_ = true;
                 UpdateOverlays();
-                measure_.status = u8"段差：先框选基准区域 A";
+                SetStatus(u8"段差：先框选基准区域 A");
             }
             break;
         }
@@ -4052,12 +8175,11 @@ void Application::DrawToolPanel() {
             ImGui::Spacing();
             if (ImGui::Button(u8"清除框选内的点", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域";
+                    SetStatus(u8"请先框选区域");
                 } else {
                     PushHistory(u8"清除框内点");
                     ApplyRoiDeleteWithBackend(measure_.roiIndices, true);
-                    measure_.status = std::string(u8"已清除框内点，可见 ") +
-                                      std::to_string(EditableCloud().VisibleCount());
+                    SetStatus(std::string(u8"已清除框内点，可见 ") + std::to_string(EditableCloud().VisibleCount()));
                     measure_.roiIndices.clear();
                     if (activeCloudPane_ == 1 && DualCloudViewActive()) {
                         needUploadFilled_ = true;
@@ -4068,12 +8190,11 @@ void Application::DrawToolPanel() {
             }
             if (ImGui::Button(u8"清除框选外的点（只留框内）", ImVec2(-1, 32.f))) {
                 if (measure_.roiIndices.empty()) {
-                    measure_.status = u8"请先框选区域";
+                    SetStatus(u8"请先框选区域");
                 } else {
                     PushHistory(u8"清除框外点");
                     ApplyRoiDeleteWithBackend(measure_.roiIndices, false);
-                    measure_.status = std::string(u8"已清除框外点，可见 ") +
-                                      std::to_string(EditableCloud().VisibleCount());
+                    SetStatus(std::string(u8"已清除框外点，可见 ") + std::to_string(EditableCloud().VisibleCount()));
                     measure_.roiIndices.clear();
                     if (activeCloudPane_ == 1 && DualCloudViewActive()) {
                         needUploadFilled_ = true;
@@ -4086,7 +8207,7 @@ void Application::DrawToolPanel() {
                 PushHistory(u8"恢复全部点前");
                 RestoreAllPointsWithBackend();
                 measure_.clipEnabled = false;
-                measure_.status = u8"已恢复全部点";
+                SetStatus(u8"已恢复全部点");
                 needUpload_ = true;
             }
             ImGui::Spacing();
@@ -4096,14 +8217,14 @@ void Application::DrawToolPanel() {
                              measure_.roiFillGridStep <= 0.f ? u8"自动" : "%.3f");
             if (ImGui::Button(u8"执行：投影并填充", ImVec2(-1, 36.f))) {
                 std::string err;
-                if (!RunRoiProjectFill(err)) measure_.status = err;
+                if (!RunRoiProjectFill(err)) SetStatus(err);
             }
             if (DualCloudViewActive()) {
                 ImGui::Text(u8"填充 %zu 点（叠加原始参考 %zu 点，仅显示）", filledCloud_.points.size(),
                             cloud_.VisibleCount());
                 if (ImGui::Button(u8"关闭填充视图", ImVec2(-1, 0))) {
                     CloseDualCloudView();
-                    measure_.status = u8"已关闭填充视图";
+                    SetStatus(u8"已关闭填充视图");
                 }
             }
             ImGui::TextWrapped(
@@ -4145,7 +8266,7 @@ void Application::DrawToolPanel() {
                 measure_.stepB.reset();
                 measure_.stepDeltaZ = 0.f;
                 UpdateOverlays();
-                measure_.status = u8"已清除台阶测量";
+                SetStatus(u8"已清除台阶测量");
             }
             break;
         case ToolMode::Section: {
@@ -4189,6 +8310,11 @@ void Application::DrawToolPanel() {
             if (ImGui::Button(u8"生成截面", ImVec2(-1, 36.f))) {
                 GenerateSection();
             }
+            if (!showSectionPanel_) {
+                if (ImGui::Button(u8"显示 2D 轮廓窗口", ImVec2(-1, 0))) {
+                    showSectionPanel_ = true;
+                }
+            }
             if (ImGui::Button(u8"清除截面结果", ImVec2(-1, 0))) {
                 measure_.section.points.clear();
                 measure_.section.pickA.reset();
@@ -4196,7 +8322,7 @@ void Application::DrawToolPanel() {
                 measure_.section.lineDistance = 0.f;
                 measure_.section.zDistance = 0.f;
                 SyncSectionCutPlane();
-                measure_.status = u8"已清除截面轮廓（切面仍可拖拽）";
+                SetStatus(u8"已清除截面轮廓（切面仍可拖拽）");
             }
             if (!measure_.section.points.empty()) {
                 ImGui::Text(u8"已生成 %zu 个轮廓点", measure_.section.points.size());
@@ -4210,18 +8336,18 @@ void Application::DrawToolPanel() {
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(2);
 }
 
 void Application::DrawUi() {
+    const UiPalette& pal = GetUiPalette();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float sidebarW = 320.f;
-    const float statusH = 42.f;
-    const float toolbarH = 40.f;
+    const float sidebarW = SidebarWidth();
+    const float consoleH = ConsoleHeight();
+    const float toolbarH = 44.f;
 
     const float menuBottom = DrawMenuBar();
 
-    // 算法编辑器：独占菜单下方区域，不显示点云侧栏/状态/叠加层
     if (algoEditor_.IsVisible()) {
         AlgoHost host;
         host.currentCloud = &cloud_;
@@ -4232,84 +8358,92 @@ void Application::DrawUi() {
         DrawAboutPopup();
         DrawNativeAlgoPasswordPopup();
         DrawCreatePopups();
-        algoEditor_.Draw(menuBottom);
+        algoEditor_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
         return;
     }
 
     DrawToolbar(menuBottom, toolbarH);
     const float contentTop = menuBottom + toolbarH;
-    const float contentH = vp->Pos.y + vp->Size.y - contentTop - statusH;
+    const float contentH = vp->Pos.y + vp->Size.y - contentTop - consoleH;
     UpdateView3dLayout(contentTop, contentH, sidebarW);
 
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, contentTop));
     ImGui::SetNextWindowSize(ImVec2(sidebarW, contentH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.panel);
     ImGui::Begin(u8"##侧栏", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    ImGui::TextDisabled(u8"点云信息");
-    ImGui::BeginChild(u8"##info", ImVec2(0, 118.f), true);
-    ImGui::Text(u8"总点数　%d", static_cast<int>(cloud_.points.size()));
-    ImGui::Text(u8"可见　　%d", static_cast<int>(cloud_.VisibleCount()));
-    ImGui::Text(u8"GPU显示 %d", gpuPointCount_);
-    if (cloud_.bounds.Valid()) {
-        const Vec3 e = cloud_.bounds.Extent();
-        ImGui::Text(u8"尺寸  %.2f × %.2f × %.2f mm", e.x, e.y, e.z);
-        const Vec3 off = cloud_.originOffset;
-        ImGui::TextDisabled(u8"原点偏移 %.3f, %.3f, %.3f", off.x, off.y, off.z);
-    } else {
-        ImGui::TextDisabled(u8"尚未加载点云");
+    UiSectionHeader(u8"点云信息", nullptr, &pal.sectionTitle);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, pal.panelRaised);
+    ImGui::PushStyleColor(ImGuiCol_Border, pal.border);
+    ImGui::BeginChild(u8"##info", ImVec2(0, 128.f), true);
+    {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(cloud_.points.size()));
+        UiInfoRow(u8"总点数", buf);
+        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(cloud_.VisibleCount()));
+        UiInfoRow(u8"可见点", buf, &pal.success);
+        std::snprintf(buf, sizeof(buf), "%d", gpuPointCount_);
+        UiInfoRow(u8"GPU 显示", buf, &pal.accent);
+        if (cloud_.bounds.Valid()) {
+            const Vec3 e = cloud_.bounds.Extent();
+            std::snprintf(buf, sizeof(buf), u8"%.2f × %.2f × %.2f", e.x, e.y, e.z);
+            UiInfoRow(u8"尺寸 mm", buf);
+            const Vec3 off = cloud_.originOffset;
+            std::snprintf(buf, sizeof(buf), u8"%.3f, %.3f, %.3f", off.x, off.y, off.z);
+            UiInfoRow(u8"原点偏移", buf);
+        } else {
+            UiInfoRow(u8"状态", u8"尚未加载点云", &pal.textMuted);
+        }
     }
     ImGui::EndChild();
+    ImGui::PopStyleColor(2);
 
-    ImGui::Spacing();
-    ImGui::Separator();
     ImGui::Spacing();
     DrawToolPanel();
 
     ImGui::End();
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + vp->Size.y - statusH));
-    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, statusH));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 11.f));
-    ImGui::Begin(u8"##状态栏", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse);
-    ImGui::TextColored(ImVec4(0.45f, 0.80f, 0.85f, 1.f), u8"状态");
-    ImGui::SameLine(0.f, 12.f);
-    ImGui::TextUnformatted(measure_.status.c_str());
-    ImGui::End();
-    ImGui::PopStyleVar(2);
+    DrawSidebarSplitter(contentTop, contentH);
+    DrawConsoleSplitter(contentTop, contentH);
+    DrawConsolePanel();
 
-    if (measure_.mode == ToolMode::Section) {
+    if (measure_.mode == ToolMode::Section && showSectionPanel_) {
         DrawSectionPanel();
     }
     if (measure_.mode == ToolMode::StepGap && measure_.stepGap.hasDistances) {
         DrawStepGapPanel();
     }
 
-    if (cloud_.points.empty()) {
+    if (cloud_.points.empty() && !view2DMode_) {
         ImDrawList* tipDl = ImGui::GetBackgroundDrawList();
         const float cx = view3dX_ + view3dW_ * 0.5f;
         const float cy = contentTop + contentH * 0.45f;
         const char* tip = u8"打开点云文件开始查看";
         const ImVec2 sz = ImGui::CalcTextSize(tip);
-        tipDl->AddText(ImVec2(cx - sz.x * 0.5f, cy), IM_COL32(130, 155, 165, 200), tip);
+        const ImVec2 p0(cx - sz.x * 0.5f - 16.f, cy - 14.f);
+        const ImVec2 p1(cx + sz.x * 0.5f + 16.f, cy + sz.y + 14.f);
+        tipDl->AddRectFilled(p0, p1, IM_COL32(20, 28, 38, 180), 8.f);
+        tipDl->AddRect(p0, p1, IM_COL32(60, 180, 200, 80), 8.f, 0, 1.f);
+        tipDl->AddText(ImVec2(cx - sz.x * 0.5f, cy), IM_COL32(140, 175, 190, 230), tip);
     }
 
-    DrawViewAxisWidget(contentTop, contentTop + contentH, sidebarW);
+    if (!view2DMode_) DrawViewAxisWidget(contentTop, contentTop + contentH, SidebarWidth());
     DrawImagePanel();
-    // 左边缘拖拽可能改了宽度，同帧刷新点云视区，避免差一帧
-    UpdateView3dLayout(contentTop, contentH, sidebarW);
+    UpdateView3dLayout(contentTop, contentH, SidebarWidth());
     DrawAboutPopup();
     DrawNativeAlgoPasswordPopup();
     DrawCreatePopups();
-    DrawDualCloudPaneLabels();
-    DrawOverlays();
+    if (!view2DMode_) {
+        DrawDualCloudPaneLabels();
+        DrawOverlays();
+    }
 }
 
 void Application::Run() {
@@ -4329,10 +8463,13 @@ void Application::Run() {
         glfwGetFramebufferSize(window_, &fbW_, &fbH_);
         glDisable(GL_SCISSOR_TEST);
         glViewport(0, 0, fbW_, fbH_);
-        glClearColor(0.07f, 0.08f, 0.10f, 1.f);
+        {
+            const UiPalette& pal = GetUiPalette();
+            glClearColor(pal.bgDeep.x, pal.bgDeep.y, pal.bgDeep.z, pal.bgDeep.w);
+        }
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        if (!algoEditor_.IsVisible()) {
+        if (!algoEditor_.IsVisible() && !view2DMode_) {
             if (DualCloudViewActive()) {
                 int vx = 0, vy = 0, vw = 0, vh = 0;
                 GetCloudPaneGlViewport(1, vx, vy, vw, vh);

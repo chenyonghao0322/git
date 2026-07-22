@@ -962,13 +962,13 @@ void AlgorithmEditor::RunGraph() {
     runStatusOk_ = true;
 }
 
-void AlgorithmEditor::Draw(float menuBottomY) {
+void AlgorithmEditor::Draw(float menuBottomY, float bottomInset) {
     if (!visible_) return;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float windowH = std::max(vp->Size.y - menuBottomY - bottomInset, 1.f);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, menuBottomY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Pos.y + vp->Size.y - menuBottomY),
-                             ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, windowH), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(1.f);
     if (focusOnOpen_) {
         ImGui::SetNextWindowFocus();

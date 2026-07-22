@@ -13,6 +13,10 @@ endif()
 set(PCL_DIR "D:/software/PCL 1.14.0/cmake" CACHE PATH "PCL cmake directory")
 find_package(PCL 1.14 REQUIRED COMPONENTS common filters sample_consensus segmentation search kdtree features)
 
+# ---------- OpenCV ----------
+set(OpenCV_DIR "D:/software/opencv-4.12.0/opencv/build/x64/vc16/lib" CACHE PATH "OpenCV cmake directory")
+find_package(OpenCV 4.12 REQUIRED)
+
 # ---------- GLFW ----------
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -53,6 +57,7 @@ add_executable(PointCloudViewer
     src/tools/PclAdapter.cpp
     src/tools/PclTools.cpp
     src/tools/UndoHistory.cpp
+    src/tools/OpenCv2D.cpp
     src/app/Application.cpp
     src/app/FileDialog.cpp
     src/app/UiTheme.cpp
@@ -70,7 +75,8 @@ target_include_directories(PointCloudViewer PRIVATE
 )
 
 target_link_directories(PointCloudViewer PRIVATE ${PCL_LIBRARY_DIRS})
-target_link_libraries(PointCloudViewer PRIVATE imgui glfw ${PCL_LIBRARIES})
+target_link_libraries(PointCloudViewer PRIVATE imgui glfw ${PCL_LIBRARIES} ${OpenCV_LIBS})
+target_include_directories(PointCloudViewer PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(PointCloudViewer PRIVATE ${PCL_DEFINITIONS})
 
 if(WIN32)
@@ -85,6 +91,13 @@ if(WIN32)
     add_custom_command(TARGET PointCloudViewer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${_pcl_root}/bin"
+            $<TARGET_FILE_DIR:PointCloudViewer>
+    )
+
+    set(_opencv_bin "D:/software/opencv-4.12.0/opencv/build/x64/vc16/bin")
+    add_custom_command(TARGET PointCloudViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_opencv_bin}/opencv_world4120.dll"
             $<TARGET_FILE_DIR:PointCloudViewer>
     )
 endif()
