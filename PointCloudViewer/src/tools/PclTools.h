@@ -58,7 +58,6 @@ bool ExtractSection(const PointCloud& cloud, bool cutAlongX, float position, flo
                     SectionData& out, std::string& error, int maxPoints = 200000);
 
 // --- 点云编辑 ---
-void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);  // 半空间剖切掩码
 
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices,
                     bool deleteInside);  // true=删框内 false=只留框内
@@ -102,5 +101,25 @@ bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::
                                 const Vec3& clipCenter, float clipRadius, PointCloud& filledOut,
                                 CircleModel& circleOut, PlaneModel& planeOut, float& outGridStep,
                                 std::string& error);
+
+// --- ICP 配准 ---
+struct IcpParams {
+    float maxCorrespondenceDist = 5.f;  // 最大对应距离（世界坐标 mm）
+    int maxIterations = 50;
+    float transEpsilon = 1e-8f;
+    float euclideanEpsilon = 1e-6f;
+    float voxelLeaf = 0.f;  // 配准前体素下采样，0=不下采样
+    bool useCentroidInit = true;
+};
+
+struct IcpResult {
+    bool success = false;
+    bool converged = false;
+    float fitnessScore = 0.f;
+    float transform[16]{};  // 行主序 4×4，作用于源点世界坐标
+};
+
+bool RunIcp(const PointCloud& target, const PointCloud& source, const IcpParams& params,
+            IcpResult& result, PointCloud& alignedSourceOut, std::string& error);
 
 }  // namespace PclTools

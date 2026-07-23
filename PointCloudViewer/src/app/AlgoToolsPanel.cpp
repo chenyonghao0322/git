@@ -24,15 +24,13 @@ const char* ToolModeLabel(ToolMode mode) {
         case ToolMode::SphereFit:
             return u8"球面拟合";
         case ToolMode::SphereBodyFit:
-            return u8"球体拟合";
+            return u8"球面拟合";
         case ToolMode::CircleFit:
             return u8"圆拟合";
         case ToolMode::CylinderFit:
             return u8"圆柱拟合";
         case ToolMode::Roi:
             return u8"ROI框选";
-        case ToolMode::ClipPlane:
-            return u8"剖切平面";
         case ToolMode::Section:
             return u8"截面";
         case ToolMode::StepHeight:
@@ -41,6 +39,8 @@ const char* ToolModeLabel(ToolMode mode) {
             return u8"平面度";
         case ToolMode::StepGap:
             return u8"段差计算";
+        case ToolMode::Icp:
+            return u8"ICP 配准";
     }
     return u8"工具";
 }
@@ -78,13 +78,15 @@ void DrawToolsTab(const AlgoToolsHost& host) {
     ToolButton(host, ToolMode::Distance);
     ToolButton(host, ToolMode::Roi);
     ToolButton(host, ToolMode::PlaneAlign);
-    ToolButton(host, ToolMode::ClipPlane);
     ToolButton(host, ToolMode::Section);
     ToolButton(host, ToolMode::StepHeight);
     ImGui::Separator();
     ImGui::TextDisabled(u8"测量");
     ToolButton(host, ToolMode::Flatness);
     ToolButton(host, ToolMode::StepGap);
+    ImGui::Separator();
+    ImGui::TextDisabled(u8"配准");
+    ToolButton(host, ToolMode::Icp);
 }
 
 void DrawFitTab(const AlgoToolsHost& host) {
@@ -92,7 +94,6 @@ void DrawFitTab(const AlgoToolsHost& host) {
     ImGui::TextDisabled(isPcl ? u8"PCL 几何拟合" : u8"自研几何拟合");
     ToolButton(host, ToolMode::PlaneFit);
     ToolButton(host, ToolMode::SphereFit);
-    ToolButton(host, ToolMode::SphereBodyFit);
     ToolButton(host, ToolMode::CircleFit);
     ToolButton(host, ToolMode::CylinderFit);
 
@@ -222,15 +223,29 @@ void DrawFilterTab(const AlgoToolsHost& host) {
     if (host.filterCompareActive) {
         ImGui::Separator();
         ImGui::Text(u8"预览：保留 %d，滤除 %d", host.filterLastKept, host.filterLastRemoved);
-        if (host.filterHideRemoved) {
-            if (ImGui::Checkbox(u8"仅显示滤波后", host.filterHideRemoved)) {
+        if (host.filterCompareViewMode) {
+            const FilterCompareViewMode prev = *host.filterCompareViewMode;
+            int mode = static_cast<int>(prev);
+            if (ImGui::RadioButton(u8"对比", &mode, 0)) {
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"原始", &mode, 1)) {
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"滤波后", &mode, 2)) {
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton(u8"差异", &mode, 3)) {
+            }
+            if (mode != static_cast<int>(prev)) {
+                *host.filterCompareViewMode = static_cast<FilterCompareViewMode>(mode);
                 if (host.requestRefreshGpu) host.requestRefreshGpu();
             }
         }
         if (ImGui::Button(u8"应用滤波", ImVec2(-1, 0)) && host.applyFilter) host.applyFilter();
         if (ImGui::Button(u8"取消预览", ImVec2(-1, 0)) && host.clearFilter) host.clearFilter();
     } else {
-        ImGui::TextDisabled(u8"先预览：青绿=保留，红=滤除");
+        ImGui::TextDisabled(u8"先预览：支持对比/原始/滤波后/差异");
     }
 }
 

@@ -2,7 +2,7 @@
 
 // MeasureTools — 自研几何/测量算法（无 PCL 依赖）
 //
-// 提供：屏幕 ROI 框选、平面/圆/球/圆柱拟合、剖切、截面、平面度、段差、
+// 提供：屏幕 ROI 框选、平面/圆/球/圆柱拟合、截面、平面度、段差、
 //       ROI 填充（投影/拟合平面/直接 XY）等。Application 与 PclTools 均可调用。
 
 #include "core/MathTypes.h"
@@ -24,11 +24,11 @@ enum class ToolMode {
     CircleFit,
     CylinderFit,
     Roi,
-    ClipPlane,
     Section,
     StepHeight,
     Flatness,   // 平面度
-    StepGap     // 段差（区域A平面 → 区域B距离图）
+    StepGap,    // 段差（区域A平面 → 区域B距离图）
+    Icp         // ICP 点云配准（PCL）
 };
 
 inline bool IsSphereFitMode(ToolMode mode) {
@@ -141,6 +141,15 @@ enum class RoiFillMode {
     DirectXY = 2,     // 不投影，XY 平面直接填充（Z 取参考值）
 };
 
+struct PlaneDistanceProfile {
+    bool valid = false;
+    std::vector<float> signedDist;
+    float minD = 0.f;
+    float maxD = 0.f;
+    float rms = 0.f;
+    int pointCount = 0;
+};
+
 struct MeasureState {
     ToolMode mode = ToolMode::Navigate;
     std::optional<Vec3> picked;
@@ -148,6 +157,7 @@ struct MeasureState {
     std::optional<Vec3> distB;
     float distance = 0.f;
     std::optional<PlaneModel> plane;
+    PlaneDistanceProfile planeDistProfile;
     bool roiDragging = false;
     float roiX0 = 0, roiY0 = 0, roiX1 = 0, roiY1 = 0;
     RoiShape roiShape = RoiShape::Rect;
@@ -164,9 +174,6 @@ struct MeasureState {
     int roiFillMode = 0;          // RoiFillMode
     std::vector<std::size_t> roiFillPlaneIndices;  // 平面拟合填充：区域 A（矩形框选）
     std::vector<std::size_t> roiIndices;
-    bool clipEnabled = false;
-    Vec3 clipNormal{0, 0, 1};
-    float clipD = 0.f;
     SectionData section;
     // 台阶/高度差：点A为基准，点B为测量点，stepDeltaZ = B.z - A.z（显示坐标，同世界相对差）
     std::optional<Vec3> stepA;
@@ -212,6 +219,9 @@ bool FitCylinder(const PointCloud& cloud, const std::vector<std::size_t>& indice
 // 拟合平面并计算各点到平面的偏差统计（平面度 PV 等）
 bool ComputeFlatness(const PointCloud& cloud, const std::vector<std::size_t>& indices,
                      FlatnessResult& out, std::string& error);
+
+void ComputePlaneDistanceProfile(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                                 const PlaneModel& plane, PlaneDistanceProfile& out);
 
 // 已知平面 A 后，计算区域 B 各点到平面的有符号距离
 bool ComputeStepGapDistances(const PointCloud& cloud, const PlaneModel& planeA,
@@ -271,9 +281,6 @@ bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::
                                 const Vec3& clipCenter, float clipRadius, PointCloud& filledOut,
                                 CircleModel& circleOut, PlaneModel& planeOut, float& outGridStep,
                                 std::string& error);
-
-// 按半空间法向剖切，隐藏法向负侧点（改 mask）
-void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled);
 
 // ROI 软删除：deleteInside=true 清除框内，false 只保留框内
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices, bool deleteInside);

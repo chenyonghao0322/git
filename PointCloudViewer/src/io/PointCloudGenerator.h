@@ -34,8 +34,20 @@ struct DiskParams {
     float centerZ = 0.f;
 };
 
-bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& error);
+struct PlaneParams {
+    float extentX = 20.f;  // X 方向半宽
+    float extentY = 20.f;  // Y 方向半宽
+    int pointCount = 20000;
+    float noise = 0.f;  // 法向（Z）噪声
+    float centerX = 0.f;
+    float centerY = 0.f;
+    float centerZ = 0.f;
+};
+
+bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& error,
+                    bool centerToOrigin = true);
 bool GenerateCylinder(const CylinderParams& params, PointCloud& out, std::string& error);
 bool GenerateDisk(const DiskParams& params, PointCloud& out, std::string& error);
+bool GeneratePlane(const PlaneParams& params, PointCloud& out, std::string& error);
 
 }  // namespace PointCloudGenerator

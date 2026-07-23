@@ -1362,17 +1362,6 @@ bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::
     return FitCircleOnFilledDisk(filledOut, planeOut, xs, ys, fitGridStep, circleOut, error);
 }
 
-void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled) {
-    if (cloud.mask.size() != cloud.points.size()) cloud.ResetMask();
-    if (!enabled) return;
-    const Vec3 n = normal.Normalized();
-    for (std::size_t i = 0; i < cloud.points.size(); ++i) {
-        if (!cloud.mask[i]) continue;
-        const float side = n.Dot(cloud.points[i]) + d;
-        cloud.mask[i] = (side >= 0.f) ? 1 : 0;
-    }
-}
-
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices, bool deleteInside) {
     if (cloud.points.empty() || roiIndices.empty()) return;
     if (cloud.mask.size() != cloud.points.size()) cloud.ResetMask();
@@ -1527,6 +1516,38 @@ bool ComputeFlatness(const PointCloud& cloud, const std::vector<std::size_t>& in
     out.rms = static_cast<float>(std::sqrt(rmsAcc / static_cast<double>(out.indices.size())));
     out.valid = true;
     return true;
+}
+
+void ComputePlaneDistanceProfile(const PointCloud& cloud, const std::vector<std::size_t>& indices,
+                                 const PlaneModel& plane, PlaneDistanceProfile& out) {
+    out = {};
+    std::vector<std::size_t> use = indices;
+    if (use.empty()) {
+        use.reserve(cloud.points.size());
+        for (std::size_t i = 0; i < cloud.points.size(); ++i) {
+            if (cloud.mask.empty() || cloud.mask[i]) use.push_back(i);
+        }
+    }
+    if (use.empty()) return;
+
+    out.signedDist.resize(use.size());
+    float minD = std::numeric_limits<float>::max();
+    float maxD = std::numeric_limits<float>::lowest();
+    double rmsAcc = 0.0;
+    const Vec3 n = plane.normal.Normalized();
+    for (std::size_t k = 0; k < use.size(); ++k) {
+        const Vec3& p = cloud.points[use[k]];
+        const float d = (p - plane.centroid).Dot(n);
+        out.signedDist[k] = d;
+        minD = std::min(minD, d);
+        maxD = std::max(maxD, d);
+        rmsAcc += static_cast<double>(d) * static_cast<double>(d);
+    }
+    out.minD = minD;
+    out.maxD = maxD;
+    out.rms = static_cast<float>(std::sqrt(rmsAcc / static_cast<double>(use.size())));
+    out.pointCount = static_cast<int>(use.size());
+    out.valid = true;
 }
 
 bool ComputeStepGapDistances(const PointCloud& cloud, const PlaneModel& planeA,

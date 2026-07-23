@@ -6,7 +6,10 @@
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/common/centroid.h>
+#include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/registration/icp.h>
 #include <pcl/search/kdtree.h>
 #include <pcl/segmentation/sac_segmentation.h>
 
@@ -673,17 +676,6 @@ bool ExtractSection(const PointCloud& cloud, bool cutAlongX, float position, flo
     return true;
 }
 
-void ApplyClipMask(PointCloud& cloud, const Vec3& normal, float d, bool enabled) {
-    if (cloud.mask.size() != cloud.points.size()) cloud.ResetMask();
-    if (!enabled) return;
-    const Vec3 n = normal.Normalized();
-    for (std::size_t i = 0; i < cloud.points.size(); ++i) {
-        if (!cloud.mask[i]) continue;
-        const float side = n.Dot(cloud.points[i]) + d;
-        cloud.mask[i] = (side >= 0.f) ? 1 : 0;
-    }
-}
-
 void ApplyRoiDelete(PointCloud& cloud, const std::vector<std::size_t>& roiIndices,
                     bool deleteInside) {
     MeasureTools::ApplyRoiDelete(cloud, roiIndices, deleteInside);
@@ -802,6 +794,108 @@ bool RoiProjectFillAndFitCircle(const PointCloud& cloud, const std::vector<std::
     return MeasureTools::RoiProjectFillAndFitCircle(cloud, indices, axis, gridStepMm, clipCircle,
                                                     clipCenter, clipRadius, filledOut, circleOut,
                                                     planeOut, outGridStep, error);
+}
+
+namespace {
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr ToPclWorld(const PointCloud& cloud) {
+    auto out = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
+    const Vec3 o = cloud.originOffset;
+    out->reserve(cloud.points.size());
+    for (std::size_t i = 0; i < cloud.points.size(); ++i) {
+        if (!Visible(cloud, i)) continue;
+        const Vec3& p = cloud.points[i];
+        out->push_back(pcl::PointXYZ(p.x + o.x, p.y + o.y, p.z + o.z));
+    }
+    return out;
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr VoxelDownsampleCloud(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& in, float leaf) {
+    if (!in || in->empty() || leaf <= 0.f) return in;
+    pcl::VoxelGrid<pcl::PointXYZ> vg;
+    vg.setInputCloud(in);
+    vg.setLeafSize(leaf, leaf, leaf);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
+    vg.filter(*out);
+    return out;
+}
+
+void MatrixToRowMajor(const Eigen::Matrix4f& m, float out[16]) {
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = m(r, c);
+        }
+    }
+}
+
+void ApplyTransformToTargetFrame(const PointCloud& source, const Eigen::Matrix4f& T,
+                                 const PointCloud& target, PointCloud& out) {
+    out = source;
+    out.originOffset = target.originOffset;
+    for (std::size_t i = 0; i < source.points.size(); ++i) {
+        const Vec3 w = source.ToWorld(source.points[i]);
+        const Eigen::Vector4f v(w.x, w.y, w.z, 1.f);
+        const Eigen::Vector4f w2 = T * v;
+        out.points[i] = Vec3{w2.x(), w2.y(), w2.z()} - target.originOffset;
+    }
+    out.RecomputeBounds();
+}
+
+}  // namespace
+
+bool RunIcp(const PointCloud& target, const PointCloud& source, const IcpParams& params,
+            IcpResult& result, PointCloud& alignedSourceOut, std::string& error) {
+    result = {};
+    alignedSourceOut.Clear();
+    if (target.points.empty() || source.points.empty()) {
+        error = u8"目标或源点云为空";
+        return false;
+    }
+
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr tgtFull = ToPclWorld(target);
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr srcFull = ToPclWorld(source);
+    if (tgtFull->size() < 10 || srcFull->size() < 10) {
+        error = u8"可见点过少，ICP 至少需要各 10 个点";
+        return false;
+    }
+
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr tgt =
+        VoxelDownsampleCloud(tgtFull, params.voxelLeaf);
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr src =
+        VoxelDownsampleCloud(srcFull, params.voxelLeaf);
+    if (!tgt || tgt->empty() || !src || src->empty()) {
+        error = u8"下采样后点云为空";
+        return false;
+    }
+
+    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+    icp.setInputTarget(tgt);
+    icp.setInputSource(src);
+    icp.setMaxCorrespondenceDistance(params.maxCorrespondenceDist);
+    icp.setMaximumIterations(params.maxIterations);
+    icp.setTransformationEpsilon(params.transEpsilon);
+    icp.setEuclideanFitnessEpsilon(params.euclideanEpsilon);
+
+    Eigen::Matrix4f init = Eigen::Matrix4f::Identity();
+    if (params.useCentroidInit) {
+        Eigen::Vector4f tc = Eigen::Vector4f::Zero();
+        Eigen::Vector4f sc = Eigen::Vector4f::Zero();
+        pcl::compute3DCentroid(*tgt, tc);
+        pcl::compute3DCentroid(*src, sc);
+        init.block<3, 1>(0, 3) = tc.head<3>() - sc.head<3>();
+    }
+
+    pcl::PointCloud<pcl::PointXYZ> aligned;
+    icp.align(aligned, init);
+
+    const Eigen::Matrix4f T = icp.getFinalTransformation();
+    result.success = true;
+    result.converged = icp.hasConverged();
+    result.fitnessScore = icp.getFitnessScore();
+    MatrixToRowMajor(T, result.transform);
+    ApplyTransformToTargetFrame(source, T, target, alignedSourceOut);
+    return true;
 }
 
 }  // namespace PclTools

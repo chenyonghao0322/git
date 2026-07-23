@@ -1348,6 +1348,7 @@ bool SampleLineProfileImpl(const std::vector<float>& gray, int width, int height
                            std::vector<LineProfileSample>& out, bool skipZero) {
     out.clear();
     if (gray.empty() || width <= 0 || height <= 0 || numSamples < 2) return false;
+    const float lineLen = std::hypot(x1 - x0, y1 - y0);
     out.reserve(static_cast<std::size_t>(numSamples));
     for (int i = 0; i < numSamples; ++i) {
         const float t = static_cast<float>(i) / static_cast<float>(numSamples - 1);
@@ -1356,7 +1357,46 @@ bool SampleLineProfileImpl(const std::vector<float>& gray, int width, int height
         LineProfileSample s;
         s.x = x;
         s.y = y;
+        s.distance = lineLen * t;
         s.value = SampleBilinear(gray, width, height, x, y, skipZero);
+        if (skipZero && s.value == 0.f) s.value = std::numeric_limits<float>::quiet_NaN();
+        out.push_back(s);
+    }
+    return !out.empty();
+}
+
+bool SampleRowProfileImpl(const std::vector<float>& gray, int width, int height, int row,
+                          std::vector<LineProfileSample>& out, bool skipZero) {
+    out.clear();
+    if (gray.empty() || width <= 0 || height <= 0) return false;
+    row = std::clamp(row, 0, height - 1);
+    out.reserve(static_cast<std::size_t>(width));
+    for (int col = 0; col < width; ++col) {
+        LineProfileSample s;
+        s.x = static_cast<float>(col);
+        s.y = static_cast<float>(row);
+        s.distance = static_cast<float>(col);
+        s.value = gray[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                       static_cast<std::size_t>(col)];
+        if (skipZero && s.value == 0.f) s.value = std::numeric_limits<float>::quiet_NaN();
+        out.push_back(s);
+    }
+    return !out.empty();
+}
+
+bool SampleColumnProfileImpl(const std::vector<float>& gray, int width, int height, int col,
+                             std::vector<LineProfileSample>& out, bool skipZero) {
+    out.clear();
+    if (gray.empty() || width <= 0 || height <= 0) return false;
+    col = std::clamp(col, 0, width - 1);
+    out.reserve(static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        LineProfileSample s;
+        s.x = static_cast<float>(col);
+        s.y = static_cast<float>(row);
+        s.distance = static_cast<float>(row);
+        s.value = gray[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                       static_cast<std::size_t>(col)];
         if (skipZero && s.value == 0.f) s.value = std::numeric_limits<float>::quiet_NaN();
         out.push_back(s);
     }
@@ -1499,6 +1539,12 @@ bool ComputeRegionBlob(const std::vector<float>& gray, int width, int height, fl
         return false;
     }
 
+    const int roiW = x1 - x0 + 1;
+    const int roiH = y1 - y0 + 1;
+    out.roiWidth = roiW;
+    out.roiHeight = roiH;
+    out.hitMask.assign(static_cast<std::size_t>(roiW * roiH), 0);
+
     double sumX = 0.0;
     double sumY = 0.0;
     int count = 0;
@@ -1508,19 +1554,22 @@ bool ComputeRegionBlob(const std::vector<float>& gray, int width, int height, fl
                                  static_cast<std::size_t>(x)];
             const bool hit = greaterThan ? (v > threshold) : (v < threshold);
             if (!hit) continue;
+            out.hitMask[static_cast<std::size_t>(y - y0) * static_cast<std::size_t>(roiW) +
+                        static_cast<std::size_t>(x - x0)] = 1;
             sumX += x;
             sumY += y;
             ++count;
         }
     }
-    if (count == 0) {
-        error = u8"区域内无满足阈值的像素";
-        return false;
-    }
     out.pixelCount = count;
     out.areaPx = static_cast<float>(count);
-    out.centroidX = static_cast<float>(sumX / static_cast<double>(count));
-    out.centroidY = static_cast<float>(sumY / static_cast<double>(count));
+    if (count > 0) {
+        out.centroidX = static_cast<float>(sumX / static_cast<double>(count));
+        out.centroidY = static_cast<float>(sumY / static_cast<double>(count));
+    } else {
+        out.centroidX = (out.roiX0 + out.roiX1) * 0.5f;
+        out.centroidY = (out.roiY0 + out.roiY1) * 0.5f;
+    }
     out.ok = true;
     return true;
 }
@@ -1550,6 +1599,640 @@ bool SampleLineProfile(const std::vector<float>& gray, int width, int height, fl
                        float x1, float y1, int numSamples, std::vector<LineProfileSample>& out,
                        bool skipZero) {
     return SampleLineProfileImpl(gray, width, height, x0, y0, x1, y1, numSamples, out, skipZero);
+}
+
+bool SampleRowProfile(const std::vector<float>& gray, int width, int height, int row,
+                      std::vector<LineProfileSample>& out, bool skipZero) {
+    return SampleRowProfileImpl(gray, width, height, row, out, skipZero);
+}
+
+bool SampleColumnProfile(const std::vector<float>& gray, int width, int height, int col,
+                         std::vector<LineProfileSample>& out, bool skipZero) {
+    return SampleColumnProfileImpl(gray, width, height, col, out, skipZero);
+}
+
+namespace {
+
+void NormalizeRoi(float& x0, float& y0, float& x1, float& y1) {
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+}
+
+int RoiPixelSpan(float a0, float a1) {
+    const int i0 = static_cast<int>(std::ceil(a0));
+    const int i1 = static_cast<int>(std::floor(a1));
+    return std::max(0, i1 - i0 + 1);
+}
+
+void BuildSearchRange(float vmin, float vmax, float step, std::vector<float>& out) {
+    out.clear();
+    if (vmax < vmin) std::swap(vmin, vmax);
+    if (step <= 0.f) step = 1.f;
+    if (std::fabs(vmax - vmin) < 1e-4f) {
+        out.push_back(vmin);
+        return;
+    }
+    for (float v = vmin; v <= vmax + step * 0.5f; v += step) out.push_back(v);
+    if (out.empty()) out.push_back(vmin);
+}
+
+void AppendValueIfMissing(std::vector<float>& values, float value, float tolerance) {
+    for (float v : values) {
+        if (std::fabs(v - value) <= tolerance) return;
+    }
+    values.push_back(value);
+    std::sort(values.begin(), values.end());
+}
+
+void BuildScaleSearchRange(float vmin, float vmax, float step, std::vector<float>& out) {
+    BuildSearchRange(vmin, vmax, step, out);
+    if (vmin <= 1.f && vmax >= 1.f) {
+        AppendValueIfMissing(out, 1.f, std::max(step * 0.25f, 0.02f));
+    }
+}
+
+cv::Mat TransformTemplateGray(const cv::Mat& grayTpl, float scale, float angleDeg, float& outTplW,
+                              float& outTplH) {
+    cv::Mat scaled;
+    if (std::fabs(scale - 1.f) > 1e-4f) {
+        cv::resize(grayTpl, scaled, cv::Size(), static_cast<double>(scale),
+                   static_cast<double>(scale), cv::INTER_LINEAR);
+    } else {
+        scaled = grayTpl;
+    }
+    outTplW = static_cast<float>(scaled.cols);
+    outTplH = static_cast<float>(scaled.rows);
+    if (scaled.cols < 4 || scaled.rows < 4) return {};
+
+    if (std::fabs(angleDeg) < 1e-3f) return scaled;
+
+    const cv::Point2f center(scaled.cols * 0.5f, scaled.rows * 0.5f);
+    cv::Mat rotMat = cv::getRotationMatrix2D(center, static_cast<double>(angleDeg), 1.0);
+    const cv::Rect2f bbox =
+        cv::RotatedRect(cv::Point2f(), scaled.size(), angleDeg).boundingRect2f();
+    rotMat.at<double>(0, 2) += static_cast<double>(bbox.width * 0.5f - center.x);
+    rotMat.at<double>(1, 2) += static_cast<double>(bbox.height * 0.5f - center.y);
+    cv::Mat rotated;
+    cv::warpAffine(scaled, rotated, rotMat, bbox.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+                   cv::Scalar(0));
+    return rotated;
+}
+
+void BuildGrayPyramid(const cv::Mat& gray, int maxLevels, std::vector<cv::Mat>& pyramid) {
+    pyramid.clear();
+    pyramid.push_back(gray);
+    const int cap = std::clamp(maxLevels, 1, 5);
+    while (static_cast<int>(pyramid.size()) < cap && pyramid.back().cols >= 16 &&
+           pyramid.back().rows >= 16) {
+        cv::Mat down;
+        cv::pyrDown(pyramid.back(), down);
+        pyramid.push_back(down);
+    }
+}
+
+int AutoPyramidLevels(int tplW, int tplH, int requested) {
+    if (requested > 0) return std::clamp(requested, 1, 5);
+    int levels = 1;
+    int w = tplW;
+    int h = tplH;
+    while (w >= 20 && h >= 20 && levels < 4) {
+        w /= 2;
+        h /= 2;
+        ++levels;
+    }
+    return levels;
+}
+
+bool RefineSubPixelPeak(const cv::Mat& scoreMap, const cv::Point& peak, float& subX, float& subY) {
+    subX = static_cast<float>(peak.x);
+    subY = static_cast<float>(peak.y);
+    if (scoreMap.empty() || scoreMap.type() != CV_32FC1) return false;
+    const int x = peak.x;
+    const int y = peak.y;
+    if (x < 1 || y < 1 || x >= scoreMap.cols - 1 || y >= scoreMap.rows - 1) return false;
+
+    auto at = [&](int px, int py) -> float { return scoreMap.at<float>(py, px); };
+    const float c = at(x, y);
+    const float denomX = at(x - 1, y) - 2.f * c + at(x + 1, y);
+    const float denomY = at(x, y - 1) - 2.f * c + at(x, y + 1);
+    float dx = 0.f;
+    float dy = 0.f;
+    if (std::fabs(denomX) > 1e-6f) dx = 0.5f * (at(x - 1, y) - at(x + 1, y)) / denomX;
+    if (std::fabs(denomY) > 1e-6f) dy = 0.5f * (at(x, y - 1) - at(x, y + 1)) / denomY;
+    subX = static_cast<float>(x) + std::clamp(dx, -0.5f, 0.5f);
+    subY = static_cast<float>(y) + std::clamp(dy, -0.5f, 0.5f);
+    return true;
+}
+
+struct TemplateMatchCandidate {
+    float score = 0.f;
+    float centerX = 0.f;
+    float centerY = 0.f;
+    float templateWidth = 0.f;
+    float templateHeight = 0.f;
+    float angleDeg = 0.f;
+    float scale = 1.f;
+    float bboxX = 0.f;
+    float bboxY = 0.f;
+    float bboxW = 0.f;
+    float bboxH = 0.f;
+};
+
+float CandidateIoU(const TemplateMatchCandidate& a, const TemplateMatchCandidate& b) {
+    const float ax1 = a.bboxX + a.bboxW;
+    const float ay1 = a.bboxY + a.bboxH;
+    const float bx1 = b.bboxX + b.bboxW;
+    const float by1 = b.bboxY + b.bboxH;
+    const float ix0 = std::max(a.bboxX, b.bboxX);
+    const float iy0 = std::max(a.bboxY, b.bboxY);
+    const float ix1 = std::min(ax1, bx1);
+    const float iy1 = std::min(ay1, by1);
+    const float iw = std::max(0.f, ix1 - ix0);
+    const float ih = std::max(0.f, iy1 - iy0);
+    const float inter = iw * ih;
+    const float areaA = std::max(a.bboxW * a.bboxH, 1.f);
+    const float areaB = std::max(b.bboxW * b.bboxH, 1.f);
+    return inter / (areaA + areaB - inter);
+}
+
+bool RejectBorderHit(const TemplateMatchCandidate& hit, int searchGlobalOffX, int searchGlobalOffY,
+                     const TemplateMatchParams& params) {
+    if (params.borderIntersect || params.searchGlobalW <= 0 || params.searchGlobalH <= 0) {
+        return false;
+    }
+    const float gx0 = static_cast<float>(searchGlobalOffX);
+    const float gy0 = static_cast<float>(searchGlobalOffY);
+    const float gx1 = gx0 + static_cast<float>(params.searchGlobalW);
+    const float gy1 = gy0 + static_cast<float>(params.searchGlobalH);
+    const float eps = 1.5f;
+    if (hit.bboxX <= gx0 + eps || hit.bboxY <= gy0 + eps) return true;
+    if (hit.bboxX + hit.bboxW >= gx1 - eps || hit.bboxY + hit.bboxH >= gy1 - eps) return true;
+    return false;
+}
+
+bool PickMatchCandidates(const std::vector<TemplateMatchCandidate>& candidates, float minScore,
+                         int maxMatches, float maxOverlap,
+                         std::vector<TemplateMatchCandidate>& picked) {
+    picked.clear();
+    const int want = std::clamp(maxMatches, 1, 32);
+    picked.reserve(static_cast<std::size_t>(want));
+    for (const TemplateMatchCandidate& c : candidates) {
+        if (c.score < minScore) break;
+        bool overlap = false;
+        for (const TemplateMatchCandidate& p : picked) {
+            if (CandidateIoU(c, p) > maxOverlap) {
+                overlap = true;
+                break;
+            }
+            const float dx = c.centerX - p.centerX;
+            const float dy = c.centerY - p.centerY;
+            const float centerDist = std::sqrt(dx * dx + dy * dy);
+            const float minDim =
+                std::min(std::min(c.bboxW, c.bboxH), std::min(p.bboxW, p.bboxH));
+            if (centerDist < minDim * (1.f - maxOverlap * 0.5f)) {
+                overlap = true;
+                break;
+            }
+        }
+        if (overlap) continue;
+        picked.push_back(c);
+        if (static_cast<int>(picked.size()) >= want) break;
+    }
+    return !picked.empty();
+}
+
+float CoarseMinScore(float minScore, float greediness) {
+    const float g = std::clamp(greediness, 0.f, 1.f);
+    return minScore * (0.55f + 0.45f * (1.f - g));
+}
+
+bool MatchWarpedTemplate(const cv::Mat& searchImg, int searchGlobalOffX, int searchGlobalOffY,
+                         const cv::Mat& warpedTpl, float scaledTplW, float scaledTplH,
+                         float angleDeg, float scale, float minScore, bool subPixel,
+                         const cv::Rect* localRoi, int pyramidLevel,
+                         const TemplateMatchParams* policy, TemplateMatchCandidate& out) {
+    if (searchImg.empty() || warpedTpl.empty()) return false;
+
+    cv::Mat tpl = warpedTpl;
+    for (int i = 0; i < pyramidLevel; ++i) {
+        if (tpl.cols < 8 || tpl.rows < 8) return false;
+        cv::Mat down;
+        cv::pyrDown(tpl, down);
+        tpl = down;
+    }
+    if (tpl.cols > searchImg.cols || tpl.rows > searchImg.rows) return false;
+
+    cv::Mat searchRoi = searchImg;
+    int roiOffX = 0;
+    int roiOffY = 0;
+    if (localRoi) {
+        cv::Rect clipped = *localRoi;
+        clipped &= cv::Rect(0, 0, searchImg.cols, searchImg.rows);
+        if (clipped.width < tpl.cols || clipped.height < tpl.rows) return false;
+        searchRoi = searchImg(clipped);
+        roiOffX = clipped.x;
+        roiOffY = clipped.y;
+    }
+
+    cv::Mat scoreMap;
+    cv::matchTemplate(searchRoi, tpl, scoreMap, cv::TM_CCOEFF_NORMED);
+    if (scoreMap.empty()) return false;
+
+    double minVal = 0.0;
+    double maxVal = 0.0;
+    cv::Point minLoc;
+    cv::Point maxLoc;
+    cv::minMaxLoc(scoreMap, &minVal, &maxVal, &minLoc, &maxLoc);
+    if (static_cast<float>(maxVal) < minScore) return false;
+
+    float peakX = static_cast<float>(maxLoc.x);
+    float peakY = static_cast<float>(maxLoc.y);
+    if (subPixel && pyramidLevel == 0) {
+        RefineSubPixelPeak(scoreMap, maxLoc, peakX, peakY);
+    }
+
+    const float mul = static_cast<float>(1 << std::max(pyramidLevel, 0));
+    out.score = static_cast<float>(maxVal);
+    out.bboxX = static_cast<float>(searchGlobalOffX) + (static_cast<float>(roiOffX) + peakX) * mul;
+    out.bboxY = static_cast<float>(searchGlobalOffY) + (static_cast<float>(roiOffY) + peakY) * mul;
+    out.bboxW = static_cast<float>(tpl.cols) * mul;
+    out.bboxH = static_cast<float>(tpl.rows) * mul;
+    out.centerX = out.bboxX + out.bboxW * 0.5f;
+    out.centerY = out.bboxY + out.bboxH * 0.5f;
+    out.templateWidth = scaledTplW;
+    out.templateHeight = scaledTplH;
+    out.angleDeg = angleDeg;
+    out.scale = scale;
+    if (policy && RejectBorderHit(out, searchGlobalOffX, searchGlobalOffY, *policy)) {
+        return false;
+    }
+    return true;
+}
+
+void SearchAngleScaleGrid(const cv::Mat& searchImg, int searchGlobalOffX, int searchGlobalOffY,
+                          const cv::Mat& grayTpl, const std::vector<float>& angles,
+                          const std::vector<float>& scales, float minScore, bool subPixel,
+                          const cv::Rect* localRoi, int pyramidLevel,
+                          const TemplateMatchParams* policy,
+                          std::vector<TemplateMatchCandidate>& outCandidates) {
+    for (float scale : scales) {
+        for (float angleDeg : angles) {
+            float scaledTplW = 0.f;
+            float scaledTplH = 0.f;
+            const cv::Mat warped =
+                TransformTemplateGray(grayTpl, scale, angleDeg, scaledTplW, scaledTplH);
+            if (warped.empty() || warped.cols < 4 || warped.rows < 4) continue;
+
+            TemplateMatchCandidate c;
+            if (!MatchWarpedTemplate(searchImg, searchGlobalOffX, searchGlobalOffY, warped,
+                                     scaledTplW, scaledTplH, angleDeg, scale, minScore, subPixel,
+                                     localRoi, pyramidLevel, policy, c)) {
+                continue;
+            }
+            outCandidates.push_back(c);
+        }
+    }
+}
+
+cv::Rect LocalRefineRoi(const TemplateMatchCandidate& cand, int searchOffX, int searchOffY,
+                         int lvl, int searchW, int searchH, int tplW, int tplH) {
+    const float inv = 1.f / static_cast<float>(1 << lvl);
+    const float cx = (cand.centerX - static_cast<float>(searchOffX)) * inv;
+    const float cy = (cand.centerY - static_cast<float>(searchOffY)) * inv;
+    const int margin = std::max(6, std::max(tplW, tplH) / 4 + 2);
+    const int halfW = static_cast<int>(cand.bboxW * inv * 0.5f) + margin;
+    const int halfH = static_cast<int>(cand.bboxH * inv * 0.5f) + margin;
+    int x0 = static_cast<int>(std::floor(cx)) - halfW;
+    int y0 = static_cast<int>(std::floor(cy)) - halfH;
+    int x1 = static_cast<int>(std::ceil(cx)) + halfW;
+    int y1 = static_cast<int>(std::ceil(cy)) + halfH;
+    x0 = std::clamp(x0, 0, searchW - 1);
+    y0 = std::clamp(y0, 0, searchH - 1);
+    x1 = std::clamp(x1, x0 + 1, searchW);
+    y1 = std::clamp(y1, y0 + 1, searchH);
+    return cv::Rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+void PickTopCandidates(std::vector<TemplateMatchCandidate>& candidates, int keepCount) {
+    if (keepCount <= 0 || static_cast<int>(candidates.size()) <= keepCount) return;
+    std::partial_sort(candidates.begin(), candidates.begin() + keepCount, candidates.end(),
+                      [](const TemplateMatchCandidate& a, const TemplateMatchCandidate& b) {
+                          return a.score > b.score;
+                      });
+    candidates.resize(static_cast<std::size_t>(keepCount));
+}
+
+}  // namespace
+
+bool MatchTemplateRgb(const std::vector<uint8_t>& rgb, int width, int height, float templateX0,
+                      float templateY0, float templateX1, float templateY1, float searchX0,
+                      float searchY0, float searchX1, float searchY1,
+                      const TemplateMatchParams& params, TemplateMatchResult& result,
+                      std::string& error) {
+    result = {};
+    if (rgb.empty() || width <= 0 || height <= 0) {
+        error = u8"图像无效";
+        return false;
+    }
+    const std::size_t expect = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u;
+    if (rgb.size() < expect) {
+        error = u8"图像数据长度不足";
+        return false;
+    }
+
+    NormalizeRoi(templateX0, templateY0, templateX1, templateY1);
+    if (!params.searchFullImage) {
+        NormalizeRoi(searchX0, searchY0, searchX1, searchY1);
+    } else {
+        searchX0 = 0.f;
+        searchY0 = 0.f;
+        searchX1 = static_cast<float>(width - 1);
+        searchY1 = static_cast<float>(height - 1);
+    }
+
+    const int tplW = RoiPixelSpan(templateX0, templateX1);
+    const int tplH = RoiPixelSpan(templateY0, templateY1);
+    if (tplW < 4 || tplH < 4) {
+        error = u8"模板区域过小（至少 4×4 像素）";
+        return false;
+    }
+
+    const int tplX0 = static_cast<int>(std::ceil(templateX0));
+    const int tplY0 = static_cast<int>(std::ceil(templateY0));
+    const int searchX0i = static_cast<int>(std::ceil(searchX0));
+    const int searchY0i = static_cast<int>(std::ceil(searchY0));
+    const int searchW = RoiPixelSpan(searchX0, searchX1);
+    const int searchH = RoiPixelSpan(searchY0, searchY1);
+    if (searchW < 4 || searchH < 4) {
+        error = u8"搜索区域过小";
+        return false;
+    }
+
+    cv::Mat image(height, width, CV_8UC3, const_cast<uint8_t*>(rgb.data()));
+    const cv::Rect tplRect(tplX0, tplY0, tplW, tplH);
+    if (tplRect.x + tplRect.width > width || tplRect.y + tplRect.height > height) {
+        error = u8"模板区域超出图像范围";
+        return false;
+    }
+    const cv::Mat tpl = image(tplRect).clone();
+
+    cv::Mat grayTpl;
+    cv::cvtColor(tpl, grayTpl, cv::COLOR_RGB2GRAY);
+
+    cv::Mat graySearch;
+    const cv::Rect searchRect(searchX0i, searchY0i, searchW, searchH);
+    if (searchRect.x + searchRect.width > width || searchRect.y + searchRect.height > height) {
+        error = u8"搜索区域超出图像范围";
+        return false;
+    }
+    cv::cvtColor(image(searchRect), graySearch, cv::COLOR_RGB2GRAY);
+
+    result.templateX0 = templateX0;
+    result.templateY0 = templateY0;
+    result.templateX1 = templateX1;
+    result.templateY1 = templateY1;
+    result.searchX0 = searchX0;
+    result.searchY0 = searchY0;
+    result.searchX1 = searchX1;
+    result.searchY1 = searchY1;
+
+    const bool subPixel = params.subPixelRefine;
+    const float minScore = std::clamp(params.minScore, 0.f, 1.f);
+
+    std::vector<TemplateMatchCandidate> candidates;
+
+    if (!params.usePyramid) {
+        std::vector<float> angles;
+        std::vector<float> scales;
+        BuildSearchRange(params.angleMinDeg, params.angleMaxDeg, params.angleStepDeg, angles);
+        BuildScaleSearchRange(params.scaleMin, params.scaleMax, params.scaleStep, scales);
+        SearchAngleScaleGrid(graySearch, searchX0i, searchY0i, grayTpl, angles, scales, minScore,
+                             subPixel, nullptr, 0, &params, candidates);
+    } else {
+        const int numLevels =
+            AutoPyramidLevels(tplW, tplH, params.pyramidLevels);
+        std::vector<cv::Mat> searchPyramid;
+        BuildGrayPyramid(graySearch, numLevels, searchPyramid);
+        const int topLevel = static_cast<int>(searchPyramid.size()) - 1;
+
+        std::vector<float> coarseAngles;
+        std::vector<float> coarseScales;
+        const float coarseAngleStep = params.angleStepDeg * static_cast<float>(1 << topLevel);
+        const float coarseScaleStep = params.scaleStep * static_cast<float>(1 << topLevel);
+        BuildSearchRange(params.angleMinDeg, params.angleMaxDeg, coarseAngleStep, coarseAngles);
+        BuildScaleSearchRange(params.scaleMin, params.scaleMax, coarseScaleStep, coarseScales);
+
+        SearchAngleScaleGrid(searchPyramid[static_cast<std::size_t>(topLevel)], searchX0i,
+                             searchY0i, grayTpl, coarseAngles, coarseScales,
+                             CoarseMinScore(minScore, params.greediness), false, nullptr, topLevel,
+                             &params, candidates);
+
+        if (candidates.empty()) {
+            error = u8"粗搜未找到候选（可放宽角度/缩放范围或降低最小得分）";
+            return false;
+        }
+
+        PickTopCandidates(candidates, std::max(params.maxMatches * 2, 6));
+
+        for (int lvl = topLevel - 1; lvl >= 0; --lvl) {
+            const cv::Mat& lvlSearch = searchPyramid[static_cast<std::size_t>(lvl)];
+            const int lvlW = lvlSearch.cols;
+            const int lvlH = lvlSearch.rows;
+            const float angleStep = params.angleStepDeg * static_cast<float>(1 << lvl);
+            const float scaleStep = params.scaleStep * static_cast<float>(1 << lvl);
+
+            std::vector<TemplateMatchCandidate> refined;
+            refined.reserve(candidates.size() * 9u);
+
+            for (const TemplateMatchCandidate& seed : candidates) {
+                std::vector<float> angles;
+                std::vector<float> scales;
+                BuildSearchRange(seed.angleDeg - angleStep * 2.f, seed.angleDeg + angleStep * 2.f,
+                                 std::max(angleStep, 0.5f), angles);
+                BuildScaleSearchRange(seed.scale - scaleStep * 2.f, seed.scale + scaleStep * 2.f,
+                                 std::max(scaleStep, 0.01f), scales);
+                const cv::Rect localRoi =
+                    LocalRefineRoi(seed, searchX0i, searchY0i, lvl, lvlW, lvlH, tplW, tplH);
+                SearchAngleScaleGrid(lvlSearch, searchX0i, searchY0i, grayTpl, angles, scales,
+                                     minScore * (lvl == 0 ? 1.f : 0.9f),
+                                     subPixel && lvl == 0, &localRoi, lvl, &params, refined);
+            }
+
+            if (refined.empty()) continue;
+            candidates = std::move(refined);
+            PickTopCandidates(candidates, std::max(params.maxMatches * 2, 6));
+        }
+    }
+
+    if (candidates.empty()) {
+        error = u8"未找到满足得分阈值的匹配（可放宽角度/缩放范围或降低最小得分）";
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TemplateMatchCandidate& a, const TemplateMatchCandidate& b) {
+                  return a.score > b.score;
+              });
+
+    std::vector<TemplateMatchCandidate> picked;
+    if (!PickMatchCandidates(candidates, minScore, params.maxMatches, params.maxOverlap, picked)) {
+        error = u8"未找到满足得分阈值的匹配";
+        return false;
+    }
+
+    result.hits.reserve(picked.size());
+    for (const TemplateMatchCandidate& c : picked) {
+        TemplateMatchHit hit;
+        hit.centerX = c.centerX;
+        hit.centerY = c.centerY;
+        hit.templateWidth = c.templateWidth;
+        hit.templateHeight = c.templateHeight;
+        hit.angleDeg = c.angleDeg;
+        hit.scale = c.scale;
+        hit.score = c.score;
+        hit.bboxX = c.bboxX;
+        hit.bboxY = c.bboxY;
+        hit.bboxW = c.bboxW;
+        hit.bboxH = c.bboxH;
+        result.hits.push_back(hit);
+    }
+
+    result.ok = true;
+    return true;
+}
+
+bool MatchTemplateGrayPatch(const cv::Mat& graySearch, int searchGlobalX, int searchGlobalY,
+                            const cv::Mat& grayTpl, const TemplateMatchParams& params,
+                            TemplateMatchResult& result, std::string& error) {
+    result = {};
+    if (graySearch.empty() || grayTpl.empty()) {
+        error = u8"模板或搜索图像无效";
+        return false;
+    }
+    const int tplW = grayTpl.cols;
+    const int tplH = grayTpl.rows;
+    if (tplW < 4 || tplH < 4) {
+        error = u8"模板过小";
+        return false;
+    }
+    const int searchW = graySearch.cols;
+    const int searchH = graySearch.rows;
+    if (searchW < tplW || searchH < tplH) {
+        error = u8"搜索区域小于模板";
+        return false;
+    }
+
+    result.templateX0 = 0.f;
+    result.templateY0 = 0.f;
+    result.templateX1 = static_cast<float>(tplW - 1);
+    result.templateY1 = static_cast<float>(tplH - 1);
+    result.searchX0 = static_cast<float>(searchGlobalX);
+    result.searchY0 = static_cast<float>(searchGlobalY);
+    result.searchX1 = static_cast<float>(searchGlobalX + searchW - 1);
+    result.searchY1 = static_cast<float>(searchGlobalY + searchH - 1);
+
+    const bool subPixel = params.subPixelRefine;
+    const float minScore = std::clamp(params.minScore, 0.f, 1.f);
+    std::vector<TemplateMatchCandidate> candidates;
+
+    if (!params.usePyramid) {
+        std::vector<float> angles;
+        std::vector<float> scales;
+        BuildSearchRange(params.angleMinDeg, params.angleMaxDeg, params.angleStepDeg, angles);
+        BuildScaleSearchRange(params.scaleMin, params.scaleMax, params.scaleStep, scales);
+        SearchAngleScaleGrid(graySearch, searchGlobalX, searchGlobalY, grayTpl, angles, scales,
+                             minScore, subPixel, nullptr, 0, &params, candidates);
+    } else {
+        const int numLevels = AutoPyramidLevels(tplW, tplH, params.pyramidLevels);
+        std::vector<cv::Mat> searchPyramid;
+        BuildGrayPyramid(graySearch, numLevels, searchPyramid);
+        const int topLevel = static_cast<int>(searchPyramid.size()) - 1;
+
+        std::vector<float> coarseAngles;
+        std::vector<float> coarseScales;
+        const float coarseAngleStep = params.angleStepDeg * static_cast<float>(1 << topLevel);
+        const float coarseScaleStep = params.scaleStep * static_cast<float>(1 << topLevel);
+        BuildSearchRange(params.angleMinDeg, params.angleMaxDeg, coarseAngleStep, coarseAngles);
+        BuildScaleSearchRange(params.scaleMin, params.scaleMax, coarseScaleStep, coarseScales);
+
+        SearchAngleScaleGrid(searchPyramid[static_cast<std::size_t>(topLevel)], searchGlobalX,
+                             searchGlobalY, grayTpl, coarseAngles, coarseScales,
+                             CoarseMinScore(minScore, params.greediness), false, nullptr, topLevel,
+                             &params, candidates);
+
+        if (candidates.empty()) {
+            error = u8"粗搜未找到候选（可放宽角度/缩放范围或降低最小得分）";
+            return false;
+        }
+
+        PickTopCandidates(candidates, std::max(params.maxMatches * 2, 6));
+
+        for (int lvl = topLevel - 1; lvl >= 0; --lvl) {
+            const cv::Mat& lvlSearch = searchPyramid[static_cast<std::size_t>(lvl)];
+            const int lvlW = lvlSearch.cols;
+            const int lvlH = lvlSearch.rows;
+            const float angleStep = params.angleStepDeg * static_cast<float>(1 << lvl);
+            const float scaleStep = params.scaleStep * static_cast<float>(1 << lvl);
+
+            std::vector<TemplateMatchCandidate> refined;
+            refined.reserve(candidates.size() * 9u);
+
+            for (const TemplateMatchCandidate& seed : candidates) {
+                std::vector<float> angles;
+                std::vector<float> scales;
+                BuildSearchRange(seed.angleDeg - angleStep * 2.f, seed.angleDeg + angleStep * 2.f,
+                                 std::max(angleStep, 0.5f), angles);
+                BuildScaleSearchRange(seed.scale - scaleStep * 2.f, seed.scale + scaleStep * 2.f,
+                                 std::max(scaleStep, 0.01f), scales);
+                const cv::Rect localRoi =
+                    LocalRefineRoi(seed, searchGlobalX, searchGlobalY, lvl, lvlW, lvlH, tplW,
+                                   tplH);
+                SearchAngleScaleGrid(lvlSearch, searchGlobalX, searchGlobalY, grayTpl, angles,
+                                     scales, minScore * (lvl == 0 ? 1.f : 0.9f),
+                                     subPixel && lvl == 0, &localRoi, lvl, &params, refined);
+            }
+
+            if (refined.empty()) continue;
+            candidates = std::move(refined);
+            PickTopCandidates(candidates, std::max(params.maxMatches * 2, 6));
+        }
+    }
+
+    if (candidates.empty()) {
+        error = u8"未找到满足得分阈值的匹配";
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TemplateMatchCandidate& a, const TemplateMatchCandidate& b) {
+                  return a.score > b.score;
+              });
+
+    std::vector<TemplateMatchCandidate> picked;
+    if (!PickMatchCandidates(candidates, minScore, params.maxMatches, params.maxOverlap, picked)) {
+        error = u8"未找到满足得分阈值的匹配";
+        return false;
+    }
+
+    result.hits.reserve(picked.size());
+    for (const TemplateMatchCandidate& c : picked) {
+        TemplateMatchHit hit;
+        hit.centerX = c.centerX;
+        hit.centerY = c.centerY;
+        hit.templateWidth = c.templateWidth;
+        hit.templateHeight = c.templateHeight;
+        hit.angleDeg = c.angleDeg;
+        hit.scale = c.scale;
+        hit.score = c.score;
+        hit.bboxX = c.bboxX;
+        hit.bboxY = c.bboxY;
+        hit.bboxW = c.bboxW;
+        hit.bboxH = c.bboxH;
+        result.hits.push_back(hit);
+    }
+
+    result.ok = true;
+    return true;
 }
 
 }  // namespace OpenCv2D

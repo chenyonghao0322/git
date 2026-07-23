@@ -11,6 +11,27 @@
 #include <functional>
 #include <string>
 
+enum class FilterCompareViewMode : int {
+    Compare = 0,
+    Original = 1,
+    FilteredOnly = 2,
+    RemovedOnly = 3,
+};
+
+inline const char* FilterCompareViewModeLabel(FilterCompareViewMode mode) {
+    switch (mode) {
+        case FilterCompareViewMode::Compare:
+            return u8"对比";
+        case FilterCompareViewMode::Original:
+            return u8"原始";
+        case FilterCompareViewMode::FilteredOnly:
+            return u8"滤波后";
+        case FilterCompareViewMode::RemovedOnly:
+            return u8"差异";
+    }
+    return u8"对比";
+}
+
 struct AlgoToolsHost {
     AlgorithmBackend backend = AlgorithmBackend::PCL;
     const PointCloud* cloud = nullptr;
@@ -22,7 +43,7 @@ struct AlgoToolsHost {
     bool filterCompareActive = false;
     int filterLastKept = 0;
     int filterLastRemoved = 0;
-    bool* filterHideRemoved = nullptr;
+    FilterCompareViewMode* filterCompareViewMode = nullptr;
 
     float* filterVoxelLeaf = nullptr;
     float* filterRadius = nullptr;

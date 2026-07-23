@@ -8,9 +8,9 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 
-void FinalizeCloud(PointCloud& cloud, const char* sourceLabel) {
+void FinalizeCloud(PointCloud& cloud, const char* sourceLabel, bool centerToOrigin) {
     cloud.RecomputeBounds();
-    cloud.CenterToOrigin();
+    if (centerToOrigin) cloud.CenterToOrigin();
     cloud.ResetMask();
     cloud.colors.clear();
     cloud.sourcePath = sourceLabel;
@@ -18,7 +18,8 @@ void FinalizeCloud(PointCloud& cloud, const char* sourceLabel) {
 
 }  // namespace
 
-bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& error) {
+bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& error,
+                    bool centerToOrigin) {
     if (params.radius <= 1e-6f) {
         error = u8"球半径必须大于 0。";
         return false;
@@ -48,7 +49,7 @@ bool GenerateSphere(const SphereParams& params, PointCloud& out, std::string& er
         out.points.push_back(p);
     }
 
-    FinalizeCloud(out, u8"<生成:球面>");
+    FinalizeCloud(out, u8"<生成:球面>", centerToOrigin);
     return true;
 }
 
@@ -89,7 +90,7 @@ bool GenerateCylinder(const CylinderParams& params, PointCloud& out, std::string
         out.points.push_back(center + Vec3{r * std::cos(a), r * std::sin(a), h});
     }
 
-    FinalizeCloud(out, u8"<生成:圆柱>");
+    FinalizeCloud(out, u8"<生成:圆柱>", true);
     return true;
 }
 
@@ -123,7 +124,36 @@ bool GenerateDisk(const DiskParams& params, PointCloud& out, std::string& error)
     }
     (void)uni01;
 
-    FinalizeCloud(out, u8"<生成:圆面>");
+    FinalizeCloud(out, u8"<生成:圆面>", true);
+    return true;
+}
+
+bool GeneratePlane(const PlaneParams& params, PointCloud& out, std::string& error) {
+    if (params.extentX <= 1e-6f || params.extentY <= 1e-6f) {
+        error = u8"平面半宽必须大于 0。";
+        return false;
+    }
+    if (params.pointCount < 16) {
+        error = u8"点数至少为 16。";
+        return false;
+    }
+
+    out.Clear();
+    out.points.reserve(static_cast<std::size_t>(params.pointCount));
+
+    std::mt19937 rng(91u);
+    std::uniform_real_distribution<float> uniX(-params.extentX, params.extentX);
+    std::uniform_real_distribution<float> uniY(-params.extentY, params.extentY);
+    std::normal_distribution<float> noiseN(0.f, params.noise > 0.f ? params.noise : 0.f);
+
+    const Vec3 center{params.centerX, params.centerY, params.centerZ};
+    for (int i = 0; i < params.pointCount; ++i) {
+        float z = 0.f;
+        if (params.noise > 0.f) z += noiseN(rng);
+        out.points.push_back(center + Vec3{uniX(rng), uniY(rng), z});
+    }
+
+    FinalizeCloud(out, u8"<生成:平面>", true);
     return true;
 }
 

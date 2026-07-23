@@ -11,7 +11,7 @@ endif()
 
 # ---------- PCL ----------
 set(PCL_DIR "D:/software/PCL 1.14.0/cmake" CACHE PATH "PCL cmake directory")
-find_package(PCL 1.14 REQUIRED COMPONENTS common filters sample_consensus segmentation search kdtree features)
+find_package(PCL 1.14 REQUIRED COMPONENTS common filters sample_consensus segmentation search kdtree features registration)
 
 # ---------- OpenCV ----------
 set(OpenCV_DIR "D:/software/opencv-4.12.0/opencv/build/x64/vc16/lib" CACHE PATH "OpenCV cmake directory")
@@ -58,11 +58,16 @@ add_executable(PointCloudViewer
     src/tools/PclTools.cpp
     src/tools/UndoHistory.cpp
     src/tools/OpenCv2D.cpp
+    src/tools/ShapeTemplateMatch.cpp
+    src/tools/HalconShapeMatch.cpp
     src/app/Application.cpp
     src/app/FileDialog.cpp
+    src/app/ShapeTemplateMatchWindow.cpp
+    src/app/HalconMatchWindow.cpp
     src/app/UiTheme.cpp
     src/app/AlgorithmEditor.cpp
     src/app/AlgoToolsPanel.cpp
+    src/app/DbTreePanel.cpp
     src/app/PclPanel.cpp
     src/app/PclToolsPanel.cpp
 )
@@ -78,6 +83,20 @@ target_link_directories(PointCloudViewer PRIVATE ${PCL_LIBRARY_DIRS})
 target_link_libraries(PointCloudViewer PRIVATE imgui glfw ${PCL_LIBRARIES} ${OpenCV_LIBS})
 target_include_directories(PointCloudViewer PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(PointCloudViewer PRIVATE ${PCL_DEFINITIONS})
+
+# ---------- Halcon (optional) ----------
+set(HALCON_ROOT "D:/software/Halcon20.11" CACHE PATH "Halcon installation root")
+option(POINTCLOUDVIEWER_ENABLE_HALCON "Enable Halcon shape matching" ON)
+if(POINTCLOUDVIEWER_ENABLE_HALCON AND EXISTS "${HALCON_ROOT}/include/halconcpp/HalconCpp.h")
+    message(STATUS "Halcon found at ${HALCON_ROOT}")
+    target_compile_definitions(PointCloudViewer PRIVATE POINTCLOUDVIEWER_USE_HALCON=1)
+    target_include_directories(PointCloudViewer PRIVATE
+        "${HALCON_ROOT}/include"
+        "${HALCON_ROOT}/include/halconcpp"
+    )
+    target_link_directories(PointCloudViewer PRIVATE "${HALCON_ROOT}/lib/x64-win64")
+    target_link_libraries(PointCloudViewer PRIVATE halconcpp halcon)
+endif()
 
 if(WIN32)
     target_link_libraries(PointCloudViewer PRIVATE opengl32 comdlg32 windowscodecs ole32)
@@ -100,6 +119,16 @@ if(WIN32)
             "${_opencv_bin}/opencv_world4120.dll"
             $<TARGET_FILE_DIR:PointCloudViewer>
     )
+
+    if(POINTCLOUDVIEWER_ENABLE_HALCON AND EXISTS "${HALCON_ROOT}/bin/x64-win64/halcon.dll")
+        add_custom_command(TARGET PointCloudViewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${HALCON_ROOT}/bin/x64-win64/halcon.dll"
+                "${HALCON_ROOT}/bin/x64-win64/halconcpp.dll"
+                "${HALCON_ROOT}/bin/x64-win64/halcondl.dll"
+                $<TARGET_FILE_DIR:PointCloudViewer>
+        )
+    endif()
 endif()
 
 # Copy sample data next to exe

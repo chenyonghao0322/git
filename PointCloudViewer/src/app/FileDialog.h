@@ -8,5 +8,9 @@ namespace FileDialog {
 std::string OpenPointCloudFile();
 std::string SavePointCloudFile();
 std::string OpenImageFile(const char* title = nullptr);
+std::string OpenShapeTemplateFile();
+std::string SaveShapeTemplateFile();
+std::string OpenHalconShapeModelFile();
+std::string SaveHalconShapeModelFile();
 
 }  // namespace FileDialog

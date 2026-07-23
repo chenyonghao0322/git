@@ -43,9 +43,11 @@ public:
 private:
     void DrawMarkersAndLines(const Mat4& mvp) const;
     void DrawPlane(const Mat4& mvp) const;
+    void DrawSphere(const Mat4& mvp) const;
     void DrawFitWire(const Mat4& mvp) const;
     void DrawAxes(const Mat4& mvp) const;
     void RebuildPlaneMesh(const PlaneModel& plane);
+    void RebuildSphereMesh(const SphereModel& sphere);
     void RebuildAxesMesh(float axisLength);
     void UploadFitWire(const std::vector<float>& posRgb);  // interleaved x,y,z,r,g,b
 
@@ -63,6 +65,11 @@ private:
     unsigned int planeVbo_ = 0;
     int planeVertexCount_ = 0;
     bool hasPlane_ = false;
+
+    unsigned int sphereVao_ = 0;
+    unsigned int sphereVbo_ = 0;
+    int sphereVertexCount_ = 0;
+    bool hasSphere_ = false;
 
     unsigned int fitWireVao_ = 0;
     unsigned int fitWireVbo_ = 0;

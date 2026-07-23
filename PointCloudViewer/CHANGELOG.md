@@ -1,5 +1,45 @@
 # 更新日志
 
+## v0.5（2026-07-23）
+
+### 新增：Halcon 形状模板匹配
+
+- 菜单「2D算子 → halcon匹配」，与「2D模板匹配」并存
+- 封装 `HalconShapeMatch`：`CreateScaledShapeModel` / `FindScaledShapeModel`、`.shm` 保存/加载
+- CMake 可选链接 Halcon 20.11，Release 自动复制运行时 DLL
+- 全屏嵌入主窗口（与算法编辑器同风格），非独立浮动窗
+- 支持整图创建或旋转 ROI 框选创建模板
+- 模板轮廓预览、匹配结果轮廓叠加、得分/缩放标注
+
+### 新增：2D 模板匹配（OpenCV）
+
+- 菜单「2D算子 → 2D模板匹配」
+- 封装 `ShapeTemplateMatch`：创建/查找/保存/加载形状模板
+
+### 新增：点云数据库树（DbTree）
+
+- 侧栏点云图层树形管理（`DbTreePanel`）
+- 多图层显示/隐藏、选中切换
+
+### Halcon 匹配修复与优化（2026-07-23）
+
+| 问题 | 处理 |
+|------|------|
+| 框选 ROI 后轮廓仍是整图 | `CropRectangle2` 物理裁剪 ROI |
+| 匹配轮廓偏移（缩放≠1） | 按 Halcon 官方 `VectorAngleToRigid` + `HomMat2dScale(Row,Col)` 变换 |
+| ROI 框选后左右被截断 | 修正 `Length1/Length2` 与宽高的对应关系 |
+| 整图出现最外圈矩形轮廓 | 复制扩边（BORDER_REPLICATE）+ domain 内缩 |
+| 最小得分 0.75 漏检、0.4 却显示 0.84 | 搜索阶段放宽阈值，结果按用户最小得分二次过滤 |
+| 大目标内误检小缩放 | 嵌套误检过滤；默认最小得分 0.75 |
+
+### 其他
+
+- `Application`：3D 多图层、ICP、段差、2D 工具等配套扩展
+- `OpenCv2D`：模板匹配与若干 2D 算子增强
+- `FileDialog`：支持 `.shm` / 模板文件对话框
+
+---
+
 ## v0.4（2026-07-22）
 
 ### 新增：2D 图像算子（OpenCv2D）

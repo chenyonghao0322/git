@@ -45,6 +45,8 @@ bool PointCloudRenderer::Init(std::string& error) {
     glGenBuffers(1, &overlayVbo_);
     glGenVertexArrays(1, &planeVao_);
     glGenBuffers(1, &planeVbo_);
+    glGenVertexArrays(1, &sphereVao_);
+    glGenBuffers(1, &sphereVbo_);
     glGenVertexArrays(1, &axesVao_);
     glGenBuffers(1, &axesVbo_);
     glGenVertexArrays(1, &fitWireVao_);
@@ -254,6 +256,61 @@ void PointCloudRenderer::SetPlaneOverlay(const std::optional<PlaneModel>& plane)
     RebuildPlaneMesh(*plane);
 }
 
+void PointCloudRenderer::RebuildSphereMesh(const SphereModel& sphere) {
+    const Vec3 c = sphere.center;
+    const float R = sphere.radius;
+    const Vec3 color{1.f, 0.55f, 0.15f};
+    constexpr int latSeg = 32;
+    constexpr int lonSeg = 48;
+    constexpr float kPi = 3.14159265f;
+
+    std::vector<Vertex> verts;
+    verts.reserve(static_cast<std::size_t>(latSeg * lonSeg * 6));
+
+    auto sph = [&](float theta, float phi) {
+        const float sinT = std::sin(theta);
+        const float cosT = std::cos(theta);
+        const float cosP = std::cos(phi);
+        const float sinP = std::sin(phi);
+        return c + Vec3{R * sinT * cosP, R * cosT, R * sinT * sinP};
+    };
+
+    for (int lat = 0; lat < latSeg; ++lat) {
+        const float theta0 = kPi * static_cast<float>(lat) / latSeg;
+        const float theta1 = kPi * static_cast<float>(lat + 1) / latSeg;
+        for (int lon = 0; lon < lonSeg; ++lon) {
+            const float phi0 = 2.f * kPi * static_cast<float>(lon) / lonSeg;
+            const float phi1 = 2.f * kPi * static_cast<float>(lon + 1) / lonSeg;
+            const Vec3 p00 = sph(theta0, phi0);
+            const Vec3 p10 = sph(theta0, phi1);
+            const Vec3 p11 = sph(theta1, phi1);
+            const Vec3 p01 = sph(theta1, phi0);
+            auto push = [&](const Vec3& p) {
+                verts.push_back({p.x, p.y, p.z, color.x, color.y, color.z});
+            };
+            push(p00);
+            push(p10);
+            push(p11);
+            push(p00);
+            push(p11);
+            push(p01);
+        }
+    }
+
+    sphereVertexCount_ = static_cast<int>(verts.size());
+    glBindVertexArray(sphereVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, sphereVbo_);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(verts.size() * sizeof(Vertex)),
+                 verts.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                          reinterpret_cast<void*>(sizeof(float) * 3));
+    glBindVertexArray(0);
+    hasSphere_ = true;
+}
+
 void PointCloudRenderer::UploadFitWire(const std::vector<float>& posRgb) {
     fitWireVertexCount_ = static_cast<int>(posRgb.size() / 6);
     if (fitWireVertexCount_ <= 0) {
@@ -302,31 +359,11 @@ Vec3 OrthoU(const Vec3& nIn) {
 
 void PointCloudRenderer::SetSphereOverlay(const std::optional<SphereModel>& sphere) {
     if (!sphere || sphere->radius <= 0.f) {
-        ClearFitWireOverlay();
+        hasSphere_ = false;
+        sphereVertexCount_ = 0;
         return;
     }
-    const Vec3 c = sphere->center;
-    const float R = sphere->radius;
-    const Vec3 col{1.f, 0.55f, 0.15f};
-    std::vector<float> verts;
-    verts.reserve(64 * 3 * 2);
-    constexpr int N = 64;
-    constexpr float kPi = 3.14159265f;
-
-    // 三条正交大圆（清晰球体轮廓，避免多条纬线像“多个圆”）
-    const Vec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    for (const Vec3& axis : axes) {
-        const Vec3 u = OrthoU(axis);
-        const Vec3 v = axis.Cross(u).Normalized();
-        Vec3 prev;
-        for (int i = 0; i <= N; ++i) {
-            const float a = 2.f * kPi * static_cast<float>(i) / N;
-            const Vec3 p = c + u * (R * std::cos(a)) + v * (R * std::sin(a));
-            if (i > 0) PushSeg(verts, prev, p, col);
-            prev = p;
-        }
-    }
-    UploadFitWire(verts);
+    RebuildSphereMesh(*sphere);
 }
 
 void PointCloudRenderer::SetCircleOverlay(const std::optional<CircleModel>& circle) {
@@ -482,6 +519,29 @@ void PointCloudRenderer::DrawPlane(const Mat4& mvp) const {
     glDepthMask(GL_TRUE);
 }
 
+void PointCloudRenderer::DrawSphere(const Mat4& mvp) const {
+    if (!hasSphere_ || sphereVertexCount_ <= 0) return;
+
+    shader_.Use();
+    shader_.SetMat4("uMVP", mvp.m);
+    shader_.SetFloat("uOpacity", 0.38f);
+    shader_.SetFloat("uPointSize", 1.f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.f, -1.f);
+
+    glBindVertexArray(sphereVao_);
+    glDrawArrays(GL_TRIANGLES, 0, sphereVertexCount_);
+    glBindVertexArray(0);
+
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthMask(GL_TRUE);
+}
+
 void PointCloudRenderer::DrawFitWire(const Mat4& mvp) const {
     if (fitWireVertexCount_ < 2) return;
     shader_.Use();
@@ -519,6 +579,7 @@ void PointCloudRenderer::Draw(const Camera& camera, int fbWidth, int fbHeight, f
 
     DrawAxes(mvp);
     DrawPlane(mvp);
+    DrawSphere(mvp);
     DrawFitWire(mvp);
     DrawMarkersAndLines(mvp);
 }
@@ -530,12 +591,17 @@ void PointCloudRenderer::Shutdown() {
     if (overlayVao_) glDeleteVertexArrays(1, &overlayVao_);
     if (planeVbo_) glDeleteBuffers(1, &planeVbo_);
     if (planeVao_) glDeleteVertexArrays(1, &planeVao_);
+    if (sphereVbo_) glDeleteBuffers(1, &sphereVbo_);
+    if (sphereVao_) glDeleteVertexArrays(1, &sphereVao_);
     if (fitWireVbo_) glDeleteBuffers(1, &fitWireVbo_);
     if (fitWireVao_) glDeleteVertexArrays(1, &fitWireVao_);
     if (axesVbo_) glDeleteBuffers(1, &axesVbo_);
     if (axesVao_) glDeleteVertexArrays(1, &axesVao_);
-    vbo_ = vao_ = overlayVbo_ = overlayVao_ = planeVbo_ = planeVao_ = axesVbo_ = axesVao_ = 0;
+    vbo_ = vao_ = overlayVbo_ = overlayVao_ = planeVbo_ = planeVao_ = sphereVbo_ = sphereVao_ =
+        axesVbo_ = axesVao_ = 0;
     fitWireVbo_ = fitWireVao_ = 0;
-    vertexCount_ = markerCount_ = lineVertexCount_ = planeVertexCount_ = fitWireVertexCount_ = 0;
+    vertexCount_ = markerCount_ = lineVertexCount_ = planeVertexCount_ = sphereVertexCount_ =
+        fitWireVertexCount_ = 0;
     hasPlane_ = false;
+    hasSphere_ = false;
 }

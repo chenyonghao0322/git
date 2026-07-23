@@ -12,10 +12,14 @@
 #include "render/Camera.h"
 #include "render/PointCloudRenderer.h"
 #include "tools/MeasureTools.h"
+#include "tools/PclTools.h"
 #include "tools/UndoHistory.h"
 #include "tools/OpenCv2D.h"
 #include "app/AlgorithmEditor.h"
+#include "app/ShapeTemplateMatchWindow.h"
+#include "app/HalconMatchWindow.h"
 #include "app/AlgoToolsPanel.h"
+#include "app/DbTreePanel.h"
 #include "app/PclPanel.h"
 #include "app/PclToolsPanel.h"
 #include "tools/AlgorithmBackend.h"
@@ -53,6 +57,7 @@ enum class Image2DTool {
     RegionBlob,
     DepthHeightDiff,
     DepthProfile,
+    TemplateMatch,
 };
 
 enum class ThreePointPhase : int {
@@ -69,6 +74,17 @@ enum class PointPickPhase : int {
 enum class CircleCaliperPhase : int {
     PickCenter = 0,
     DragRadius = 1,
+};
+
+enum class TemplateMatchPhase : int {
+    DrawTemplate = 0,
+    DrawSearch = 1,
+};
+
+enum class DepthProfileMode : int {
+    ScanRow = 0,     // 扫描行 X-Z（线扫常用）
+    ScanColumn = 1,  // 扫描列 Y-Z
+    FreeLine = 2,    // 任意线段
 };
 
 inline const char* Image2DToolLabel(Image2DTool tool) {
@@ -119,6 +135,8 @@ inline const char* Image2DToolLabel(Image2DTool tool) {
             return u8"两点高度差";
         case Image2DTool::DepthProfile:
             return u8"剖面高度曲线";
+        case Image2DTool::TemplateMatch:
+            return u8"模板匹配";
         default:
             return u8"无";
     }
@@ -162,16 +180,45 @@ private:
         bool valid() const { return texId != 0 && width > 0 && height > 0; }
     };
 
+    struct SceneCloudLayer {
+        int id = 0;
+        PointCloud cloud;
+        bool visible = true;
+        PointCloudRenderer renderer;
+        int gpuPointCount = 0;
+        bool needUpload = true;
+        std::vector<std::size_t> displayIndices;
+        bool rendererReady = false;
+    };
+
     // --- UI 绘制 ---
     void DrawUi();                    // 整帧 ImGui 布局入口
     float DrawMenuBar();              // 顶部菜单栏，返回底边 Y
     void DrawToolbar(float y, float height);
-    void DrawToolPanel();             // 左侧工具面板（ROI、拟合、剖切等）
+    void DrawToolPanel();             // 左侧工具面板（ROI、拟合等）
+    void DrawDbTreePanel(float height);
+    void DrawDbTreeSplitter(float maxDbHeight);
+    void DrawEmptyCloudPrompt(float contentTop, float contentH);
+    DbTreeHost BuildDbTreeHost();
+    void DrawPlaneDistanceHistogram(const PlaneDistanceProfile& profile);
+    void UpdatePlaneFitProfile(const PlaneModel& plane, const std::vector<std::size_t>& indices);
+    void FitCameraToAllClouds();
+    void SetActiveLayerById(int layerId);
+    void RemoveSceneLayerById(int layerId);
+    void InitLayerRenderer(SceneCloudLayer& layer);
+    void ShutdownSceneLayers();
+    PointCloud& MainCloud();
+    const PointCloud& MainCloud() const;
+    SceneCloudLayer& ActiveLayer();
+    const SceneCloudLayer& ActiveLayer() const;
+    PointCloudRenderer& ActiveRenderer();
+    bool HasSceneClouds() const;
     void DrawViewAxisWidget(float contentTop, float contentBottom, float leftInset);
     void DrawAboutPopup();
     void DrawNativeAlgoPasswordPopup();
     void DrawSectionPanel();          // 截面 2D 图与测距面板
     void DrawStepGapPanel();          // 段差结果面板
+    void DrawDepthProfilePanel();     // 深度 Profile 曲线面板
     void DrawFilterMenuItems();       // 菜单栏滤波子项
     void Draw2DOperatorMenuItems();   // 菜单栏 2D 算子（OpenCV）
     void DrawCreatePopups();          // 创建球/柱/圆盘弹窗
@@ -179,12 +226,13 @@ private:
     void HandleInput();               // 键盘快捷键（撤销、工具切换等）
 
     // --- 文件与点云 ---
-    bool LoadPath(const std::string& path);
+    bool LoadPath(const std::string& path, bool append = true);
     bool SaveCloud();
-    bool ApplyCloud(PointCloud&& cloud, const char* statusMsg);  // 加载后重置状态与撤销栈
+    bool ApplyCloud(PointCloud&& cloud, const char* statusMsg, bool append = false);
     void CreateSphereCloud();
     void CreateCylinderCloud();
     void CreateDiskCloud();
+    void CreatePlaneCloud();
     bool OpenDepthImage();
     bool OpenBrightnessImage();
     void DestroyImageView(ImageView& view);
@@ -195,11 +243,15 @@ private:
     void ApplyViewPreset(int preset);  // 0顶 1侧X 2侧Z 3沿Y 4包围盒
     void SetToolMode(ToolMode mode);
     void ClearToolVisuals(bool resetStatus = true);
-    void RefreshGpu();                 // 上传主点云到 GPU
+    void RefreshGpu();                 // 上传当前激活点云到 GPU
+    void RefreshAllLayerGpu();         // 上传所有场景点云
+    void RefreshLayerGpu(SceneCloudLayer& layer, bool isActive);
     void RebuildAnalysisColors();    // 按分析结果（平面度/段差/拟合）着色
     void OnLeftClick(float mouseX, float mouseY);  // 3D 视区左键：点选/测距/剖切等
     void DrawOverlays();
     void UpdateOverlays();           // 同步拟合线框、测距线等到渲染器
+    void SyncFittedSphereLayer(const SphereModel& sphere);
+    void RemoveFittedSphereLayers();
 
     // --- ROI 框选 ---
     void BeginRoiDrag(float mouseX, float mouseY);
@@ -224,10 +276,19 @@ private:
     PointCloud& EditableCloud();       // 当前可编辑点云（主云或填充云）
     const PointCloud& EditableCloud() const;
     void DrawDualCloudPaneLabels();
+    void DrawIcpOverlayLabel();
     void DrawFitRoiShapeControls();
     void ResetFitRoiSelection();
     void BuildFilledPaneDisplayCloud(PointCloud& out);  // 灰原+青补合成
     bool MeasureHoleRadiusWithBackend(HoleMeasureResult& out, std::string& error);
+
+    // --- ICP 配准 ---
+    void LoadIcpSourceCloud();
+    void RunIcpRegistration();
+    void ClearIcpState();
+    void RefreshIcpGpu();
+    void ReparentCloudToTargetFrame(PointCloud& src) const;
+    void DrawIcpPanel();
 
     // --- 截面 ---
     void GenerateSection();
@@ -264,7 +325,6 @@ private:
     float SidebarWidth() const;
     void DrawSidebarSplitter(float contentTop, float contentH);
     void DrawConsolePanel();
-    void DrawConsoleSplitter(float contentTop, float contentH);
     void AppendConsoleLog(const std::string& msg);
     void SetStatus(const std::string& msg, bool logConsole = true);
     float ConsoleHeight() const;
@@ -350,14 +410,29 @@ private:
     void ComputeRoundness();
     void ClearRoundness();
     int FindClosestMeasuredCircleCaliper(int imageSource, float px, float py, float maxDistPx) const;
-    void PreviewRegionBlob(ImageView& view);
+    void PreviewRegionBlob(ImageView& view, bool quiet = false);
+    void RefreshRegionBlobPreview();
+    bool HasRegionBlobRoi() const;
     void ConfirmRegionBlob();
     void CancelRegionBlobPending();
     void AddDepthHeightSample(float px, float py, int imageSource);
     void ClearDepthHeightDiff();
     void PreviewDepthProfile(ImageView& view);
+    void PreviewDepthProfileAt(float px, float py, ImageView& view);
     void ClearDepthProfile();
+    void PreviewTemplateMatch(ImageView& view);
+    void ConfirmTemplateMatch();
+    void CancelTemplateMatchPending();
+    void ResetTemplateMatchPick();
+    void ClearTemplateMatch();
     void ResetImage2dView();
+    void EnterView2DMode();
+    void EnterView3DMode();
+    void RestoreApplicationState();
+    void RotateImages2d90CW();
+    void RotateImages2d90CCW();
+    bool RotateImageView90CW(ImageView& view);
+    bool RotateImageView90CCW(ImageView& view);
     void DrawLineMeasureOverlay(ImDrawList* dl, const ImageView& view, float cursorX, float cursorY,
                                 float drawW, float drawH);
     void DrawImage2DToolPanel();
@@ -372,6 +447,7 @@ private:
     void RunFilterPreview(int type, AlgorithmBackend backend);  // 0体素 1半径 2统计
     void ApplyFilterResult();
     void ClearFilterCompare();
+    void DrawFilterCompareViewControls();
 
     // --- 算法后端桥接（自研 / PCL 二选一）---
     bool FitPlaneWithBackend(const std::vector<std::size_t>& indices, PlaneModel& plane,
@@ -391,7 +467,6 @@ private:
     bool ExtractSectionWithBackend(bool cutAlongX, float position, float thickness,
                                    SectionData& out, std::string& error,
                                    AlgorithmBackend backend);
-    void ApplyClipMaskWithBackend(const Vec3& normal, float d, bool enabled);
     void SelectRoiWithBackend(int fbW, int fbH, float x0, float y0, float x1, float y1,
                               std::vector<std::size_t>& outIndices, RoiShape shape,
                               bool useWorldSize, float worldRadius, float worldHalfW,
@@ -407,14 +482,17 @@ private:
     AlgorithmBackend EffectiveAlgoBackend() const;  // 当前生效的算法后端
 
     GLFWwindow* window_ = nullptr;
-    PointCloud cloud_;           // 主点云：加载/编辑的原始数据
+    std::vector<SceneCloudLayer> sceneLayers_;
+    int activeLayerIndex_ = -1;
+    int nextSceneLayerId_ = 1;
+    int dbSelectedLayerId_ = 0;
+    DbEntityId dbSelectedSpecial_ = DbEntityId::None;
     PointCloud filledCloud_;     // 填充点云：ROI 填充生成的补点（仅掩码可编辑）
     Camera camera_;
-    PointCloudRenderer renderer_;
     PointCloudRenderer filledRenderer_;  // 填充视区专用渲染器（灰原+青补叠加）
+    PointCloudRenderer icpRenderer_;     // ICP 源点云叠加渲染
     MeasureState measure_;
     UndoHistory history_;
-    std::vector<std::size_t> displayIndices_;
     std::vector<std::size_t> displayFilledIndices_;
     bool dualCloudView_ = false;   // true：显示「灰原+青补」填充视区
     int activeCloudPane_ = 0;    // 0=主点云 1=填充点云（双视区时框选/删除作用对象）
@@ -424,13 +502,24 @@ private:
     float zMin_ = 0.f;
     float zMax_ = 1.f;
     bool autoZRange_ = true;
-    bool needUpload_ = false;
+    bool sceneGpuDirty_ = false;
     bool needUploadFilled_ = false;
+    bool needUploadIcp_ = false;
     int maxDisplayPoints_ = 1200000;
-    int gpuPointCount_ = 0;
     int gpuFilledPointCount_ = 0;
     float filledZMin_ = 0.f;
     float filledZMax_ = 1.f;
+    PointCloud icpSourceCloud_;
+    PointCloud icpAlignedSource_;
+    PclTools::IcpParams icpParams_;
+    PclTools::IcpResult icpResult_;
+    bool icpSourceLoaded_ = false;
+    bool icpOverlayActive_ = false;
+    bool icpShowAligned_ = false;
+    float icpZMin_ = 0.f;
+    float icpZMax_ = 1.f;
+    bool dbFilledRefVisible_ = true;
+    bool dbFilledResultVisible_ = true;
     bool showAxes_ = true;
     float axesLength_ = 1.f;
     bool showAbout_ = false;
@@ -440,7 +529,8 @@ private:
     bool showCreateSphere_ = false;
     bool showCreateCylinder_ = false;
     bool showCreateDisk_ = false;
-    static constexpr const char* kAppVersion = "0.4";
+    bool showCreatePlane_ = false;
+    static constexpr const char* kAppVersion = "0.5";
 
     // 创建点云参数
     float genSphereRadius_ = 10.f;
@@ -453,13 +543,17 @@ private:
     float genDiskRadius_ = 10.f;
     int genDiskPoints_ = 20000;
     float genDiskNoise_ = 0.f;
+    float genPlaneExtentX_ = 20.f;
+    float genPlaneExtentY_ = 20.f;
+    int genPlanePoints_ = 20000;
+    float genPlaneNoise_ = 0.f;
 
     // 2D 深度图 / 亮度图窗口（不转点云）
     ImageView depthImage_;
     ImageView brightnessImage_;
-    bool showImagePanel_ = false;
     int imagePanelTab_ = 0;  // 0 深度 1 亮度
     float sidebarPreferredW_ = 360.f;
+    float dbTreePreferredH_ = 200.f;
     float imagePanelPreferredW_ = 420.f;
     float image2dZoom_ = 1.f;
     float image2dPanX_ = 0.f;
@@ -762,8 +856,42 @@ private:
     float depthProfileRoiX1_ = 0.f;
     float depthProfileRoiY1_ = 0.f;
     bool depthProfileValid_ = false;
-    int depthProfileSampleCount_ = 64;
+    bool showDepthProfilePanel_ = true;
+    DepthProfileMode depthProfileMode_ = DepthProfileMode::ScanRow;
+    int depthProfileSampleCount_ = 256;
     std::vector<OpenCv2D::LineProfileSample> depthProfileSamples_;
+    std::string depthProfileLabel_;
+    int depthProfileHoverIdx_ = -1;
+    int depthProfilePickA_ = -1;
+    int depthProfilePickB_ = -1;
+    float depthProfileMeasureDelta_ = 0.f;
+    bool depthProfileMeasureValid_ = false;
+
+    TemplateMatchPhase templateMatchPhase_ = TemplateMatchPhase::DrawTemplate;
+    bool templateMatchTplDragging_ = false;
+    bool templateMatchSearchDragging_ = false;
+    int templateMatchDragSource_ = -1;
+    float templateMatchTplX0_ = 0.f;
+    float templateMatchTplY0_ = 0.f;
+    float templateMatchTplX1_ = 0.f;
+    float templateMatchTplY1_ = 0.f;
+    bool templateMatchHasTemplate_ = false;
+    float templateMatchSearchX0_ = 0.f;
+    float templateMatchSearchY0_ = 0.f;
+    float templateMatchSearchX1_ = 0.f;
+    float templateMatchSearchY1_ = 0.f;
+    bool templateMatchSearchFull_ = true;
+    OpenCv2D::TemplateMatchParams templateMatchParams_;
+    bool templateMatchPending_ = false;
+    int templateMatchPendingSource_ = -1;
+    OpenCv2D::TemplateMatchResult templateMatchPendingResult_;
+    struct MeasuredTemplateMatch {
+        int id = 0;
+        int imageSource = 0;
+        OpenCv2D::TemplateMatchResult result;
+    };
+    std::vector<MeasuredTemplateMatch> measuredTemplateMatches_;
+    int nextTemplateMatchId_ = 1;
 
     // 滤波
     float filterVoxelLeaf_ = 0.5f;
@@ -772,7 +900,7 @@ private:
     int filterStatMeanK_ = 20;
     float filterStatStdMul_ = 1.0f;
     bool filterCompareActive_ = false;
-    bool filterHideRemoved_ = false;
+    FilterCompareViewMode filterCompareViewMode_ = FilterCompareViewMode::Compare;
     std::vector<uint8_t> filterKeepMask_;
     std::vector<uint8_t> filterBackupMask_;
     int filterLastKept_ = 0;
@@ -804,15 +932,21 @@ private:
     float view3dPane0W_ = 800.f;
     float view3dPane1X_ = 0.f;
     float view3dPane1W_ = 0.f;
+    float cachedContentTop_ = 0.f;
+    float cachedContentH_ = 600.f;
+    float cachedSidebarW_ = 320.f;
+    bool cachedViewLayoutValid_ = false;
 
     struct ConsoleLine {
         std::string time;  // HH:MM:SS
         std::string text;
     };
     std::vector<ConsoleLine> consoleLog_;
-    float consoleHeight_ = 148.f;
+    float consoleHeight_ = 168.f;
     bool consoleAutoScroll_ = true;
     static constexpr std::size_t kConsoleMaxLines = 500;
 
     AlgorithmEditor algoEditor_;
+    ShapeTemplateMatchWindow shapeTemplateWindow_;
+    HalconMatchWindow halconMatchWindow_;
 };

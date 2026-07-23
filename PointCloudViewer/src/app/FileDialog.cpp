@@ -96,4 +96,88 @@ std::string OpenImageFile(const char* title) {
 #endif
 }
 
+std::string OpenShapeTemplateFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "形状模板\0*.stm;*.yaml;*.yml\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "加载形状模板";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) == TRUE) {
+        return std::string(file);
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
+std::string SaveShapeTemplateFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "形状模板\0*.stm\0YAML\0*.yaml;*.yml\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "保存形状模板";
+    ofn.lpstrDefExt = "stm";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::string path(file);
+        if (path.find('.') == std::string::npos) path += ".stm";
+        return path;
+    }
+    return {};
+#endif
+}
+
+std::string OpenHalconShapeModelFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "Halcon 形状模板\0*.shm\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "加载 Halcon 形状模板";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) == TRUE) {
+        return std::string(file);
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
+std::string SaveHalconShapeModelFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "Halcon 形状模板\0*.shm\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "保存 Halcon 形状模板";
+    ofn.lpstrDefExt = "shm";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::string path(file);
+        if (path.find('.') == std::string::npos) path += ".shm";
+        return path;
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
 }  // namespace FileDialog

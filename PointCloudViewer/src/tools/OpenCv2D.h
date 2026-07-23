@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+namespace cv {
+class Mat;
+}
+
 namespace OpenCv2D {
 
 struct LineSegment {
@@ -299,6 +303,9 @@ struct RegionBlobResult {
     float roiY0 = 0.f;
     float roiX1 = 0.f;
     float roiY1 = 0.f;
+    int roiWidth = 0;
+    int roiHeight = 0;
+    std::vector<uint8_t> hitMask;  // roiWidth * roiHeight，1=满足阈值
     float centroidX = 0.f;
     float centroidY = 0.f;
     int pixelCount = 0;
@@ -325,11 +332,79 @@ bool ComputeConcentricity(float cx1, float cy1, float cx2, float cy2, Concentric
 struct LineProfileSample {
     float x = 0.f;
     float y = 0.f;
+    float distance = 0.f;  // 沿剖面起点的距离（像素）
     float value = 0.f;
 };
 
 bool SampleLineProfile(const std::vector<float>& gray, int width, int height, float x0, float y0,
                        float x1, float y1, int numSamples, std::vector<LineProfileSample>& out,
                        bool skipZero);
+
+// 扫描行 Profile：固定 row，沿 X 采样（线扫 X-Z 剖面）
+bool SampleRowProfile(const std::vector<float>& gray, int width, int height, int row,
+                      std::vector<LineProfileSample>& out, bool skipZero);
+
+// 扫描列 Profile：固定 col，沿 Y 采样
+bool SampleColumnProfile(const std::vector<float>& gray, int width, int height, int col,
+                         std::vector<LineProfileSample>& out, bool skipZero);
+
+struct TemplateMatchParams {
+    float minScore = 0.6f;  // NCC 得分阈值 [0, 1]
+    int maxMatches = 1;     // 最多返回几个匹配（>1 时做峰值抑制）
+    bool searchFullImage = false;
+    float angleMinDeg = -20.f;  // 旋转搜索范围（度）
+    float angleMaxDeg = 20.f;
+    float angleStepDeg = 5.f;
+    float scaleMin = 0.8f;  // 缩放搜索范围（相对模板 ROI）
+    float scaleMax = 1.2f;
+    float scaleStep = 0.1f;
+    bool usePyramid = true;     // 图像金字塔粗到细搜索
+    int pyramidLevels = 0;      // 0=按模板尺寸自动（最多 4 层）
+    bool subPixelRefine = true;  // 得分图抛物线亚像素精修
+    float greediness = 0.75f;  // 越大粗搜剪枝越强（0~1）
+    float maxOverlap = 0.5f;     // 多目标最大 IoU 重叠
+    bool borderIntersect = true; // 是否允许贴搜索区边缘
+    int searchGlobalW = 0;       // 搜索区宽（全图坐标，0=不检边缘）
+    int searchGlobalH = 0;       // 搜索区高
+};
+
+struct TemplateMatchHit {
+    float centerX = 0.f;  // 匹配中心（像素，左上原点）
+    float centerY = 0.f;
+    float templateWidth = 0.f;   // 缩放后、旋转前的模板宽
+    float templateHeight = 0.f;  // 缩放后、旋转前的模板高
+    float angleDeg = 0.f;
+    float scale = 1.f;
+    float score = 0.f;
+    float bboxX = 0.f;  // 旋转后外接矩形（便于查看范围）
+    float bboxY = 0.f;
+    float bboxW = 0.f;
+    float bboxH = 0.f;
+};
+
+struct TemplateMatchResult {
+    float templateX0 = 0.f;
+    float templateY0 = 0.f;
+    float templateX1 = 0.f;
+    float templateY1 = 0.f;
+    float searchX0 = 0.f;
+    float searchY0 = 0.f;
+    float searchX1 = 0.f;
+    float searchY1 = 0.f;
+    std::vector<TemplateMatchHit> hits;
+    bool ok = false;
+};
+
+// 亮度图 RGB8 模板匹配（TM_CCOEFF_NORMED，金字塔 + 旋转/缩放 + 亚像素）
+bool MatchTemplateRgb(const std::vector<uint8_t>& rgb, int width, int height, float templateX0,
+                      float templateY0, float templateX1, float templateY1, float searchX0,
+                      float searchY0, float searchX1, float searchY1,
+                      const TemplateMatchParams& params, TemplateMatchResult& result,
+                      std::string& error);
+
+// 独立模板 patch 匹配（模板与搜索图可来自不同图像）
+bool MatchTemplateGrayPatch(const cv::Mat& graySearch, int searchGlobalX, int searchGlobalY,
+                            const cv::Mat& grayTpl, const TemplateMatchParams& params,
+                            TemplateMatchResult& result, std::string& error);
 
 }  // namespace OpenCv2D
