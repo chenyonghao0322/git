@@ -392,6 +392,7 @@ bool Application::Init() {
     halconMatchWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     ocrWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     camera2DCalibWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    cameraIntrinsicsCalibWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     multiViewGeometryWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     multiViewGeometryWindow_.SetImportCloudCallback(
         [this](const std::vector<Vec3>& pts, const char* status) {
@@ -3157,7 +3158,8 @@ void Application::HandleInput() {
 
     // 算法编辑器 / 模板匹配 / OCR 打开时不处理点云视区交互
     if (algoEditor_.IsVisible() || halconMatchWindow_.IsVisible() || ocrWindow_.IsVisible() ||
-        camera2DCalibWindow_.IsVisible() || multiViewGeometryWindow_.IsVisible())
+        camera2DCalibWindow_.IsVisible() || cameraIntrinsicsCalibWindow_.IsVisible() ||
+        multiViewGeometryWindow_.IsVisible())
         return;
 
     if (view2DMode_) {
@@ -4195,9 +4197,12 @@ float Application::DrawMenuBar() {
         ImGui::EndMenu();
     }
 
-    if (ImGui::BeginMenu(u8"2D 相机标定")) {
+    if (ImGui::BeginMenu(u8"相机标定")) {
         if (ImGui::MenuItem(u8"九点标定…", nullptr, camera2DCalibWindow_.IsVisible())) {
             camera2DCalibWindow_.SetVisible(!camera2DCalibWindow_.IsVisible());
+        }
+        if (ImGui::MenuItem(u8"内参标定…", nullptr, cameraIntrinsicsCalibWindow_.IsVisible())) {
+            cameraIntrinsicsCalibWindow_.SetVisible(!cameraIntrinsicsCalibWindow_.IsVisible());
         }
         ImGui::EndMenu();
     }
@@ -6103,6 +6108,7 @@ void Application::RestoreApplicationState() {
     halconMatchWindow_.SetVisible(false);
     ocrWindow_.SetVisible(false);
     camera2DCalibWindow_.SetVisible(false);
+    cameraIntrinsicsCalibWindow_.SetVisible(false);
     multiViewGeometryWindow_.SetVisible(false);
 
     showAbout_ = false;
@@ -10567,6 +10573,15 @@ void Application::DrawUi() {
         DrawNativeAlgoPasswordPopup();
         DrawCreatePopups();
         camera2DCalibWindow_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
+        return;
+    }
+
+    if (cameraIntrinsicsCalibWindow_.IsVisible()) {
+        DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
+        DrawCreatePopups();
+        cameraIntrinsicsCalibWindow_.Draw(menuBottom, consoleH);
         DrawConsolePanel();
         return;
     }

@@ -62,6 +62,7 @@ add_executable(PointCloudViewer
     src/tools/ShapeTemplateMatch.cpp
     src/tools/HalconShapeMatch.cpp
     src/tools/Camera2DCalibration.cpp
+    src/tools/CameraIntrinsicsCalibration.cpp
     src/tools/MultiViewGeometry.cpp
     src/tools/OcrTools.cpp
     src/tools/PaddleOcrTools.cpp
@@ -70,6 +71,7 @@ add_executable(PointCloudViewer
     src/app/ShapeTemplateMatchWindow.cpp
     src/app/HalconMatchWindow.cpp
     src/app/Camera2DCalibrationWindow.cpp
+    src/app/CameraIntrinsicsCalibrationWindow.cpp
     src/app/MultiViewGeometryWindow.cpp
     src/app/OcrWindow.cpp
     src/app/UiTheme.cpp

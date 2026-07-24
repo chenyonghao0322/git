@@ -21,6 +21,7 @@
 #include "app/HalconMatchWindow.h"
 #include "app/OcrWindow.h"
 #include "app/Camera2DCalibrationWindow.h"
+#include "app/CameraIntrinsicsCalibrationWindow.h"
 #include "app/MultiViewGeometryWindow.h"
 #include "app/AlgoToolsPanel.h"
 #include "app/DbTreePanel.h"
@@ -978,5 +979,6 @@ private:
     HalconMatchWindow halconMatchWindow_;
     OcrWindow ocrWindow_;
     Camera2DCalibrationWindow camera2DCalibWindow_;
+    CameraIntrinsicsCalibrationWindow cameraIntrinsicsCalibWindow_;
     MultiViewGeometryWindow multiViewGeometryWindow_;
 };
