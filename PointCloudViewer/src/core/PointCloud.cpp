@@ -9,6 +9,7 @@ void PointCloud::Clear() {
     bounds = {};
     originOffset = {0, 0, 0};
     sourcePath.clear();
+    vertexColors = false;
 }
 
 void PointCloud::RecomputeBounds() {

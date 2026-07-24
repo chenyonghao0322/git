@@ -504,7 +504,7 @@ void HalconMatchWindow::DrawParamColumns() {
         return;
     }
 
-    ImGui::TextDisabled(u8"创建模板 (Halcon)");
+    ImGui::TextDisabled(u8"创建模板");
     if (ImGui::BeginTable("##halcon_create", 4,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX)) {
         ImGui::TableSetupColumn("lbl1", ImGuiTableColumnFlags_WidthFixed, 78.f);
@@ -574,7 +574,7 @@ void HalconMatchWindow::DrawParamColumns() {
     }
 
     ImGui::Spacing();
-    ImGui::TextDisabled(u8"寻找模板 (Halcon)");
+    ImGui::TextDisabled(u8"寻找模板");
     if (ImGui::BeginTable("##halcon_find", 4,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX)) {
         ImGui::TableSetupColumn("lbl1", ImGuiTableColumnFlags_WidthFixed, 78.f);
@@ -830,7 +830,7 @@ void HalconMatchWindow::Draw(float menuBottomY, float bottomInset) {
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings;
 
     bool open = visible_;
-    if (!ImGui::Begin(u8"halcon匹配", &open, flags)) {
+    if (!ImGui::Begin(u8"模板匹配", &open, flags)) {
         ImGui::End();
         ImGui::PopStyleVar(2);
         visible_ = open;

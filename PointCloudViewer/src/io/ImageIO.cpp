@@ -39,17 +39,16 @@ struct ComScope {
 
 std::wstring PathToWide(const std::string& path) {
     if (path.empty()) return {};
-    // File dialog returns ACP paths on this app; try ACP then UTF-8.
-    int n = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+    int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (n > 0) {
         std::wstring w(static_cast<std::size_t>(n - 1), L'\0');
-        MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, w.data(), n);
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), n);
         return w;
     }
-    n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    n = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
     if (n <= 0) return {};
     std::wstring w(static_cast<std::size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), n);
+    MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, w.data(), n);
     return w;
 }
 
@@ -143,7 +142,12 @@ bool LoadGray(const std::string& path, GrayImage& out, std::string& error) {
     out.pixels.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
 
     bool ok = false;
-    if (IsEqualGUID(srcFmt, GUID_WICPixelFormat16bppGray)) {
+    if (IsEqualGUID(srcFmt, GUID_WICPixelFormat32bppGrayFloat)) {
+        const UINT stride = w * 4;
+        ok = SUCCEEDED(frame->CopyPixels(nullptr, stride,
+                                         static_cast<UINT>(out.pixels.size() * sizeof(float)),
+                                         reinterpret_cast<BYTE*>(out.pixels.data())));
+    } else if (IsEqualGUID(srcFmt, GUID_WICPixelFormat16bppGray)) {
         const UINT stride = w * 2;
         std::vector<uint16_t> buf(out.pixels.size());
         ok = SUCCEEDED(frame->CopyPixels(nullptr, stride,
@@ -175,6 +179,22 @@ bool LoadGray(const std::string& path, GrayImage& out, std::string& error) {
                 error.clear();
             } else {
                 error = "读取 16 位灰度像素失败。";
+            }
+        }
+        if (!ok) {
+            error.clear();
+            IWICBitmapSource* convertedF = nullptr;
+            if (ConvertTo(factory, frame, GUID_WICPixelFormat32bppGrayFloat, &convertedF, error)) {
+                const UINT stride = w * 4;
+                ok = SUCCEEDED(convertedF->CopyPixels(
+                    nullptr, stride, static_cast<UINT>(out.pixels.size() * sizeof(float)),
+                    reinterpret_cast<BYTE*>(out.pixels.data())));
+                convertedF->Release();
+                if (ok) {
+                    error.clear();
+                } else {
+                    error = "读取 32 位浮点灰度像素失败。";
+                }
             }
         }
         if (!ok) {

@@ -8,6 +8,7 @@
 #include "tools/FilterTools.h"
 #include "tools/OpenCv2D.h"
 #include "tools/PclTools.h"
+#include "tools/PaddleOcrTools.h"
 
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
@@ -29,6 +30,53 @@
 namespace {
 
 void GlfwErrorCallback(int /*code*/, const char* /*desc*/) {}
+
+void SetWindowIconFromAsset(GLFWwindow* window) {
+    ImageIO::RgbImage img;
+    std::string error;
+    if (!ImageIO::LoadRgb("assets/pointcloud_icon.png", img, error)) return;
+
+    std::vector<uint8_t> rgba(static_cast<std::size_t>(img.width * img.height * 4));
+    for (int i = 0; i < img.width * img.height; ++i) {
+        rgba[static_cast<std::size_t>(i) * 4 + 0] = img.rgb[static_cast<std::size_t>(i) * 3 + 0];
+        rgba[static_cast<std::size_t>(i) * 4 + 1] = img.rgb[static_cast<std::size_t>(i) * 3 + 1];
+        rgba[static_cast<std::size_t>(i) * 4 + 2] = img.rgb[static_cast<std::size_t>(i) * 3 + 2];
+        rgba[static_cast<std::size_t>(i) * 4 + 3] = 255;
+    }
+
+    GLFWimage icon{};
+    icon.width = img.width;
+    icon.height = img.height;
+    icon.pixels = rgba.data();
+    glfwSetWindowIcon(window, 1, &icon);
+}
+
+ImFont* gMenuBarFont = nullptr;
+
+constexpr float kMenuBarFontPx = 27.f;
+constexpr float kMenuBarFramePadY = 10.f;
+constexpr float kMenuBarFramePadXMul = 1.25f;
+
+void PushMenuBarStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(style.FramePadding.x * kMenuBarFramePadXMul, kMenuBarFramePadY));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(style.ItemSpacing.x * 1.2f, style.ItemSpacing.y * 1.1f));
+    if (gMenuBarFont) ImGui::PushFont(gMenuBarFont);
+}
+
+void PopMenuBarStyle() {
+    if (gMenuBarFont) ImGui::PopFont();
+    ImGui::PopStyleVar(2);
+}
+
+float MenuBarFrameHeight() {
+    PushMenuBarStyle();
+    const float h = ImGui::GetFrameHeight();
+    PopMenuBarStyle();
+    return h;
+}
 
 bool LoadChineseFont() {
     ImGuiIO& io = ImGui::GetIO();
@@ -54,6 +102,8 @@ bool LoadChineseFont() {
         cfg.OversampleV = 2;
         ImFont* font = io.Fonts->AddFontFromFileTTF(
             path, 18.0f, &cfg, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        gMenuBarFont = io.Fonts->AddFontFromFileTTF(
+            path, kMenuBarFontPx, &cfg, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
         if (font) return true;
     }
     return false;
@@ -312,6 +362,7 @@ bool Application::Init() {
     }
     glfwMakeContextCurrent(window_);
     glfwSwapInterval(1);
+    SetWindowIconFromAsset(window_);
 
     if (!gladLoadGL(reinterpret_cast<GLADloadfunc>(glfwGetProcAddress))) {
         return false;
@@ -339,6 +390,18 @@ bool Application::Init() {
 
     shapeTemplateWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     halconMatchWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    ocrWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    camera2DCalibWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    multiViewGeometryWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    multiViewGeometryWindow_.SetImportCloudCallback(
+        [this](const std::vector<Vec3>& pts, const char* status) {
+            PointCloud cloud;
+            cloud.points = pts;
+            cloud.ResetMask();
+            cloud.RecomputeBounds();
+            cloud.CenterToOrigin();
+            ApplyCloud(std::move(cloud), status, false);
+        });
 
     SetStatus(u8"请打开点云文件（PLY / PCD / XYZ / OBJ），或打开深度/亮度图对照查看");
     return true;
@@ -592,8 +655,7 @@ void RotateRgb90CCW(const std::vector<uint8_t>& src, int w, int h, std::vector<u
 
 }  // namespace
 
-bool Application::OpenDepthImage() {
-    const std::string path = FileDialog::OpenImageFile("打开深度图");
+bool Application::LoadDepthImageFromPath(const std::string& path) {
     if (path.empty()) return false;
 
     ImageIO::GrayImage gray;
@@ -614,6 +676,9 @@ bool Application::OpenDepthImage() {
     depthImage_.height = gray.height;
     depthImage_.gray = std::move(gray.pixels);
     ComputeGrayRange(depthImage_.gray, depthSkipZero_, depthDataMin_, depthDataMax_);
+    PointCloudIO::SuggestDepthMapParams(depthImage_.gray, depthImage_.width, depthImage_.height,
+                                        depthMapParams_);
+    depthMapParams_.skipZero = depthSkipZero_;
     depthDisplayMin_ = depthDataMin_;
     depthDisplayMax_ = depthDataMax_;
     depthImage_.valueMin = depthDataMin_;
@@ -638,6 +703,23 @@ bool Application::OpenDepthImage() {
                   depthImage_.width, depthImage_.height);
     SetStatus(buf);
     return true;
+}
+
+bool Application::OpenDepthImage() {
+    const std::string path = FileDialog::OpenImageFile("打开深度图");
+    if (path.empty()) return false;
+    if (!LoadDepthImageFromPath(path)) return false;
+    OpenDepthToCloudDialog();
+    return true;
+}
+
+void Application::OpenDepthToCloudDialog() {
+    if (depthImage_.gray.empty() || depthImage_.width <= 0 || depthImage_.height <= 0) {
+        SetStatus(u8"请先打开深度图");
+        return;
+    }
+    showDepthToCloudWindow_ = true;
+    depthToCloudWindowFocus_ = true;
 }
 
 void Application::RebuildDepthDisplay() {
@@ -870,6 +952,13 @@ void Application::ClearImageSyncPick() {
     syncRow_ = -1;
 }
 
+bool Application::CanSyncRegionBlob() const {
+    return imageSyncEnabled_ && depthImage_.valid() && brightnessImage_.valid() &&
+           depthImage_.width > 0 && depthImage_.height > 0 &&
+           depthImage_.width == brightnessImage_.width &&
+           depthImage_.height == brightnessImage_.height;
+}
+
 bool Application::TryEnableImageSync() {
     if (!depthImage_.valid() || !brightnessImage_.valid()) {
         SetStatus(u8"请先同时打开深度图和亮度图");
@@ -888,7 +977,7 @@ bool Application::TryEnableImageSync() {
     ClearImageSyncPick();
     char buf[192];
     std::snprintf(buf, sizeof(buf),
-                  u8"已启用深度/亮度联动 %dx%d：在任一图上单击，另一图同步十字线", syncWidth_,
+                  u8"已启用深度/亮度联动 %dx%d：单击同步十字线；区域筛选将同步到两图", syncWidth_,
                   syncHeight_);
     SetStatus(buf);
     return true;
@@ -1271,9 +1360,10 @@ void Application::RefreshLayerGpu(SceneCloudLayer& layer, bool isActive) {
     params.highlightRoi = showRoi ? &measure_.roiIndices : nullptr;
     params.usePointColors =
         (cloud.colors.size() == cloud.points.size()) &&
-        (isActive && (filterCompareActive_ || measure_.flatness.valid ||
-                      measure_.stepGap.hasDistances || useIntensityColors_ || sphereFitCompare ||
-                      circleFitCompare));
+        (cloud.vertexColors ||
+         (isActive && (filterCompareActive_ || measure_.flatness.valid ||
+                       measure_.stepGap.hasDistances || useIntensityColors_ || sphereFitCompare ||
+                       circleFitCompare)));
     params.ignoreMask = false;
 
     std::vector<uint8_t> maskBackup;
@@ -3065,8 +3155,10 @@ void Application::HandleInput() {
     ImGuiIO& io = ImGui::GetIO();
     glfwGetFramebufferSize(window_, &fbW_, &fbH_);
 
-    // 算法编辑器 / Halcon 匹配打开时不处理点云视区交互
-    if (algoEditor_.IsVisible() || halconMatchWindow_.IsVisible()) return;
+    // 算法编辑器 / 模板匹配 / OCR 打开时不处理点云视区交互
+    if (algoEditor_.IsVisible() || halconMatchWindow_.IsVisible() || ocrWindow_.IsVisible() ||
+        camera2DCalibWindow_.IsVisible() || multiViewGeometryWindow_.IsVisible())
+        return;
 
     if (view2DMode_) {
         const bool ctrl = glfwGetKey(window_, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
@@ -3085,7 +3177,7 @@ void Application::HandleInput() {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         const float sidebarW = SidebarWidth();
         constexpr float toolbarH = 44.f;
-        const float menuH = ImGui::GetFrameHeight();
+        const float menuH = MenuBarFrameHeight();
         const float contentTop = vp->Pos.y + menuH + toolbarH;
         const float contentH = vp->Pos.y + vp->Size.y - contentTop;
         const float viewH = std::max(contentH - ConsoleHeight(), 1.f);
@@ -4001,7 +4093,12 @@ float Application::DrawMenuBar() {
     const UiPalette& pal = GetUiPalette();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     float menuBottom = vp->Pos.y;
-    if (!ImGui::BeginMainMenuBar()) return menuBottom;
+
+    PushMenuBarStyle();
+    if (!ImGui::BeginMainMenuBar()) {
+        PopMenuBarStyle();
+        return menuBottom;
+    }
 
     ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
     ImGui::TextUnformatted(u8"  点云查看器");
@@ -4023,6 +4120,7 @@ float Application::DrawMenuBar() {
         if (ImGui::MenuItem(u8"打开亮度图…")) {
             OpenBrightnessImage();
         }
+        ImGui::Separator();
         if (ImGui::MenuItem(u8"加载示例")) {
             LoadPath("assets/sample/sample.xyz");
         }
@@ -4097,14 +4195,36 @@ float Application::DrawMenuBar() {
         ImGui::EndMenu();
     }
 
-    if (ImGui::MenuItem(u8"2D模板匹配", nullptr, shapeTemplateWindow_.IsVisible())) {
-        shapeTemplateWindow_.SetVisible(!shapeTemplateWindow_.IsVisible());
+    if (ImGui::BeginMenu(u8"2D 相机标定")) {
+        if (ImGui::MenuItem(u8"九点标定…", nullptr, camera2DCalibWindow_.IsVisible())) {
+            camera2DCalibWindow_.SetVisible(!camera2DCalibWindow_.IsVisible());
+        }
+        ImGui::EndMenu();
     }
 
-    if (ImGui::MenuItem(u8"halcon匹配", nullptr, halconMatchWindow_.IsVisible())) {
+    if (ImGui::BeginMenu(u8"多视图几何")) {
+        if (ImGui::MenuItem(u8"两视图对应…", nullptr, multiViewGeometryWindow_.IsVisible())) {
+            multiViewGeometryWindow_.SetVisible(!multiViewGeometryWindow_.IsVisible());
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::MenuItem(u8"模板匹配", nullptr, halconMatchWindow_.IsVisible())) {
         const bool next = !halconMatchWindow_.IsVisible();
-        if (next) algoEditor_.SetVisible(false);
+        if (next) {
+            algoEditor_.SetVisible(false);
+            ocrWindow_.SetVisible(false);
+        }
         halconMatchWindow_.SetVisible(next);
+    }
+
+    if (ImGui::MenuItem(u8"OCR 识别", nullptr, ocrWindow_.IsVisible())) {
+        const bool next = !ocrWindow_.IsVisible();
+        if (next) {
+            algoEditor_.SetVisible(false);
+            halconMatchWindow_.SetVisible(false);
+        }
+        ocrWindow_.SetVisible(next);
     }
 
     if (ImGui::BeginMenu(u8"设置")) {
@@ -4162,7 +4282,10 @@ float Application::DrawMenuBar() {
 
     if (ImGui::MenuItem(u8"算法编辑器", nullptr, algoEditor_.IsVisible())) {
         const bool next = !algoEditor_.IsVisible();
-        if (next) halconMatchWindow_.SetVisible(false);
+        if (next) {
+            halconMatchWindow_.SetVisible(false);
+            ocrWindow_.SetVisible(false);
+        }
         algoEditor_.ToggleVisible();
     }
 
@@ -4183,6 +4306,13 @@ float Application::DrawMenuBar() {
 
     menuBottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::EndMainMenuBar();
+    PopMenuBarStyle();
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImU32 lineCol = ImGui::ColorConvertFloat4ToU32(pal.border);
+    dl->AddLine(ImVec2(vp->Pos.x, menuBottom), ImVec2(vp->Pos.x + vp->Size.x, menuBottom),
+                lineCol, 1.0f);
+
     return menuBottom;
 }
 
@@ -4923,6 +5053,7 @@ void Application::DrawDepthRenderControls() {
         changed = true;
     }
     if (ImGui::Checkbox(u8"忽略 0 值参与统计", &depthSkipZero_)) {
+        depthMapParams_.skipZero = depthSkipZero_;
         ComputeGrayRange(depthImage_.gray, depthSkipZero_, depthDataMin_, depthDataMax_);
         depthDisplayMin_ = std::clamp(depthDisplayMin_, depthDataMin_, depthDataMax_);
         depthDisplayMax_ = std::clamp(depthDisplayMax_, depthDataMin_, depthDataMax_);
@@ -4935,34 +5066,209 @@ void Application::DrawDepthRenderControls() {
     if (changed) RebuildDepthDisplay();
 }
 
-void Application::DrawImagePanel() {
-    if (!HasImagePanel()) return;
-
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float sidebarW = SidebarWidth();
-    const float panelY = view3dY_;
-    const float panelH = view3dH_;
-    const float panelX = vp->Pos.x + sidebarW;
-    const float imageW = std::max(vp->Size.x - sidebarW, 1.f);
-
-    ImGui::SetNextWindowPos(ImVec2(panelX, panelY));
-    ImGui::SetNextWindowSize(ImVec2(imageW, panelH));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 8.f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, GetUiPalette().bgDeep);
-
-    ImGui::Begin(u8"##2D图像停靠栏", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                     ImGuiWindowFlags_NoScrollbar);
-
-    {
-        const UiPalette& pal = GetUiPalette();
-        UiSectionHeader(u8"2D 图像", nullptr, &pal.tool2D, true);
-        ImGui::SameLine();
-        ImGui::TextColored(pal.tool2D, u8"2D 模式");
+void Application::ConvertDepthToPointCloud(bool append) {
+    if (depthImage_.gray.empty() || depthImage_.width <= 0 || depthImage_.height <= 0) {
+        SetStatus(u8"请先打开深度图");
+        return;
     }
+
+    const bool brightOk = depthMapUseBrightness_ && brightnessImage_.valid() &&
+                          brightnessImage_.width == depthImage_.width &&
+                          brightnessImage_.height == depthImage_.height &&
+                          !brightnessImage_.rgb.empty();
+    if (depthMapUseBrightness_ && brightnessImage_.valid() && !brightOk) {
+        SetStatus(u8"亮度图尺寸与深度图不一致，已忽略亮度着色");
+    }
+
+    PointCloud cloud;
+    std::string error;
+    const std::vector<uint8_t>* rgb = brightOk ? &brightnessImage_.rgb : nullptr;
+    if (!PointCloudIO::BuildFromDepthGray(depthImage_.gray, depthImage_.width, depthImage_.height,
+                                          rgb, depthMapParams_, cloud, error, depthImage_.path)) {
+        SetStatus(error);
+        return;
+    }
+
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), u8"深度转点云完成：%zu 点（%dx%d）", cloud.points.size(),
+                  depthImage_.width, depthImage_.height);
+    ApplyCloud(std::move(cloud), buf, append);
+    EnterView3DMode();
+}
+
+void Application::DrawDepthToCloudParamFields() {
+    ImGui::PushID("DepthToCloudParams");
+
+    const auto labeledInputFloat = [](const char* label, float* v, const char* fmt = "%.6f") {
+        ImGui::TextUnformatted(label);
+        ImGui::PushID(label);
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputFloat("##val", v, 0.f, 0.f, fmt);
+        ImGui::PopID();
+    };
+
+    const PointCloudIO::DepthGrayStats stats =
+        PointCloudIO::AnalyzeDepthGray(depthImage_.gray, depthImage_.width, depthImage_.height);
+    if (stats.validCount > 0) {
+        char statBuf[280];
+        std::snprintf(statBuf, sizeof(statBuf),
+                      u8"有效 %zu / %zu  原始 [%g, %g]  有效 [%g, %g]", stats.validCount,
+                      stats.totalPixels, stats.rawMin, stats.rawMax, stats.validMin,
+                      stats.validMax);
+        ImGui::TextWrapped("%s", statBuf);
+        if (stats.zeroCount > 0 || stats.maxUint16Count > 0) {
+            ImGui::TextDisabled(u8"无效像素: 0×%zu  65535×%zu", stats.zeroCount,
+                                stats.maxUint16Count);
+        }
+    } else {
+        ImGui::TextColored(ImVec4(1.f, 0.55f, 0.45f, 1.f), u8"未检测到有效深度像素");
+    }
+
+    if (ImGui::Button(u8"应用推荐参数", ImVec2(-1.f, 0.f))) {
+        PointCloudIO::SuggestDepthMapParams(depthImage_.gray, depthImage_.width, depthImage_.height,
+                                            depthMapParams_);
+        depthMapParams_.skipZero = depthSkipZero_;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(u8"推荐无效值过滤与 Z 量化；不修改 XY 间隔");
+    }
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(u8"XY 扫描间隔（必填）", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled(u8"激光线方向 → X；扫描/编码器方向 → Y");
+        labeledInputFloat(u8"X 间隔 (mm/px)", &depthMapParams_.pixelSizeX);
+        if (depthMapParams_.pixelSizeX < 0.f) depthMapParams_.pixelSizeX = 0.f;
+        labeledInputFloat(u8"Y 间隔 (mm/px)", &depthMapParams_.pixelSizeY);
+        if (depthMapParams_.pixelSizeY < 0.f) depthMapParams_.pixelSizeY = 0.f;
+        if (depthMapParams_.pixelSizeX <= 0.f || depthMapParams_.pixelSizeY <= 0.f) {
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f), u8"XY 间隔必须大于 0");
+        }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(u8"Z 高度换算（必填）", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox(u8"16bit 量化深度（线扫）", &depthMapParams_.useQuantizedZ);
+        if (depthMapParams_.useQuantizedZ) {
+            labeledInputFloat(u8"Z 全量程 (mm)", &depthMapParams_.zFullRangeMm, "%.3f");
+            if (depthMapParams_.zFullRangeMm < 0.f) depthMapParams_.zFullRangeMm = 0.f;
+            labeledInputFloat(u8"Z 量化除数", &depthMapParams_.zQuantDivisor, "%.0f");
+            if (depthMapParams_.zQuantDivisor < 1.f) depthMapParams_.zQuantDivisor = 1.f;
+            const float zScale = PointCloudIO::EffectiveDepthScale(depthMapParams_);
+            ImGui::TextDisabled(u8"Z = raw × (%.8f) + 偏移", zScale);
+            ImGui::TextDisabled(u8"即 全量程 %.3f ÷ 量化除数 %.0f", depthMapParams_.zFullRangeMm,
+                                depthMapParams_.zQuantDivisor);
+        } else {
+            labeledInputFloat(u8"Z 缩放 (mm/DN)", &depthMapParams_.depthScale, "%.8f");
+        }
+        labeledInputFloat(u8"Z 偏移 (mm)", &depthMapParams_.zOffset, "%.4f");
+    }
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(u8"无效值与坐标")) {
+        labeledInputFloat(u8"自定义无效值", &depthMapParams_.invalidValue, "%.4f");
+        if (ImGui::Checkbox(u8"跳过 0", &depthMapParams_.skipZero)) {
+            depthSkipZero_ = depthMapParams_.skipZero;
+            ComputeGrayRange(depthImage_.gray, depthSkipZero_, depthDataMin_, depthDataMax_);
+            RebuildDepthDisplay();
+        }
+        ImGui::Checkbox(u8"跳过 65535", &depthMapParams_.skipUint16Max);
+        ImGui::Checkbox(u8"翻转 Y 轴", &depthMapParams_.flipY);
+        ImGui::Checkbox(u8"交换 X/Y", &depthMapParams_.swapXY);
+        ImGui::Checkbox(u8"居中到原点", &depthMapParams_.centerToOrigin);
+    }
+
+    if (ImGui::CollapsingHeader(u8"其它")) {
+        ImGui::TextUnformatted(u8"降采样步长");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputInt("##step", &depthMapParams_.step);
+        depthMapParams_.step = std::clamp(depthMapParams_.step, 1, 32);
+        const bool brightOk = brightnessImage_.valid() &&
+                              brightnessImage_.width == depthImage_.width &&
+                              brightnessImage_.height == depthImage_.height;
+        if (brightnessImage_.valid() && !brightOk) {
+            ImGui::TextColored(ImVec4(1.f, 0.55f, 0.45f, 1.f), u8"亮度图尺寸与深度图不一致");
+        }
+        if (brightOk) {
+            ImGui::Checkbox(u8"使用亮度图着色", &depthMapUseBrightness_);
+        }
+        ImGui::Checkbox(u8"追加到场景", &depthMapAppend_);
+    }
+
+    ImGui::PopID();
+}
+
+void Application::DrawDepthToCloudWindow() {
+    if (!showDepthToCloudWindow_) return;
+
+    ImGui::SetNextWindowSize(ImVec2(400.f, 580.f), ImGuiCond_FirstUseEver);
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    if (depthToCloudWindowFocus_) {
+        ImGui::SetNextWindowFocus();
+        depthToCloudWindowFocus_ = false;
+    }
+
+    if (!ImGui::Begin(u8"深度图转点云", &showDepthToCloudWindow_, ImGuiWindowFlags_NoCollapse)) {
+        return;
+    }
+
+    if (depthImage_.gray.empty()) {
+        ImGui::TextDisabled(u8"请先打开深度图");
+        ImGui::End();
+        return;
+    }
+
+    char titleBuf[128];
+    std::snprintf(titleBuf, sizeof(titleBuf), u8"图像 %d × %d", depthImage_.width,
+                  depthImage_.height);
+    ImGui::TextDisabled("%s", titleBuf);
+    ImGui::Separator();
+
+    const float footerH = 46.f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 10.f));
+    ImGui::BeginChild(u8"##depth2cloud_scroll", ImVec2(0.f, -footerH), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    DrawDepthToCloudParamFields();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    ImGui::Separator();
+    if (ImGui::Button(u8"生成点云", ImVec2(130.f, 36.f))) {
+        ConvertDepthToPointCloud(depthMapAppend_);
+        showDepthToCloudWindow_ = false;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(u8"按当前参数生成点云并切换到 3D");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"仅 2D 查看", ImVec2(120.f, 36.f))) {
+        EnterView2DMode();
+        showDepthToCloudWindow_ = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"关闭", ImVec2(80.f, 36.f))) {
+        showDepthToCloudWindow_ = false;
+    }
+
+    ImGui::End();
+}
+
+void Application::DrawDepthToCloudControls() {
+    if (depthImage_.gray.empty() || depthImage_.width <= 0 || depthImage_.height <= 0) return;
+
+    ImGui::Separator();
+    ImGui::TextDisabled(u8"深度图转点云");
+    ImGui::TextWrapped(u8"XY 间隔与 Z 换算请在「深度图转点云」窗口中设置。");
+    if (ImGui::Button(u8"打开参数窗口…", ImVec2(-1.f, 32.f))) {
+        OpenDepthToCloudDialog();
+    }
+}
+
+void Application::DrawImageViewControls() {
+    if (!view2DMode_) return;
+
+    const UiPalette& pal = GetUiPalette();
+    UiSectionHeader(u8"2D 图像", nullptr, &pal.tool2D, true);
 
     const bool canSync = depthImage_.valid() && brightnessImage_.valid();
     if (!canSync) ImGui::BeginDisabled();
@@ -4991,23 +5297,69 @@ void Application::DrawImagePanel() {
             ImGui::TextDisabled(u8"在深度图或亮度图上单击即可联动");
         }
     }
-    ImGui::Separator();
+
+    const bool both = depthImage_.valid() && brightnessImage_.valid();
+    if (both && !imageSyncEnabled_) {
+        ImGui::Spacing();
+        ImGui::TextDisabled(u8"显示图像");
+        const float halfW = (ImGui::GetContentRegionAvail().x - 4.f) * 0.5f;
+        {
+            const bool sel = imagePanelTab_ == 0;
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, pal.tool2D);
+            if (ImGui::Button(u8"深度图", ImVec2(halfW, 0.f))) imagePanelTab_ = 0;
+            if (sel) ImGui::PopStyleColor();
+        }
+        ImGui::SameLine(0.f, 4.f);
+        {
+            const bool sel = imagePanelTab_ == 1;
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, pal.tool2D);
+            if (ImGui::Button(u8"亮度图", ImVec2(halfW, 0.f))) imagePanelTab_ = 1;
+            if (sel) ImGui::PopStyleColor();
+        }
+    }
 
     if (depthImage_.valid() || brightnessImage_.valid()) {
-        if (ImGui::Button(u8"左转 90°", ImVec2(-1.f, 0.f))) {
+        ImGui::Spacing();
+        const float halfW = (ImGui::GetContentRegionAvail().x - 4.f) * 0.5f;
+        if (ImGui::Button(u8"左转 90°", ImVec2(halfW, 0.f))) {
             RotateImages2d90CCW();
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(u8"深度图与亮度图同步逆时针旋转 90°，便于竖图横向查看");
         }
-        if (ImGui::Button(u8"右转 90°", ImVec2(-1.f, 0.f))) {
+        ImGui::SameLine(0.f, 4.f);
+        if (ImGui::Button(u8"右转 90°", ImVec2(halfW, 0.f))) {
             RotateImages2d90CW();
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(u8"深度图与亮度图同步顺时针旋转 90°，便于竖图横向查看");
         }
-        ImGui::Separator();
     }
+
+    ImGui::Separator();
+}
+
+void Application::DrawImagePanel() {
+    if (!HasImagePanel()) return;
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float sidebarW = SidebarWidth();
+    const float panelY = view3dY_;
+    const float panelH = view3dH_;
+    const float panelX = vp->Pos.x + sidebarW;
+    const float imageW = std::max(vp->Size.x - sidebarW, 1.f);
+
+    ImGui::SetNextWindowPos(ImVec2(panelX, panelY));
+    ImGui::SetNextWindowSize(ImVec2(imageW, panelH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, GetUiPalette().bgDeep);
+
+    ImGui::Begin(u8"##2D图像停靠栏", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                     ImGuiWindowFlags_NoScrollbar);
 
     const bool both = depthImage_.valid() && brightnessImage_.valid();
     if (both && imageSyncEnabled_) {
@@ -5020,18 +5372,8 @@ void Application::DrawImagePanel() {
         DrawImageWithSyncMarker(brightnessImage_, u8"亮度图");
         ImGui::EndChild();
         DrawDepthRenderControls();
+        DrawDepthToCloudControls();
     } else {
-        if (ImGui::BeginTabBar(u8"##imageTabs")) {
-            if (depthImage_.valid() && ImGui::BeginTabItem(u8"深度图")) {
-                imagePanelTab_ = 0;
-                ImGui::EndTabItem();
-            }
-            if (brightnessImage_.valid() && ImGui::BeginTabItem(u8"亮度图")) {
-                imagePanelTab_ = 1;
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
-        }
         if (imagePanelTab_ == 0 && !depthImage_.valid() && brightnessImage_.valid())
             imagePanelTab_ = 1;
         if (imagePanelTab_ == 1 && !brightnessImage_.valid() && depthImage_.valid())
@@ -5040,7 +5382,10 @@ void Application::DrawImagePanel() {
         ImageView* view = (imagePanelTab_ == 1) ? &brightnessImage_ : &depthImage_;
         if (view->valid()) {
             DrawImageWithSyncMarker(*view, imagePanelTab_ == 0 ? u8"深度图" : u8"亮度图");
-            if (imagePanelTab_ == 0) DrawDepthRenderControls();
+            if (imagePanelTab_ == 0) {
+                DrawDepthRenderControls();
+                DrawDepthToCloudControls();
+            }
         } else {
             ImGui::TextDisabled(view2DMode_ ? u8"请从「文件」打开深度图或亮度图" : u8"当前无图像");
         }
@@ -5756,6 +6101,9 @@ void Application::RestoreApplicationState() {
     }
     shapeTemplateWindow_.SetVisible(false);
     halconMatchWindow_.SetVisible(false);
+    ocrWindow_.SetVisible(false);
+    camera2DCalibWindow_.SetVisible(false);
+    multiViewGeometryWindow_.SetVisible(false);
 
     showAbout_ = false;
     showCreateSphere_ = false;
@@ -6766,39 +7114,99 @@ void Application::ClearRoundness() {
 }
 
 void Application::PreviewRegionBlob(ImageView& view, bool quiet) {
-    if (!view.valid()) return;
+    if (!view.valid() && !CanSyncRegionBlob()) return;
+
+    ImageView* computeView = &view;
+    if (CanSyncRegionBlob() && brightnessImage_.valid()) {
+        computeView = &brightnessImage_;
+    } else if (!view.valid()) {
+        return;
+    }
+
     OpenCv2D::RegionBlobResult result;
     std::string error;
     bool ok = false;
-    if (!view.gray.empty()) {
-        ok = OpenCv2D::ComputeRegionBlob(view.gray, view.width, view.height, regionBlobRoiX0_,
-                                         regionBlobRoiY0_, regionBlobRoiX1_, regionBlobRoiY1_,
-                                         regionBlobThreshold_, regionBlobGreaterThan_, result,
-                                         error);
-    } else if (!view.rgb.empty()) {
+    if (!computeView->gray.empty()) {
+        ok = OpenCv2D::ComputeRegionBlob(computeView->gray, computeView->width, computeView->height,
+                                         regionBlobRoiX0_, regionBlobRoiY0_, regionBlobRoiX1_,
+                                         regionBlobRoiY1_, regionBlobThreshold_,
+                                         regionBlobGreaterThan_, result, error);
+    } else if (!computeView->rgb.empty()) {
         ok = OpenCv2D::ComputeRegionBlobRgb(
-            view.rgb, view.width, view.height, regionBlobRoiX0_, regionBlobRoiY0_,
-            regionBlobRoiX1_, regionBlobRoiY1_, regionBlobThreshold_, regionBlobGreaterThan_, result,
-            error);
+            computeView->rgb, computeView->width, computeView->height, regionBlobRoiX0_,
+            regionBlobRoiY0_, regionBlobRoiX1_, regionBlobRoiY1_, regionBlobThreshold_,
+            regionBlobGreaterThan_, result, error);
     } else {
         if (!quiet) SetStatus(u8"当前图像无可用灰度数据");
         return;
     }
     if (!ok) {
         regionBlobPending_ = false;
+        regionBlobPendingDepthStats_ = {};
         if (!quiet) SetStatus(error);
         return;
     }
     regionBlobPending_ = true;
-    regionBlobPendingSource_ = ImageSourceOf(view);
+    regionBlobPendingSource_ = ImageSourceOf(*computeView);
     regionBlobPendingResult_ = std::move(result);
+    UpdateRegionBlobDepthStats();
     if (!quiet) {
         if (regionBlobPendingResult_.pixelCount > 0) {
-            SetStatus(u8"区域分析预览完成，请在左侧确认");
+            if (CanSyncRegionBlob() && regionBlobPendingDepthStats_.valid) {
+                SetStatus(u8"亮度区域已筛选，深度图已同步高亮");
+            } else {
+                SetStatus(u8"区域分析预览完成，请在左侧确认");
+            }
         } else {
             SetStatus(u8"当前阈值下无满足条件的像素，请调整阈值");
         }
     }
+}
+
+void Application::UpdateRegionBlobDepthStats() {
+    regionBlobPendingDepthStats_ = {};
+    if (!regionBlobPending_ || !regionBlobPendingResult_.ok ||
+        regionBlobPendingResult_.pixelCount <= 0 || !depthImage_.valid() ||
+        depthImage_.gray.empty()) {
+        return;
+    }
+    const OpenCv2D::RegionBlobResult& blob = regionBlobPendingResult_;
+    const int roiW = blob.roiWidth;
+    const int roiH = blob.roiHeight;
+    const int x0 = static_cast<int>(blob.roiX0);
+    const int y0 = static_cast<int>(blob.roiY0);
+    double sum = 0.0;
+    int count = 0;
+    float vmin = 0.f;
+    float vmax = 0.f;
+    for (int ry = 0; ry < roiH; ++ry) {
+        for (int rx = 0; rx < roiW; ++rx) {
+            if (blob.hitMask[static_cast<std::size_t>(ry * roiW + rx)] == 0) continue;
+            const int gx = x0 + rx;
+            const int gy = y0 + ry;
+            const std::size_t di =
+                static_cast<std::size_t>(gy) * static_cast<std::size_t>(depthImage_.width) +
+                static_cast<std::size_t>(gx);
+            if (di >= depthImage_.gray.size()) continue;
+            const float z = depthImage_.gray[di];
+            if (!std::isfinite(z)) continue;
+            if (depthSkipZero_ && std::fabs(z) <= 1e-6f) continue;
+            if (count == 0) {
+                vmin = vmax = z;
+            } else {
+                vmin = std::min(vmin, z);
+                vmax = std::max(vmax, z);
+            }
+            sum += static_cast<double>(z);
+            ++count;
+        }
+    }
+    if (count <= 0) return;
+    regionBlobPendingDepthStats_.count = count;
+    regionBlobPendingDepthStats_.min = vmin;
+    regionBlobPendingDepthStats_.max = vmax;
+    regionBlobPendingDepthStats_.mean = static_cast<float>(sum / static_cast<double>(count));
+    regionBlobPendingDepthStats_.valid = true;
 }
 
 bool Application::HasRegionBlobRoi() const {
@@ -6808,6 +7216,10 @@ bool Application::HasRegionBlobRoi() const {
 
 void Application::RefreshRegionBlobPreview() {
     if (image2DTool_ != Image2DTool::RegionBlob || !HasRegionBlobRoi()) return;
+    if (CanSyncRegionBlob() && brightnessImage_.valid()) {
+        PreviewRegionBlob(brightnessImage_, true);
+        return;
+    }
     int src = regionBlobPendingSource_;
     if (src < 0) src = regionBlobDragSource_;
     if (src < 0) src = 0;
@@ -6830,6 +7242,7 @@ void Application::ConfirmRegionBlob() {
     MeasuredRegionBlob entry;
     entry.id = nextRegionBlobId_++;
     entry.imageSource = regionBlobPendingSource_;
+    entry.syncedPair = CanSyncRegionBlob();
     entry.result = std::move(regionBlobPendingResult_);
     measuredRegionBlobs_.push_back(std::move(entry));
     regionBlobPending_ = false;
@@ -6845,6 +7258,7 @@ void Application::CancelRegionBlobPending() {
     regionBlobPending_ = false;
     regionBlobPendingSource_ = -1;
     regionBlobPendingResult_ = {};
+    regionBlobPendingDepthStats_ = {};
 }
 
 void Application::AddDepthHeightSample(float px, float py, int imageSource) {
@@ -7949,8 +8363,48 @@ void Application::DrawLineMeasureOverlay(ImDrawList* dl, const ImageView& view, 
     drawDragRect(rectCaliperDragging_, rectCaliperDragSource_, rectCaliperRoiX0_,
                  rectCaliperRoiY0_, rectCaliperRoiX1_, rectCaliperRoiY1_,
                  IM_COL32(80, 200, 255, 220));
-    drawDragRect(regionBlobDragging_, regionBlobDragSource_, regionBlobRoiX0_, regionBlobRoiY0_,
-                 regionBlobRoiX1_, regionBlobRoiY1_, IM_COL32(255, 70, 70, 240));
+    drawDragRect(regionBlobDragging_ && !CanSyncRegionBlob(), regionBlobDragSource_,
+                 regionBlobRoiX0_, regionBlobRoiY0_, regionBlobRoiX1_, regionBlobRoiY1_,
+                 IM_COL32(255, 70, 70, 240));
+    if (regionBlobDragging_ && CanSyncRegionBlob()) {
+        const float l = std::min(regionBlobRoiX0_, regionBlobRoiX1_);
+        const float r = std::max(regionBlobRoiX0_, regionBlobRoiX1_);
+        const float t = std::min(regionBlobRoiY0_, regionBlobRoiY1_);
+        const float b = std::max(regionBlobRoiY0_, regionBlobRoiY1_);
+        const ImU32 col = (src == 0) ? IM_COL32(60, 200, 255, 240) : IM_COL32(255, 70, 70, 240);
+        dl->AddRect(toScreen(l, t), toScreen(r, b), col, 0.f, 0, 2.f);
+    }
+
+    auto drawRegionBlobOverlay = [&](const OpenCv2D::RegionBlobResult& b, bool onDepthView) {
+        const ImU32 boxCol =
+            onDepthView ? IM_COL32(60, 200, 255, 255) : IM_COL32(255, 45, 45, 255);
+        const ImU32 fillCol =
+            onDepthView ? IM_COL32(40, 160, 255, 140) : IM_COL32(255, 30, 30, 175);
+        dl->AddRect(toScreen(b.roiX0, b.roiY0), toScreen(b.roiX1, b.roiY1), boxCol, 0.f, 0, 2.5f);
+        DrawRegionBlobMask(dl, b, toScreen, fillCol);
+        if (b.pixelCount > 0) {
+            const ImVec2 c = toScreen(b.centroidX, b.centroidY);
+            dl->AddCircleFilled(c, 5.f, boxCol);
+            dl->AddCircle(c, 8.f, IM_COL32(255, 255, 255, 230), 0, 2.f);
+        }
+    };
+
+    if (regionBlobPending_ && regionBlobPendingResult_.ok) {
+        const bool showHere = regionBlobPendingSource_ == src ||
+                              (CanSyncRegionBlob() && view.width == syncWidth_ &&
+                               view.height == syncHeight_);
+        if (showHere) {
+            drawRegionBlobOverlay(regionBlobPendingResult_, src == 0);
+        }
+    }
+    for (const MeasuredRegionBlob& rb : measuredRegionBlobs_) {
+        if (!rb.result.ok) continue;
+        const bool showHere = rb.imageSource == src ||
+                              (rb.syncedPair && CanSyncRegionBlob() && view.width == syncWidth_ &&
+                               view.height == syncHeight_);
+        if (!showHere) continue;
+        drawRegionBlobOverlay(rb.result, src == 0);
+    }
 
     auto drawDragLine = [&](bool dragging, int dragSource, float x0, float y0, float x1, float y1,
                             ImU32 col) {
@@ -8053,31 +8507,6 @@ void Application::DrawLineMeasureOverlay(ImDrawList* dl, const ImageView& view, 
             dl->AddLine(toScreen(ca.result.centerX, ca.result.centerY),
                         toScreen(cb.result.centerX, cb.result.centerY), IM_COL32(255, 160, 80, 220),
                         2.f);
-        }
-    }
-
-    if (regionBlobPending_ && regionBlobPendingSource_ == src && regionBlobPendingResult_.ok) {
-        const auto& b = regionBlobPendingResult_;
-        constexpr ImU32 kRegionRed = IM_COL32(255, 45, 45, 255);
-        constexpr ImU32 kRegionFill = IM_COL32(255, 30, 30, 175);
-        dl->AddRect(toScreen(b.roiX0, b.roiY0), toScreen(b.roiX1, b.roiY1), kRegionRed, 0.f, 0,
-                    2.5f);
-        DrawRegionBlobMask(dl, b, toScreen, kRegionFill);
-        if (b.pixelCount > 0) {
-            const ImVec2 c = toScreen(b.centroidX, b.centroidY);
-            dl->AddCircleFilled(c, 5.f, kRegionRed);
-            dl->AddCircle(c, 8.f, IM_COL32(255, 255, 255, 230), 0, 2.f);
-        }
-    }
-    for (const MeasuredRegionBlob& rb : measuredRegionBlobs_) {
-        if (rb.imageSource != src || !rb.result.ok) continue;
-        constexpr ImU32 kRegionFill = IM_COL32(255, 40, 40, 155);
-        constexpr ImU32 kRegionRed = IM_COL32(255, 55, 55, 255);
-        DrawRegionBlobMask(dl, rb.result, toScreen, kRegionFill);
-        dl->AddRect(toScreen(rb.result.roiX0, rb.result.roiY0),
-                    toScreen(rb.result.roiX1, rb.result.roiY1), kRegionRed, 0.f, 0, 2.f);
-        if (rb.result.pixelCount > 0) {
-            dl->AddCircleFilled(toScreen(rb.result.centroidX, rb.result.centroidY), 4.f, kRegionRed);
         }
     }
 
@@ -8777,10 +9206,17 @@ void Application::DrawImage2DToolPanel() {
     }
 
     if (image2DTool_ == Image2DTool::RegionBlob) {
-        ImGui::TextWrapped(u8"拖拽矩形区域，按阈值统计面积与质心；满足阈值的像素以红色高亮。");
+        if (CanSyncRegionBlob()) {
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.f, 1.f),
+                               u8"联动模式：亮度阈值筛选，深度图同步高亮（蓝）");
+            ImGui::TextDisabled(u8"在亮度图或深度图上拖拽矩形均可；阈值始终按亮度计算");
+        } else {
+            ImGui::TextWrapped(u8"拖拽矩形区域，按阈值统计面积与质心；满足阈值的像素以红色高亮。");
+            ImGui::TextDisabled(u8"启用深度/亮度联动后，可同步显示到深度图");
+        }
         regionBlobThreshold_ = std::clamp(regionBlobThreshold_, 0.f, 255.f);
         ImGui::SetNextItemWidth(-1.f);
-        if (ImGui::SliderFloat(u8"阈值", &regionBlobThreshold_, 0.f, 255.f, "%.0f")) {
+        if (ImGui::SliderFloat(u8"亮度阈值", &regionBlobThreshold_, 0.f, 255.f, "%.0f")) {
             RefreshRegionBlobPreview();
         }
         if (ImGui::Checkbox(u8"大于阈值", &regionBlobGreaterThan_)) {
@@ -8788,9 +9224,15 @@ void Application::DrawImage2DToolPanel() {
         }
         if (regionBlobPending_ && regionBlobPendingResult_.ok) {
             if (regionBlobPendingResult_.pixelCount > 0) {
-                ImGui::Text(u8"面积 %d px²  质心 (%.1f, %.1f)",
+                ImGui::Text(u8"亮度面积 %d px²  质心 (%.1f, %.1f)",
                             regionBlobPendingResult_.pixelCount, regionBlobPendingResult_.centroidX,
                             regionBlobPendingResult_.centroidY);
+                if (regionBlobPendingDepthStats_.valid) {
+                    ImGui::Text(u8"对应深度  min=%.4f  max=%.4f  mean=%.4f（%d 点）",
+                                regionBlobPendingDepthStats_.min, regionBlobPendingDepthStats_.max,
+                                regionBlobPendingDepthStats_.mean,
+                                regionBlobPendingDepthStats_.count);
+                }
                 if (ImGui::Button(u8"确认区域", ImVec2(-1, 36.f))) ConfirmRegionBlob();
             } else {
                 ImGui::TextColored(ImVec4(1.f, 0.72f, 0.35f, 1.f), u8"当前阈值下无满足条件的像素");
@@ -9387,6 +9829,7 @@ void Application::DrawViewAxisWidget(float contentTop, float contentBottom, floa
 void Application::DrawToolPanel() {
     const UiPalette& pal = GetUiPalette();
     if (image2DTool_ != Image2DTool::None || view2DMode_) {
+        if (view2DMode_) DrawImageViewControls();
         if (image2DTool_ != Image2DTool::None) {
             UiSectionHeader(Image2DToolLabel(image2DTool_), u8"2D 算子 — 参数与结果", &pal.tool2D);
         } else {
@@ -9400,8 +9843,12 @@ void Application::DrawToolPanel() {
         if (image2DTool_ != Image2DTool::None) {
             DrawImage2DToolPanel();
         } else {
-            ImGui::TextWrapped(u8"当前为 2D 模式，点云视区已隐藏。\n"
-                               u8"在菜单「2D算子」中启用卡尺提线等工具。");
+            if (!depthImage_.gray.empty()) {
+                DrawDepthToCloudControls();
+            } else {
+                ImGui::TextWrapped(u8"当前为 2D 模式，点云视区已隐藏。\n"
+                                   u8"在菜单「2D算子」中启用卡尺提线等工具。");
+            }
         }
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
@@ -9409,6 +9856,13 @@ void Application::DrawToolPanel() {
     }
 
     const bool icpMode = measure_.mode == ToolMode::Icp;
+    if (!view2DMode_ && !depthImage_.gray.empty()) {
+        UiSectionHeader(u8"深度转点云", u8"已加载深度图，可重新设置参数", &pal.tool2D);
+        if (ImGui::Button(u8"设置参数并生成点云…", ImVec2(-1.f, 32.f))) {
+            OpenDepthToCloudDialog();
+        }
+        ImGui::Spacing();
+    }
     UiSectionHeader(ToolModeLabel(measure_.mode),
                     icpMode ? nullptr : u8"当前工具参数与说明", &pal.tool3D);
 
@@ -10099,6 +10553,33 @@ void Application::DrawUi() {
         return;
     }
 
+    if (ocrWindow_.IsVisible()) {
+        DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
+        DrawCreatePopups();
+        ocrWindow_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
+        return;
+    }
+
+    if (camera2DCalibWindow_.IsVisible()) {
+        DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
+        DrawCreatePopups();
+        camera2DCalibWindow_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
+        return;
+    }
+
+    if (multiViewGeometryWindow_.IsVisible()) {
+        DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
+        DrawCreatePopups();
+        multiViewGeometryWindow_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
+        return;
+    }
+
     DrawToolbar(menuBottom, toolbarH);
     const float contentTop = menuBottom + toolbarH;
     const float contentH = vp->Pos.y + vp->Size.y - contentTop;
@@ -10148,6 +10629,7 @@ void Application::DrawUi() {
     DrawImagePanel();
     UpdateView3dLayout(contentTop, viewH, SidebarWidth());
     DrawAboutPopup();
+    DrawDepthToCloudWindow();
     DrawNativeAlgoPasswordPopup();
     DrawCreatePopups();
     if (!view2DMode_) {
@@ -10171,10 +10653,14 @@ void Application::Run() {
         HandleInput();
         DrawUi();
 
-        if (sceneGpuDirty_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible()) RefreshGpu();
-        if (needUploadFilled_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible())
+        if (sceneGpuDirty_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
+            !ocrWindow_.IsVisible())
+            RefreshGpu();
+        if (needUploadFilled_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
+            !ocrWindow_.IsVisible())
             RefreshGpuFilled();
-        if (needUploadIcp_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible())
+        if (needUploadIcp_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
+            !ocrWindow_.IsVisible())
             RefreshIcpGpu();
 
         glfwGetFramebufferSize(window_, &fbW_, &fbH_);
@@ -10224,6 +10710,7 @@ void Application::Run() {
 }
 
 void Application::Shutdown() {
+    PaddleOcrTools::Shutdown();
     DestroyImageView(depthImage_);
     DestroyImageView(brightnessImage_);
     ShutdownSceneLayers();

@@ -9,6 +9,7 @@
 // - 管理撤销栈、滤波预览、双视图（原始+填充叠加）等应用状态
 
 #include "core/PointCloud.h"
+#include "io/PointCloudIO.h"
 #include "render/Camera.h"
 #include "render/PointCloudRenderer.h"
 #include "tools/MeasureTools.h"
@@ -18,6 +19,9 @@
 #include "app/AlgorithmEditor.h"
 #include "app/ShapeTemplateMatchWindow.h"
 #include "app/HalconMatchWindow.h"
+#include "app/OcrWindow.h"
+#include "app/Camera2DCalibrationWindow.h"
+#include "app/MultiViewGeometryWindow.h"
 #include "app/AlgoToolsPanel.h"
 #include "app/DbTreePanel.h"
 #include "app/PclPanel.h"
@@ -223,6 +227,7 @@ private:
     void Draw2DOperatorMenuItems();   // 菜单栏 2D 算子（OpenCV）
     void DrawCreatePopups();          // 创建球/柱/圆盘弹窗
     void DrawImagePanel();            // 右侧深度/亮度图面板
+    void DrawImageViewControls();     // 左侧 2D 图像控件（联动、旋转、切换）
     void HandleInput();               // 键盘快捷键（撤销、工具切换等）
 
     // --- 文件与点云 ---
@@ -234,7 +239,10 @@ private:
     void CreateDiskCloud();
     void CreatePlaneCloud();
     bool OpenDepthImage();
+    bool LoadDepthImageFromPath(const std::string& path);
     bool OpenBrightnessImage();
+    void OpenDepthToCloudDialog();
+    void ConvertDepthToPointCloud(bool append);
     void DestroyImageView(ImageView& view);
     bool UploadImageTexture(ImageView& view);
 
@@ -330,9 +338,11 @@ private:
     float ConsoleHeight() const;
 
     // --- 深度/亮度图联动 ---
+    bool CanSyncRegionBlob() const;
     bool TryEnableImageSync();
     void ClearImageSyncPick();
     void SetImageSyncPixel(int col, int row);
+    void UpdateRegionBlobDepthStats();
     void RebuildDepthDisplay();
     void ClearLineMeasure();
     void ClearArcMeasure();
@@ -438,6 +448,9 @@ private:
     void DrawImage2DToolPanel();
     void DrawImageWithSyncMarker(ImageView& view, const char* label);
     void DrawDepthRenderControls();
+    void DrawDepthToCloudParamFields();
+    void DrawDepthToCloudControls();
+    void DrawDepthToCloudWindow();
     void DrawRoiRegionOverlay(ImDrawList* dl, int winW, int winH,
                               const std::vector<std::size_t>& indices, const char* label,
                               unsigned int col, unsigned int textCol);
@@ -577,6 +590,11 @@ private:
     float depthDisplayMin_ = 0.f;
     float depthDisplayMax_ = 1.f;
     bool depthSkipZero_ = true;
+    PointCloudIO::DepthMapParams depthMapParams_{};
+    bool depthMapUseBrightness_ = true;
+    bool depthMapAppend_ = false;
+    bool showDepthToCloudWindow_ = false;
+    bool depthToCloudWindowFocus_ = false;
 
     // OpenCV 2D 算子：卡尺提线
     Image2DTool image2DTool_ = Image2DTool::None;
@@ -832,9 +850,18 @@ private:
     bool regionBlobPending_ = false;
     int regionBlobPendingSource_ = -1;
     OpenCv2D::RegionBlobResult regionBlobPendingResult_;
+    struct RegionMaskDepthStats {
+        int count = 0;
+        float min = 0.f;
+        float max = 0.f;
+        float mean = 0.f;
+        bool valid = false;
+    };
+    RegionMaskDepthStats regionBlobPendingDepthStats_;
     struct MeasuredRegionBlob {
         int id = 0;
         int imageSource = 0;
+        bool syncedPair = false;
         OpenCv2D::RegionBlobResult result;
     };
     std::vector<MeasuredRegionBlob> measuredRegionBlobs_;
@@ -949,4 +976,7 @@ private:
     AlgorithmEditor algoEditor_;
     ShapeTemplateMatchWindow shapeTemplateWindow_;
     HalconMatchWindow halconMatchWindow_;
+    OcrWindow ocrWindow_;
+    Camera2DCalibrationWindow camera2DCalibWindow_;
+    MultiViewGeometryWindow multiViewGeometryWindow_;
 };

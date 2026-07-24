@@ -18,7 +18,7 @@ struct RgbImage {
     std::vector<uint8_t> rgb;  // row-major RGB, size = width * height * 3
 };
 
-// Load grayscale (8/16-bit or converted). Pixel values keep raw numeric meaning
+// Load grayscale (8/16-bit, 32-bit float, or converted). Pixel values keep raw numeric meaning
 // (e.g. uint16 DN stays 0..65535 as float).
 bool LoadGray(const std::string& path, GrayImage& out, std::string& error);
 

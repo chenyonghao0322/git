@@ -15,6 +15,7 @@ constexpr ImU32 kContourCol = IM_COL32(40, 220, 80, 255);
 constexpr ImU32 kScoreCol = IM_COL32(255, 60, 60, 255);
 constexpr ImU32 kRoiCol = IM_COL32(80, 180, 255, 220);
 
+// 按轮廓分段将模型边缘折线绘制到 ImGui 画布上（用于匹配结果叠加）。
 void DrawContourPolylines(ImDrawList* dl, const std::vector<float>& xs,
                           const std::vector<float>& ys, const std::vector<int>& starts,
                           float originX, float originY, float sx, float sy, ImU32 col,
@@ -37,15 +38,19 @@ void DrawContourPolylines(ImDrawList* dl, const std::vector<float>& xs,
 }
 }  // namespace
 
+// 设置窗口可见性。
 void ShapeTemplateMatchWindow::SetVisible(bool visible) { visible_ = visible; }
 
+// 切换窗口显示/隐藏。
 void ShapeTemplateMatchWindow::ToggleVisible() { visible_ = !visible_; }
 
+// 更新状态文本，并通知主窗口状态栏。
 void ShapeTemplateMatchWindow::SetStatus(const char* msg) {
     statusText_ = msg ? msg : "";
     if (onStatus_) onStatus_(msg);
 }
 
+// 释放图像槽的 OpenGL 纹理并清空像素数据。
 void ShapeTemplateMatchWindow::DestroyImageSlot(ImageSlot& slot) {
     if (slot.texId) {
         glDeleteTextures(1, &slot.texId);
@@ -57,6 +62,7 @@ void ShapeTemplateMatchWindow::DestroyImageSlot(ImageSlot& slot) {
     slot.path.clear();
 }
 
+// 释放模板预览纹理。
 void ShapeTemplateMatchWindow::DestroyModelPreviewTexture() {
     if (modelPreviewTexId_) {
         glDeleteTextures(1, &modelPreviewTexId_);
@@ -66,6 +72,7 @@ void ShapeTemplateMatchWindow::DestroyModelPreviewTexture() {
     modelPreviewH_ = 0;
 }
 
+// 从 model_ 的预览图或模板灰度图生成 OpenGL 预览纹理。
 void ShapeTemplateMatchWindow::RefreshModelPreviewTexture() {
     DestroyModelPreviewTexture();
     if (!model_.valid) return;
@@ -97,6 +104,7 @@ void ShapeTemplateMatchWindow::RefreshModelPreviewTexture() {
     modelPreviewH_ = h;
 }
 
+// 将 ImageSlot 的 RGB 像素上传到 GPU 纹理。
 bool ShapeTemplateMatchWindow::UploadTexture(ImageSlot& slot) {
     if (slot.rgb.empty() || slot.width <= 0 || slot.height <= 0) return false;
     if (slot.texId == 0) glGenTextures(1, &slot.texId);
@@ -112,6 +120,7 @@ bool ShapeTemplateMatchWindow::UploadTexture(ImageSlot& slot) {
     return true;
 }
 
+// 从文件路径加载图像，替换 slot 内容并创建显示纹理。
 bool ShapeTemplateMatchWindow::LoadImageSlot(ImageSlot& slot, const std::string& path,
                                              std::string& error) {
     ImageIO::RgbImage img;
@@ -124,6 +133,7 @@ bool ShapeTemplateMatchWindow::LoadImageSlot(ImageSlot& slot, const std::string&
     return UploadTexture(slot);
 }
 
+// 鼠标屏幕坐标 → 图像像素坐标（仅在绘制区域内有效）。
 bool ShapeTemplateMatchWindow::ImageToPixel(const ImageSlot& slot, const ImVec2& imgPos, float drawW,
                                             float drawH, float mouseX, float mouseY, float& outX,
                                             float& outY) const {
@@ -139,6 +149,7 @@ bool ShapeTemplateMatchWindow::ImageToPixel(const ImageSlot& slot, const ImVec2&
     return true;
 }
 
+// 在源图上绘制搜索 ROI 矩形、匹配轮廓线与得分/缩放文字。
 void ShapeTemplateMatchWindow::DrawMatchOverlays(ImDrawList* dl, const ImVec2& imgPos, float drawW,
                                                  float drawH) {
     if (!sourceImage_.valid()) return;
@@ -170,6 +181,7 @@ void ShapeTemplateMatchWindow::DrawMatchOverlays(ImDrawList* dl, const ImVec2& i
     }
 }
 
+// 主图像显示区：自适应缩放、Shift+滚轮缩放、ROI 拖拽、悬停取色、匹配叠加。
 void ShapeTemplateMatchWindow::DrawImageCanvas(ImageSlot& slot, bool allowRoi, RoiMode roiMode,
                                                float height, const char* childId) {
     if (!slot.valid()) {
@@ -272,6 +284,7 @@ void ShapeTemplateMatchWindow::DrawImageCanvas(ImageSlot& slot, bool allowRoi, R
     ImGui::EndChild();
 }
 
+// 右下角的模板预览：优先显示已创建模型的预览图，否则显示原模板图并支持框选 ROI。
 void ShapeTemplateMatchWindow::DrawTemplatePreviewPanel() {
     ImGui::TextDisabled(u8"模板预览");
     const float panelH = 168.f;
@@ -344,6 +357,7 @@ void ShapeTemplateMatchWindow::DrawTemplatePreviewPanel() {
     ImGui::EndChild();
 }
 
+// 绘制创建模板与寻找模板两组参数控件（表格布局）。
 void ShapeTemplateMatchWindow::DrawParamColumns() {
     ImGui::TextDisabled(u8"创建模板");
     if (ImGui::BeginTable("##create_params", 4,
@@ -567,6 +581,7 @@ void ShapeTemplateMatchWindow::DrawParamColumns() {
     }
 }
 
+// 读取模板图像，默认 ROI 为整图，并清除已有模型。
 void ShapeTemplateMatchWindow::ReadTemplateImage() {
     const std::string path = FileDialog::OpenImageFile(u8"读取模板图像");
     if (path.empty()) return;
@@ -587,6 +602,7 @@ void ShapeTemplateMatchWindow::ReadTemplateImage() {
     SetStatus(buf);
 }
 
+// 读取源图像，重置搜索 ROI 与上次匹配结果。
 void ShapeTemplateMatchWindow::ReadSourceImage() {
     const std::string path = FileDialog::OpenImageFile(u8"读取源图像");
     if (path.empty()) return;
@@ -605,6 +621,7 @@ void ShapeTemplateMatchWindow::ReadSourceImage() {
     SetStatus(buf);
 }
 
+// 调用 ShapeTemplateMatch 根据模板图 ROI 与参数创建形状模型。
 void ShapeTemplateMatchWindow::CreateTemplate() {
     if (!templateImage_.valid()) {
         SetStatus(u8"请先读取模板图像");
@@ -624,6 +641,7 @@ void ShapeTemplateMatchWindow::CreateTemplate() {
     SetStatus(buf);
 }
 
+// 在源图上执行模板匹配，结果保存到 lastResult_ 供叠加显示。
 void ShapeTemplateMatchWindow::RunMatch() {
     if (!sourceImage_.valid()) {
         SetStatus(u8"请先读取源图像");
@@ -647,6 +665,7 @@ void ShapeTemplateMatchWindow::RunMatch() {
     SetStatus(buf);
 }
 
+// 将当前模型序列化保存到用户选择的文件。
 void ShapeTemplateMatchWindow::SaveTemplate() {
     const std::string path = FileDialog::SaveShapeTemplateFile();
     if (path.empty()) return;
@@ -660,6 +679,7 @@ void ShapeTemplateMatchWindow::SaveTemplate() {
     SetStatus(buf);
 }
 
+// 从文件反序列化加载模板模型并刷新预览。
 void ShapeTemplateMatchWindow::LoadTemplate() {
     const std::string path = FileDialog::OpenShapeTemplateFile();
     if (path.empty()) return;
@@ -672,6 +692,7 @@ void ShapeTemplateMatchWindow::LoadTemplate() {
     SetStatus(u8"模板加载成功");
 }
 
+// 清除模型、匹配结果与预览纹理，不影响已加载的图像。
 void ShapeTemplateMatchWindow::ClearTemplate() {
     model_ = {};
     lastResult_ = {};
@@ -679,6 +700,7 @@ void ShapeTemplateMatchWindow::ClearTemplate() {
     SetStatus(u8"已清除模板");
 }
 
+// 搜索 ROI 恢复为整幅源图，并关闭 useSearchRoi_ 限制。
 void ShapeTemplateMatchWindow::ClearSearchRoi() {
     if (sourceImage_.valid()) {
         searchRoiX0_ = searchRoiY0_ = 0.f;
@@ -688,6 +710,7 @@ void ShapeTemplateMatchWindow::ClearSearchRoi() {
     useSearchRoi_ = false;
 }
 
+// 窗口主入口：左侧大图 + 右侧参数/按钮/预览，底部状态与像素信息。
 void ShapeTemplateMatchWindow::Draw() {
     if (!visible_) return;
 

@@ -8,7 +8,35 @@
 #include <commdlg.h>
 #endif
 
+#include <vector>
+#include <cstring>
+#include <string>
+#include <cwchar>
+
 namespace FileDialog {
+namespace {
+
+#ifdef _WIN32
+std::wstring Utf8ToWide(const char* utf8) {
+    if (!utf8 || !*utf8) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring out(static_cast<std::size_t>(n - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out.data(), n);
+    return out;
+}
+
+std::string WideToUtf8(const wchar_t* wide) {
+    if (!wide || !*wide) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(static_cast<std::size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+#endif
+
+}  // namespace
 
 std::string OpenPointCloudFile() {
 #ifdef _WIN32
@@ -71,25 +99,64 @@ std::string SavePointCloudFile() {
 
 std::string OpenImageFile(const char* title) {
 #ifdef _WIN32
-    char file[MAX_PATH] = {0};
-    OPENFILENAMEA ofn{};
+    wchar_t file[MAX_PATH] = {0};
+    OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter =
-        "图像文件\0*.png;*.bmp;*.jpg;*.jpeg;*.tif;*.tiff;*.gif;*.webp\0"
-        "PNG\0*.png\0"
-        "BMP\0*.bmp\0"
-        "JPEG\0*.jpg;*.jpeg\0"
-        "TIFF\0*.tif;*.tiff\0"
-        "全部文件\0*.*\0";
+    const wchar_t* filter =
+        L"图像文件\0*.png;*.bmp;*.jpg;*.jpeg;*.tif;*.tiff;*.gif;*.webp\0"
+        L"PNG\0*.png\0"
+        L"BMP\0*.bmp\0"
+        L"JPEG\0*.jpg;*.jpeg\0"
+        L"TIFF\0*.tif;*.tiff\0"
+        L"全部文件\0*.*\0";
+    ofn.lpstrFilter = filter;
     ofn.nFilterIndex = 1;
-    ofn.lpstrTitle = title ? title : "打开图像";
+    const std::wstring titleW = title ? Utf8ToWide(title) : L"打开图像";
+    ofn.lpstrTitle = titleW.c_str();
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameA(&ofn) == TRUE) {
-        return std::string(file);
+    if (GetOpenFileNameW(&ofn) == TRUE) {
+        return WideToUtf8(file);
     }
     return {};
+#else
+    (void)title;
+    return {};
+#endif
+}
+
+std::vector<std::string> OpenMultipleImageFiles(const char* title) {
+#ifdef _WIN32
+    std::vector<wchar_t> buf(65536, 0);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    const wchar_t* filter =
+        L"图像文件\0*.png;*.bmp;*.jpg;*.jpeg;*.tif;*.tiff;*.gif;*.webp\0"
+        L"全部文件\0*.*\0";
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 1;
+    const std::wstring titleW = title ? Utf8ToWide(title) : L"批量选择图像";
+    ofn.lpstrTitle = titleW.c_str();
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER |
+                OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&ofn) != TRUE) return {};
+
+    std::vector<std::string> paths;
+    const wchar_t* p = buf.data();
+    const std::wstring dir = p;
+    p += dir.size() + 1;
+    if (*p == L'\0') {
+        paths.push_back(WideToUtf8(dir.c_str()));
+        return paths;
+    }
+    while (*p != L'\0') {
+        paths.push_back(WideToUtf8((dir + L"\\" + p).c_str()));
+        p += std::wcslen(p) + 1;
+    }
+    return paths;
 #else
     (void)title;
     return {};

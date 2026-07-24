@@ -43,6 +43,7 @@ target_link_libraries(imgui PUBLIC glfw)
 
 # ---------- App ----------
 add_executable(PointCloudViewer
+    app.rc
     src/main.cpp
     src/core/PointCloud.cpp
     src/io/PointCloudIO.cpp
@@ -60,10 +61,17 @@ add_executable(PointCloudViewer
     src/tools/OpenCv2D.cpp
     src/tools/ShapeTemplateMatch.cpp
     src/tools/HalconShapeMatch.cpp
+    src/tools/Camera2DCalibration.cpp
+    src/tools/MultiViewGeometry.cpp
+    src/tools/OcrTools.cpp
+    src/tools/PaddleOcrTools.cpp
     src/app/Application.cpp
     src/app/FileDialog.cpp
     src/app/ShapeTemplateMatchWindow.cpp
     src/app/HalconMatchWindow.cpp
+    src/app/Camera2DCalibrationWindow.cpp
+    src/app/MultiViewGeometryWindow.cpp
+    src/app/OcrWindow.cpp
     src/app/UiTheme.cpp
     src/app/AlgorithmEditor.cpp
     src/app/AlgoToolsPanel.cpp
@@ -96,6 +104,51 @@ if(POINTCLOUDVIEWER_ENABLE_HALCON AND EXISTS "${HALCON_ROOT}/include/halconcpp/H
     )
     target_link_directories(PointCloudViewer PRIVATE "${HALCON_ROOT}/lib/x64-win64")
     target_link_libraries(PointCloudViewer PRIVATE halconcpp halcon)
+endif()
+
+# ---------- Tesseract OCR (optional) ----------
+set(TESSERACT_ROOT "D:/software/Tesseract-OCR" CACHE PATH "Tesseract installation root")
+option(POINTCLOUDVIEWER_ENABLE_TESSERACT "Enable Tesseract OCR" ON)
+if(POINTCLOUDVIEWER_ENABLE_TESSERACT AND EXISTS "${TESSERACT_ROOT}/include/tesseract/baseapi.h")
+    message(STATUS "Tesseract found at ${TESSERACT_ROOT}")
+    target_compile_definitions(PointCloudViewer PRIVATE POINTCLOUDVIEWER_USE_TESSERACT=1)
+    target_include_directories(PointCloudViewer PRIVATE "${TESSERACT_ROOT}/include")
+    target_link_directories(PointCloudViewer PRIVATE "${TESSERACT_ROOT}/lib")
+    find_library(TESSERACT_LIB NAMES tesseract tesseract55 tesseract54 tesseract53
+        PATHS "${TESSERACT_ROOT}/lib" NO_DEFAULT_PATH)
+    find_library(LEPTONICA_LIB NAMES leptonica leptonica-1.85.0 leptonica-1.84.1 leptonica-1.83.1
+        PATHS "${TESSERACT_ROOT}/lib" NO_DEFAULT_PATH)
+    if(TESSERACT_LIB AND LEPTONICA_LIB)
+        target_link_libraries(PointCloudViewer PRIVATE ${TESSERACT_LIB} ${LEPTONICA_LIB})
+        if(WIN32)
+            file(GLOB _tess_dlls "${TESSERACT_ROOT}/*.dll")
+            foreach(_dll ${_tess_dlls})
+                get_filename_component(_dll_name "${_dll}" NAME)
+                if(_dll_name MATCHES "^(tesseract|leptonica)")
+                    add_custom_command(TARGET PointCloudViewer POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${_dll}"
+                            $<TARGET_FILE_DIR:PointCloudViewer>
+                    )
+                endif()
+            endforeach()
+        endif()
+    else()
+        message(WARNING "Tesseract headers found but libraries missing in ${TESSERACT_ROOT}/lib")
+    endif()
+elseif(POINTCLOUDVIEWER_ENABLE_TESSERACT AND EXISTS "${TESSERACT_ROOT}/tesseract.exe")
+    message(STATUS "Tesseract CLI found at ${TESSERACT_ROOT}")
+    target_compile_definitions(PointCloudViewer PRIVATE
+        POINTCLOUDVIEWER_USE_TESSERACT_CLI=1
+        "POINTCLOUDVIEWER_TESSERACT_ROOT=\"${TESSERACT_ROOT}\"")
+endif()
+
+# ---------- Python (PaddleOCR) ----------
+set(PYTHON_ROOT "D:/software/Python3.13.14" CACHE PATH "Python root for PaddleOCR")
+if(EXISTS "${PYTHON_ROOT}/python.exe")
+    message(STATUS "Python for PaddleOCR: ${PYTHON_ROOT}")
+    target_compile_definitions(PointCloudViewer PRIVATE
+        "POINTCLOUDVIEWER_PYTHON_EXE=\"${PYTHON_ROOT}/python.exe\"")
 endif()
 
 if(WIN32)
@@ -138,3 +191,11 @@ add_custom_command(TARGET PointCloudViewer POST_BUILD
         ${CMAKE_CURRENT_SOURCE_DIR}/assets
         $<TARGET_FILE_DIR:PointCloudViewer>/assets
 )
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/tessdata")
+    add_custom_command(TARGET PointCloudViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets/tessdata
+            $<TARGET_FILE_DIR:PointCloudViewer>/tessdata
+    )
+endif()

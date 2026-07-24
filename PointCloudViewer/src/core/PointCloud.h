@@ -19,6 +19,7 @@ struct PointCloud {
     Aabb bounds;
     Vec3 originOffset{0, 0, 0};  // world = display + originOffset
     std::string sourcePath;
+    bool vertexColors = false;  // true: colors 为亮度/RGB 等着色，渲染时优先使用
 
     void Clear();                              // 清空所有数据
     void RecomputeBounds();                    // 按可见点重算包围盒

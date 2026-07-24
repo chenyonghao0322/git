@@ -538,28 +538,201 @@ bool Save(const std::string& path, const PointCloud& cloud, std::string& error, 
     return false;
 }
 
+namespace {
+
+constexpr float kUint16MaxDepth = 65535.f;
+
+bool IsInvalidDepthSample(float raw, const DepthMapParams& params) {
+    if (params.skipNonFinite && !std::isfinite(raw)) return true;
+    if (params.skipZero && std::fabs(raw) <= params.invalidEps) return true;
+    if (params.skipUint16Max && raw >= kUint16MaxDepth - 0.5f) return true;
+    if (std::fabs(raw - params.invalidValue) <= params.invalidEps) return true;
+    return false;
+}
+
+}  // namespace
+
+DepthGrayStats AnalyzeDepthGray(const std::vector<float>& depth, int width, int height) {
+    DepthGrayStats stats;
+    if (width <= 0 || height <= 0 || depth.empty()) return stats;
+
+    stats.totalPixels = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    if (stats.totalPixels != depth.size()) return stats;
+
+    bool haveRange = false;
+    for (float raw : depth) {
+        if (!std::isfinite(raw)) continue;
+        if (!haveRange) {
+            stats.rawMin = stats.rawMax = raw;
+            haveRange = true;
+        } else {
+            stats.rawMin = std::min(stats.rawMin, raw);
+            stats.rawMax = std::max(stats.rawMax, raw);
+        }
+        if (std::fabs(raw) <= 1e-6f) {
+            ++stats.zeroCount;
+            continue;
+        }
+        if (raw >= kUint16MaxDepth - 0.5f) {
+            ++stats.maxUint16Count;
+            continue;
+        }
+        ++stats.validCount;
+        if (stats.validCount == 1) {
+            stats.validMin = stats.validMax = raw;
+        } else {
+            stats.validMin = std::min(stats.validMin, raw);
+            stats.validMax = std::max(stats.validMax, raw);
+        }
+    }
+    return stats;
+}
+
+void SuggestDepthMapParams(const std::vector<float>& depth, int width, int height,
+                           DepthMapParams& inOut) {
+    const DepthGrayStats stats = AnalyzeDepthGray(depth, width, height);
+    if (stats.validCount == 0) return;
+
+    inOut.skipZero = stats.zeroCount > 0;
+    inOut.skipUint16Max = stats.maxUint16Count > 0;
+    inOut.skipNonFinite = true;
+
+    const float span = stats.validMax - stats.validMin;
+    const bool looksUint16Dn =
+        stats.rawMax > 256.f && stats.rawMax <= kUint16MaxDepth + 1.f && span > 1.f;
+    if (looksUint16Dn) {
+        inOut.useQuantizedZ = true;
+        inOut.zQuantDivisor = 65536.f;
+        inOut.zOffset = 0.f;
+    } else if (stats.validMax <= 256.f && stats.validMin >= 0.f) {
+        inOut.useQuantizedZ = false;
+        inOut.depthScale = 1.f;
+    } else if (stats.validMax <= 100.f && stats.validMin >= -100.f) {
+        inOut.useQuantizedZ = false;
+        inOut.depthScale = 1.f;
+    } else {
+        inOut.useQuantizedZ = false;
+        inOut.depthScale = 1.f;
+    }
+}
+
+namespace detail {
+
+inline bool BuildPointCloudFromDepth(const std::vector<float>& depth, int width, int height,
+                                     const std::vector<uint8_t>* brightnessRgb,
+                                     const DepthMapParams& params, PointCloud& out,
+                                     std::string& error) {
+    if (width <= 0 || height <= 0 || depth.empty()) {
+        error = "深度图数据无效。";
+        return false;
+    }
+    if (static_cast<std::size_t>(width) * static_cast<std::size_t>(height) != depth.size()) {
+        error = "深度图尺寸与像素缓冲不一致。";
+        return false;
+    }
+    if (!(params.pixelSizeX > 0.f) || !(params.pixelSizeY > 0.f)) {
+        error = "像素间隔必须大于 0。";
+        return false;
+    }
+    const float zScale = EffectiveDepthScale(params);
+    if (!(zScale != 0.f) || !std::isfinite(zScale)) {
+        error = params.useQuantizedZ ? "Z 换算无效（请检查全量程与量化除数）。"
+                                     : "深度缩放无效。";
+        return false;
+    }
+
+    const bool hasBright =
+        brightnessRgb != nullptr &&
+        brightnessRgb->size() == static_cast<std::size_t>(width * height * 3);
+    const int step = std::max(params.step, 1);
+
+    out.Clear();
+    out.vertexColors = false;
+    const std::size_t approx =
+        static_cast<std::size_t>((width + step - 1) / step) *
+        static_cast<std::size_t>((height + step - 1) / step);
+    out.points.reserve(approx);
+    if (hasBright) out.colors.reserve(approx);
+
+    for (int row = 0; row < height; row += step) {
+        const int yRow = params.flipY ? (height - 1 - row) : row;
+        for (int col = 0; col < width; col += step) {
+            const std::size_t di =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(col);
+            const float raw = depth[di];
+            if (IsInvalidDepthSample(raw, params)) continue;
+
+            const float z = raw * zScale + params.zOffset;
+            if (!std::isfinite(z)) continue;
+
+            Vec3 p;
+            if (params.swapXY) {
+                p.x = static_cast<float>(yRow) * params.pixelSizeX;
+                p.y = static_cast<float>(col) * params.pixelSizeY;
+            } else {
+                p.x = static_cast<float>(col) * params.pixelSizeX;
+                p.y = static_cast<float>(yRow) * params.pixelSizeY;
+            }
+            p.z = z;
+            out.points.push_back(p);
+
+            if (hasBright) {
+                const std::size_t bi = di * 3u;
+                out.colors.push_back(Vec3{(*brightnessRgb)[bi] / 255.f,
+                                          (*brightnessRgb)[bi + 1] / 255.f,
+                                          (*brightnessRgb)[bi + 2] / 255.f});
+            }
+        }
+    }
+
+    if (out.points.empty()) {
+        error = "深度图中没有有效点（请检查无效值过滤 / 深度缩放）。";
+        return false;
+    }
+
+    out.RecomputeBounds();
+    if (!out.bounds.Valid()) {
+        error = "点云包围盒无效。";
+        return false;
+    }
+    if (params.centerToOrigin) out.CenterToOrigin();
+    if (hasBright) {
+        out.vertexColors = true;
+    } else {
+        out.ApplyHeightColors(out.bounds.min.z, out.bounds.max.z);
+    }
+    out.ResetMask();
+    return true;
+}
+
+}  // namespace detail
+
+bool BuildFromDepthGray(const std::vector<float>& depth, int width, int height,
+                        const std::vector<uint8_t>* brightnessRgb,
+                        const DepthMapParams& params, PointCloud& out, std::string& error,
+                        const std::string& sourcePath) {
+    if (!detail::BuildPointCloudFromDepth(depth, width, height, brightnessRgb, params, out,
+                                          error)) {
+        return false;
+    }
+    if (!sourcePath.empty()) out.sourcePath = sourcePath;
+    return true;
+}
+
 bool LoadDepthMaps(const std::string& depthPath, const std::string& brightnessPath,
                    const DepthMapParams& params, PointCloud& out, std::string& error) {
     if (depthPath.empty()) {
         error = "请指定深度图路径。";
         return false;
     }
-    if (!(params.pixelSizeX > 0.f) || !(params.pixelSizeY > 0.f)) {
-        error = "像素尺寸必须大于 0。";
-        return false;
-    }
-    if (!(params.depthScale != 0.f) || !std::isfinite(params.depthScale)) {
-        error = "深度缩放无效。";
-        return false;
-    }
-    const int step = std::max(params.step, 1);
 
     ImageIO::GrayImage depth;
     if (!ImageIO::LoadGray(depthPath, depth, error)) return false;
 
     ImageIO::RgbImage bright;
-    const bool hasBright = !brightnessPath.empty();
-    if (hasBright) {
+    const std::vector<uint8_t>* rgbPtr = nullptr;
+    if (!brightnessPath.empty()) {
         if (!ImageIO::LoadRgb(brightnessPath, bright, error)) return false;
         if (bright.width != depth.width || bright.height != depth.height) {
             error = "深度图与亮度图尺寸不一致（" + std::to_string(depth.width) + "x" +
@@ -567,58 +740,14 @@ bool LoadDepthMaps(const std::string& depthPath, const std::string& brightnessPa
                     std::to_string(bright.height) + "）。";
             return false;
         }
+        rgbPtr = &bright.rgb;
     }
 
-    out.Clear();
-    const std::size_t approx =
-        static_cast<std::size_t>((depth.width + step - 1) / step) *
-        static_cast<std::size_t>((depth.height + step - 1) / step);
-    out.points.reserve(approx);
-    if (hasBright) out.colors.reserve(approx);
-
-    for (int row = 0; row < depth.height; row += step) {
-        const int yRow = params.flipY ? (depth.height - 1 - row) : row;
-        for (int col = 0; col < depth.width; col += step) {
-            const std::size_t di =
-                static_cast<std::size_t>(row) * static_cast<std::size_t>(depth.width) +
-                static_cast<std::size_t>(col);
-            const float raw = depth.pixels[di];
-            if (params.skipNonFinite && !std::isfinite(raw)) continue;
-            if (std::fabs(raw - params.invalidValue) <= params.invalidEps) continue;
-
-            const float z = raw * params.depthScale + params.zOffset;
-            if (!std::isfinite(z)) continue;
-
-            Vec3 p;
-            p.x = static_cast<float>(col) * params.pixelSizeX;
-            p.y = static_cast<float>(yRow) * params.pixelSizeY;
-            p.z = z;
-            out.points.push_back(p);
-
-            if (hasBright) {
-                const std::size_t bi = di * 3u;
-                out.colors.push_back(Vec3{bright.rgb[bi] / 255.f, bright.rgb[bi + 1] / 255.f,
-                                          bright.rgb[bi + 2] / 255.f});
-            }
-        }
-    }
-
-    if (out.points.empty()) {
-        error = "深度图中没有有效点（请检查无效值 / 深度缩放）。";
+    if (!detail::BuildPointCloudFromDepth(depth.pixels, depth.width, depth.height, rgbPtr, params,
+                                          out, error)) {
         return false;
     }
-
     out.sourcePath = depthPath;
-    out.RecomputeBounds();
-    if (!out.bounds.Valid()) {
-        error = "点云包围盒无效。";
-        return false;
-    }
-    out.CenterToOrigin();
-    if (!hasBright) {
-        out.ApplyHeightColors(out.bounds.min.z, out.bounds.max.z);
-    }
-    out.ResetMask();
     return true;
 }
 
