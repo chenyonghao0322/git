@@ -390,6 +390,34 @@ bool Application::Init() {
 
     shapeTemplateWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     halconMatchWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    measurementRecipeWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
+    measurementRecipeWindow_.SetSyncSourceCallback(
+        [this](const std::vector<uint8_t>& rgb, const std::vector<float>& gray, int w, int h,
+               const std::string& path) {
+            ImportRecipeSourceToBrightness(rgb, gray, w, h, path);
+        });
+    measurementRecipeWindow_.SetDrawHostCanvasCallback([this]() {
+        if (!brightnessImage_.valid()) {
+            ImGui::TextDisabled(u8"请先在配方中读取源图像");
+            return;
+        }
+        DrawImageWithSyncMarker(brightnessImage_, u8"配方源图 / 2D算子");
+    });
+    measurementRecipeWindow_.SetDrawHostToolPanelCallback([this]() { DrawImage2DToolPanel(); });
+    measurementRecipeWindow_.SetIs2DToolActiveCallback(
+        [this]() { return image2DTool_ != Image2DTool::None; });
+    measurementRecipeWindow_.SetActivate2DToolCallback(
+        [this](int tool) { ActivateImage2DTool(static_cast<Image2DTool>(tool)); });
+    measurementRecipeWindow_.SetGetActive2DToolCallback(
+        [this]() { return static_cast<int>(image2DTool_); });
+    measurementRecipeWindow_.SetRemapHostGeometryCallback(
+        [this](float fromCx, float fromCy, float fromAng, float fromScale, float toCx, float toCy,
+               float toAng, float toScale) {
+            RemapMeasuredGeometryByMatchPose(fromCx, fromCy, fromAng, fromScale, toCx, toCy, toAng,
+                                             toScale);
+        });
+    measurementRecipeWindow_.SetInvalidateHostResultsCallback(
+        [this]() { InvalidateRecipeHostResults(); });
     ocrWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     camera2DCalibWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
     cameraIntrinsicsCalibWindow_.SetStatusCallback([this](const char* msg) { SetStatus(msg); });
@@ -519,6 +547,126 @@ bool Application::UploadImageTexture(ImageView& view) {
                  view.rgb.data());
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
+}
+
+void Application::ImportRecipeSourceToBrightness(const std::vector<uint8_t>& rgb,
+                                                 const std::vector<float>& gray, int width,
+                                                 int height, const std::string& path) {
+    if (rgb.empty() || width <= 0 || height <= 0) return;
+    DestroyImageView(brightnessImage_);
+    brightnessImage_.width = width;
+    brightnessImage_.height = height;
+    brightnessImage_.path = path;
+    brightnessImage_.rgb = rgb;
+    brightnessImage_.gray = gray;
+    if (!brightnessImage_.gray.empty()) {
+        float vmin = 1e30f, vmax = -1e30f;
+        for (float v : brightnessImage_.gray) {
+            if (!std::isfinite(v)) continue;
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v);
+        }
+        if (!(vmax > vmin)) {
+            vmin = 0.f;
+            vmax = 1.f;
+        }
+        brightnessImage_.valueMin = vmin;
+        brightnessImage_.valueMax = vmax;
+    } else {
+        brightnessImage_.valueMin = 0.f;
+        brightnessImage_.valueMax = 255.f;
+    }
+    UploadImageTexture(brightnessImage_);
+    imagePanelTab_ = 1;
+}
+
+void Application::InvalidateRecipeHostResults() {
+    lineDistValid_ = false;
+    lineDistSamples_.clear();
+    arcDistValid_ = false;
+    arcDistSamples_.clear();
+}
+
+void Application::RemapMeasuredGeometryByMatchPose(float fromCx, float fromCy, float fromAngDeg,
+                                                   float fromScale, float toCx, float toCy,
+                                                   float toAngDeg, float toScale) {
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kDegToRad = kPi / 180.f;
+    if (fromScale < 1e-6f || toScale < 1e-6f) return;
+
+    auto transform = [&](float x, float y, float& ox, float& oy) {
+        const float dx = x - fromCx;
+        const float dy = y - fromCy;
+        const float radFrom = -fromAngDeg * kDegToRad;
+        const float cf = std::cos(radFrom);
+        const float sf = std::sin(radFrom);
+        const float lx = (dx * cf - dy * sf) / fromScale;
+        const float ly = (dx * sf + dy * cf) / fromScale;
+        const float radTo = toAngDeg * kDegToRad;
+        const float ct = std::cos(radTo);
+        const float st = std::sin(radTo);
+        const float sx = lx * toScale;
+        const float sy = ly * toScale;
+        ox = toCx + sx * ct - sy * st;
+        oy = toCy + sx * st + sy * ct;
+    };
+
+    auto xformLine = [&](OpenCv2D::CaliperLineResult& r) {
+        transform(r.roiX0, r.roiY0, r.roiX0, r.roiY0);
+        transform(r.roiX1, r.roiY1, r.roiX1, r.roiY1);
+        transform(r.fitX1, r.fitY1, r.fitX1, r.fitY1);
+        transform(r.fitX2, r.fitY2, r.fitX2, r.fitY2);
+        for (auto& ep : r.edgePoints) {
+            if (!ep.valid) continue;
+            transform(ep.x, ep.y, ep.x, ep.y);
+        }
+        for (auto& c : r.calipers) {
+            transform(c.x1, c.y1, c.x1, c.y1);
+            transform(c.x2, c.y2, c.x2, c.y2);
+        }
+    };
+
+    for (auto& line : measuredLines_) xformLine(line.result);
+    if (lineMeasurePending_) xformLine(lineMeasurePendingResult_);
+
+    for (auto& arc : measuredArcs_) {
+        auto& r = arc.result;
+        transform(r.roiP0X, r.roiP0Y, r.roiP0X, r.roiP0Y);
+        transform(r.roiP1X, r.roiP1Y, r.roiP1X, r.roiP1Y);
+        transform(r.roiP2X, r.roiP2Y, r.roiP2X, r.roiP2Y);
+        transform(r.roiCenterX, r.roiCenterY, r.roiCenterX, r.roiCenterY);
+        transform(r.fitCenterX, r.fitCenterY, r.fitCenterX, r.fitCenterY);
+        r.roiRadius *= (toScale / fromScale);
+        r.fitRadius *= (toScale / fromScale);
+        for (auto& ep : r.edgePoints) {
+            if (!ep.valid) continue;
+            transform(ep.x, ep.y, ep.x, ep.y);
+        }
+    }
+
+    for (auto& cir : measuredCircleFits_) {
+        transform(cir.result.centerX, cir.result.centerY, cir.result.centerX, cir.result.centerY);
+        cir.result.radius *= (toScale / fromScale);
+        for (auto& ep : cir.edgePoints) {
+            if (!ep.valid) continue;
+            transform(ep.x, ep.y, ep.x, ep.y);
+        }
+    }
+
+    for (auto& pd : measuredPointDists_) {
+        transform(pd.ax, pd.ay, pd.ax, pd.ay);
+        transform(pd.bx, pd.by, pd.bx, pd.by);
+        pd.dx = pd.bx - pd.ax;
+        pd.dy = pd.by - pd.ay;
+        pd.distance = std::sqrt(pd.dx * pd.dx + pd.dy * pd.dy);
+    }
+
+    if (lineDistPickA_ >= 0 && lineDistPickB_ >= 0) {
+        ComputeSelectedLineDistance();
+    } else {
+        lineDistValid_ = false;
+        lineDistSamples_.clear();
+    }
 }
 
 namespace {
@@ -3157,7 +3305,8 @@ void Application::HandleInput() {
     glfwGetFramebufferSize(window_, &fbW_, &fbH_);
 
     // 算法编辑器 / 模板匹配 / OCR 打开时不处理点云视区交互
-    if (algoEditor_.IsVisible() || halconMatchWindow_.IsVisible() || ocrWindow_.IsVisible() ||
+    if (algoEditor_.IsVisible() || halconMatchWindow_.IsVisible() ||
+        measurementRecipeWindow_.IsVisible() || ocrWindow_.IsVisible() ||
         camera2DCalibWindow_.IsVisible() || cameraIntrinsicsCalibWindow_.IsVisible() ||
         multiViewGeometryWindow_.IsVisible())
         return;
@@ -4219,8 +4368,19 @@ float Application::DrawMenuBar() {
         if (next) {
             algoEditor_.SetVisible(false);
             ocrWindow_.SetVisible(false);
+            measurementRecipeWindow_.SetVisible(false);
         }
         halconMatchWindow_.SetVisible(next);
+    }
+
+    if (ImGui::MenuItem(u8"测量配方", nullptr, measurementRecipeWindow_.IsVisible())) {
+        const bool next = !measurementRecipeWindow_.IsVisible();
+        if (next) {
+            algoEditor_.SetVisible(false);
+            ocrWindow_.SetVisible(false);
+            halconMatchWindow_.SetVisible(false);
+        }
+        measurementRecipeWindow_.SetVisible(next);
     }
 
     if (ImGui::MenuItem(u8"OCR 识别", nullptr, ocrWindow_.IsVisible())) {
@@ -4228,6 +4388,7 @@ float Application::DrawMenuBar() {
         if (next) {
             algoEditor_.SetVisible(false);
             halconMatchWindow_.SetVisible(false);
+            measurementRecipeWindow_.SetVisible(false);
         }
         ocrWindow_.SetVisible(next);
     }
@@ -4289,6 +4450,7 @@ float Application::DrawMenuBar() {
         const bool next = !algoEditor_.IsVisible();
         if (next) {
             halconMatchWindow_.SetVisible(false);
+            measurementRecipeWindow_.SetVisible(false);
             ocrWindow_.SetVisible(false);
         }
         algoEditor_.ToggleVisible();
@@ -4550,6 +4712,10 @@ void Application::DrawImageWithSyncMarker(ImageView& view, const char* label) {
 
     if (showLineMeasureOverlay_) {
         DrawLineMeasureOverlay(ImGui::GetWindowDrawList(), view, cursor.x, cursor.y, drawW, drawH);
+    }
+    if (measurementRecipeWindow_.IsVisible() && measurementRecipeWindow_.HasMatchOverlay()) {
+        measurementRecipeWindow_.DrawMeasureOverlaysOnHost(ImGui::GetWindowDrawList(), cursor, drawW,
+                                                           drawH);
     }
 
     const bool lineCaliperActive = image2DTool_ == Image2DTool::CaliperLine;
@@ -6095,6 +6261,120 @@ void Application::EnterView2DMode() {
     view2DMode_ = true;
 }
 
+void Application::ActivateImage2DTool(Image2DTool tool) {
+    if (tool == Image2DTool::None) {
+        image2DTool_ = Image2DTool::None;
+        return;
+    }
+    // 已是同一工具则保持开启（配方步骤切换时不误关）
+    if (image2DTool_ == tool) {
+        EnterView2DMode();
+        return;
+    }
+
+    image2DTool_ = tool;
+    EnterView2DMode();
+
+    switch (tool) {
+        case Image2DTool::CaliperLine:
+            ClearArcMeasure();
+            arcMeasurePending_ = false;
+            arcMeasurePendingSource_ = -1;
+            arcMeasurePendingResult_ = {};
+            SetStatus(u8"卡尺提线：在图像上拖拽绘制测量方向线");
+            break;
+        case Image2DTool::CaliperArc:
+            ClearLineMeasure();
+            ClearArcMeasure();
+            lineMeasurePending_ = false;
+            lineMeasurePendingSource_ = -1;
+            lineMeasurePendingResult_ = {};
+            SetStatus(u8"卡尺提弧：先点击 A、B 点，再拖拽拱高线段");
+            break;
+        case Image2DTool::CaliperPoint:
+            CancelCaliperPointPending();
+            SetStatus(u8"单点卡尺：拖拽测量方向线提取边缘");
+            break;
+        case Image2DTool::CaliperCircle:
+            circleCaliperPhase_ = CircleCaliperPhase::PickCenter;
+            CancelCircleCaliperPending();
+            SetStatus(u8"圆卡尺：点击圆心后拖拽半径");
+            break;
+        case Image2DTool::RectCaliper:
+            SetStatus(u8"矩形卡尺：拖拽矩形 ROI");
+            break;
+        case Image2DTool::ProfileWidth:
+            SetStatus(u8"剖面测宽：拖拽测量线");
+            break;
+        case Image2DTool::CircleFit:
+            ClearArcMeasure();
+            CancelCircleFitPending();
+            SetStatus(u8"拟合圆：点击已有圆弧，或设置 A/B 后拖拽拱高提取边缘");
+            break;
+        case Image2DTool::EllipseFit:
+            SetStatus(u8"拟合椭圆：点击圆弧或沿弧提取");
+            break;
+        case Image2DTool::ThreePointCircle:
+            SetStatus(u8"三点定圆：依次点击三个点");
+            break;
+        case Image2DTool::PointDistance:
+            pointDistPhase_ = PointPickPhase::PickA;
+            SetStatus(u8"点点距离：依次点击 A、B 两点");
+            break;
+        case Image2DTool::PointLineDistance:
+            ClearPointLineDistance();
+            SetStatus(u8"点线距离：先点击一点，再点击线段");
+            break;
+        case Image2DTool::LineDistance:
+            SetStatus(u8"线线距离：在图像上点击线段选 A、B");
+            break;
+        case Image2DTool::ArcDistance:
+            SetStatus(u8"圆弧距离：在图像上点击圆弧选 A、B");
+            break;
+        case Image2DTool::ParallelLineDistance:
+            SetStatus(u8"平行线距离：点击两条线段");
+            break;
+        case Image2DTool::LineAngle:
+            SetStatus(u8"两线夹角：点击两条已提取线段");
+            break;
+        case Image2DTool::CircleGap:
+            SetStatus(u8"圆间隙：点击两个已拟合圆");
+            break;
+        case Image2DTool::ArcLength:
+            ClearArcLength();
+            SetStatus(u8"弧长：点击一条已提取圆弧");
+            break;
+        case Image2DTool::PointProjection:
+            SetStatus(u8"投影点：先点选再选线段");
+            break;
+        case Image2DTool::Concentricity:
+            SetStatus(u8"同心度：点击两个拟合圆");
+            break;
+        case Image2DTool::Roundness:
+            SetStatus(u8"圆度：点击圆后计算");
+            break;
+        case Image2DTool::RegionBlob:
+            SetStatus(u8"区域分析：拖拽矩形");
+            break;
+        case Image2DTool::DepthHeightDiff:
+            SetStatus(u8"高度差：深度图点击两点");
+            break;
+        case Image2DTool::DepthProfile:
+            imagePanelTab_ = 0;
+            showDepthProfilePanel_ = true;
+            SetStatus(u8"深度 Profile：在深度图上单击或拖拽");
+            break;
+        case Image2DTool::TemplateMatch:
+            ResetTemplateMatchPick();
+            imagePanelTab_ = 1;
+            SetStatus(u8"模板匹配：在亮度图上拖拽框选模板");
+            break;
+        default:
+            SetStatus(Image2DToolLabel(tool));
+            break;
+    }
+}
+
 void Application::EnterView3DMode() {
     view2DMode_ = false;
     image2DTool_ = Image2DTool::None;
@@ -6106,6 +6386,7 @@ void Application::RestoreApplicationState() {
     }
     shapeTemplateWindow_.SetVisible(false);
     halconMatchWindow_.SetVisible(false);
+    measurementRecipeWindow_.SetVisible(false);
     ocrWindow_.SetVisible(false);
     camera2DCalibWindow_.SetVisible(false);
     cameraIntrinsicsCalibWindow_.SetVisible(false);
@@ -10559,6 +10840,15 @@ void Application::DrawUi() {
         return;
     }
 
+    if (measurementRecipeWindow_.IsVisible()) {
+        DrawAboutPopup();
+        DrawNativeAlgoPasswordPopup();
+        DrawCreatePopups();
+        measurementRecipeWindow_.Draw(menuBottom, consoleH);
+        DrawConsolePanel();
+        return;
+    }
+
     if (ocrWindow_.IsVisible()) {
         DrawAboutPopup();
         DrawNativeAlgoPasswordPopup();
@@ -10669,13 +10959,13 @@ void Application::Run() {
         DrawUi();
 
         if (sceneGpuDirty_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
-            !ocrWindow_.IsVisible())
+            !measurementRecipeWindow_.IsVisible() && !ocrWindow_.IsVisible())
             RefreshGpu();
         if (needUploadFilled_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
-            !ocrWindow_.IsVisible())
+            !measurementRecipeWindow_.IsVisible() && !ocrWindow_.IsVisible())
             RefreshGpuFilled();
         if (needUploadIcp_ && !algoEditor_.IsVisible() && !halconMatchWindow_.IsVisible() &&
-            !ocrWindow_.IsVisible())
+            !measurementRecipeWindow_.IsVisible() && !ocrWindow_.IsVisible())
             RefreshIcpGpu();
 
         glfwGetFramebufferSize(window_, &fbW_, &fbH_);

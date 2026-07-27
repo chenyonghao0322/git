@@ -70,6 +70,7 @@ add_executable(PointCloudViewer
     src/app/FileDialog.cpp
     src/app/ShapeTemplateMatchWindow.cpp
     src/app/HalconMatchWindow.cpp
+    src/app/MeasurementRecipeWindow.cpp
     src/app/Camera2DCalibrationWindow.cpp
     src/app/CameraIntrinsicsCalibrationWindow.cpp
     src/app/MultiViewGeometryWindow.cpp

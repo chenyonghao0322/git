@@ -247,4 +247,47 @@ std::string SaveHalconShapeModelFile() {
 #endif
 }
 
+std::string OpenMeasurementRecipeFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "测量配方\0*.mrcp\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "加载测量配方";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) == TRUE) {
+        return std::string(file);
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
+std::string SaveMeasurementRecipeFile() {
+#ifdef _WIN32
+    char file[MAX_PATH] = {0};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "测量配方\0*.mrcp\0全部文件\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = "保存测量配方";
+    ofn.lpstrDefExt = "mrcp";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::string path(file);
+        if (path.find('.') == std::string::npos) path += ".mrcp";
+        return path;
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
 }  // namespace FileDialog

@@ -19,6 +19,7 @@
 #include "app/AlgorithmEditor.h"
 #include "app/ShapeTemplateMatchWindow.h"
 #include "app/HalconMatchWindow.h"
+#include "app/MeasurementRecipeWindow.h"
 #include "app/OcrWindow.h"
 #include "app/Camera2DCalibrationWindow.h"
 #include "app/CameraIntrinsicsCalibrationWindow.h"
@@ -246,6 +247,14 @@ private:
     void ConvertDepthToPointCloud(bool append);
     void DestroyImageView(ImageView& view);
     bool UploadImageTexture(ImageView& view);
+    void ImportRecipeSourceToBrightness(const std::vector<uint8_t>& rgb,
+                                        const std::vector<float>& gray, int width, int height,
+                                        const std::string& path);
+    // 将已确认的 2D 测量几何按匹配位姿变换，并重算线距等派生结果
+    void RemapMeasuredGeometryByMatchPose(float fromCx, float fromCy, float fromAngDeg,
+                                          float fromScale, float toCx, float toCy, float toAngDeg,
+                                          float toScale);
+    void InvalidateRecipeHostResults();
 
     // --- 相机与 3D 视图 ---
     void FitCameraToCloud();
@@ -438,6 +447,7 @@ private:
     void ClearTemplateMatch();
     void ResetImage2dView();
     void EnterView2DMode();
+    void ActivateImage2DTool(Image2DTool tool);  // 供菜单与测量配方共用
     void EnterView3DMode();
     void RestoreApplicationState();
     void RotateImages2d90CW();
@@ -977,6 +987,7 @@ private:
     AlgorithmEditor algoEditor_;
     ShapeTemplateMatchWindow shapeTemplateWindow_;
     HalconMatchWindow halconMatchWindow_;
+    MeasurementRecipeWindow measurementRecipeWindow_;
     OcrWindow ocrWindow_;
     Camera2DCalibrationWindow camera2DCalibWindow_;
     CameraIntrinsicsCalibrationWindow cameraIntrinsicsCalibWindow_;

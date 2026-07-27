@@ -14,5 +14,7 @@ std::string OpenShapeTemplateFile();
 std::string SaveShapeTemplateFile();
 std::string OpenHalconShapeModelFile();
 std::string SaveHalconShapeModelFile();
+std::string OpenMeasurementRecipeFile();
+std::string SaveMeasurementRecipeFile();
 
 }  // namespace FileDialog
